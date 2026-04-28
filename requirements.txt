@@ -1,0 +1,17 @@
+PyMuPDF
+python-docx
+pandas
+openpyxl
+regex
+sentence-transformers
+chromadb
+neo4j
+openai
+langchain
+transformers
+torch
+fastapi
+uvicorn
+python-dotenv
+tiktoken
+spacy
