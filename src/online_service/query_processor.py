@@ -6,7 +6,7 @@ import os
 import re
 from typing import Any
 
-from src.utils.glm_client import embed_texts, generate_text
+from src.utils.deepseek_client import embed_texts, generate_text
 
 
 def HyDE(
@@ -26,14 +26,18 @@ def HyDE(
 """
     hypothetical_answer = generate_text(
         llm_client,
-        text_model or os.getenv("GLM_TEXT_MODEL", "glm-5"),
+        text_model or os.getenv("TEXT_MODEL", "deepseek-v4-flash"),
         prompt,
         temperature=0.1,
         max_output_tokens=256,
     )
     embedding = embed_texts(
         embedding_client,
-        embedding_model or os.getenv("GLM_EMBEDDING_MODEL", "embedding-3"),
+        embedding_model
+        or os.getenv(
+            "EMBEDDING_MODEL",
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        ),
         [hypothetical_answer or query],
     )[0]
     return embedding

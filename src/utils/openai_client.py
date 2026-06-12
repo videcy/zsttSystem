@@ -26,11 +26,56 @@ def extract_json_object(text: str) -> dict[str, Any]:
     if fenced_match:
         return json.loads(fenced_match.group(1))
 
-    brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
-    if brace_match:
-        return json.loads(brace_match.group(1))
+    for candidate in _iter_json_object_candidates(text):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
 
     raise ValueError("Model output does not contain a JSON object.")
+
+
+def _iter_json_object_candidates(text: str) -> list[str]:
+    """Yield balanced JSON object candidates from text."""
+    candidates: list[str] = []
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index, char in enumerate(text):
+        if start == -1:
+            if char == "{":
+                start = index
+                depth = 1
+                in_string = False
+                escape = False
+            continue
+
+        if escape:
+            escape = False
+            continue
+
+        if char == "\\" and in_string:
+            escape = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                candidates.append(text[start:index + 1])
+                start = -1
+
+    return candidates
 
 
 def generate_text(

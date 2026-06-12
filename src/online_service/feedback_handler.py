@@ -10,15 +10,32 @@ from typing import Any
 
 def build_citations(selected_docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build a lightweight citation payload from selected retrieval results."""
+    source_translation = {
+        "vector": "向量数据库",
+        "graph": "知识图谱",
+    }
+    
     citations: list[dict[str, Any]] = []
     for document in selected_docs:
+        metadata = document.get("metadata", {})
+        translated_metadata = {
+            "课程代码": metadata.get("course_code"),
+            "课程名称": metadata.get("course_name"),
+            "大纲章节": metadata.get("syllabus_section"),
+            "先修课程": metadata.get("prerequisites"),
+            "学分": metadata.get("credits"),
+            "关联知识图谱节点": metadata.get("linked_kg_nodes"),
+        }
+        translated_metadata = {k: v for k, v in translated_metadata.items() if v is not None}
+        
+        source = document.get("source")
         citation = {
-            "source": document.get("source"),
-            "id": document.get("id"),
-            "metadata": document.get("metadata", {}),
+            "来源": source_translation.get(source, source),
+            "标识符": document.get("id"),
+            "元数据": translated_metadata,
         }
         if document.get("source") == "graph":
-            citation["path"] = document.get("nodes", [])
+            citation["路径"] = document.get("nodes", [])
         citations.append(citation)
     return citations
 

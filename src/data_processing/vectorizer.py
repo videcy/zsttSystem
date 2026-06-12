@@ -7,8 +7,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+from src.data_processing.concept_normalizer import ConceptNormalizer
 from src.online_service.local_vector_store import LocalVectorCollection
-from src.utils.glm_client import create_glm_client, embed_texts
+from src.utils.deepseek_client import create_deepseek_client, embed_texts
 
 
 class VectorIndexer:
@@ -20,15 +21,26 @@ class VectorIndexer:
         db_path: str = "vector_store/",
         embedding_batch_size: int = 64,
         upsert_batch_size: int = 64,
+        preprocessed_chunks_path: str = "outputs/chunked_data_with_concepts.json",
+        concept_registry_path: str = "outputs/concept_registry.json",
+        concept_alias_map_path: str = "outputs/concept_alias_map.json",
+        concept_candidate_path: str = "outputs/concept_candidates.json",
+        verified_edge_path: str = "outputs/concept_verified_edges.json",
     ) -> None:
         self.model_name = model_name or os.getenv(
-            "GLM_EMBEDDING_MODEL",
-            "embedding-3",
+            "EMBEDDING_MODEL",
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         )
         self.embedding_batch_size = embedding_batch_size
         self.upsert_batch_size = upsert_batch_size
         self.db_path = Path(db_path)
-        self.api_client = create_glm_client()
+        self.preprocessed_chunks_path = Path(preprocessed_chunks_path)
+        self.concept_registry_path = Path(concept_registry_path)
+        self.concept_alias_map_path = Path(concept_alias_map_path)
+        self.concept_candidate_path = Path(concept_candidate_path)
+        self.verified_edge_path = Path(verified_edge_path)
+        self.api_client = create_deepseek_client()
+        self.concept_normalizer = ConceptNormalizer()
         self.collection = LocalVectorCollection(db_path=self.db_path, name="scholar_collection")
 
     def load_chunks(self, json_path: str = "outputs/chunked_data.json") -> list[dict[str, Any]]:
@@ -43,6 +55,20 @@ class VectorIndexer:
         if not isinstance(chunks, list):
             raise ValueError("Chunk JSON must contain a list of chunk objects.")
         return chunks
+
+    def preprocess_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
+        """Extract and canonicalize concepts before embedding."""
+        return self.concept_normalizer.preprocess_chunks(
+            chunks,
+            registry_output_path=self.concept_registry_path,
+            alias_output_path=self.concept_alias_map_path,
+            enriched_chunks_output_path=self.preprocessed_chunks_path,
+            candidate_output_path=self.concept_candidate_path,
+            verified_output_path=self.verified_edge_path,
+        )
 
     def _normalize_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
         """Convert metadata values into Chroma-compatible scalar types."""
@@ -59,11 +85,16 @@ class VectorIndexer:
         if not chunks:
             raise ValueError("No chunks provided for indexing.")
 
+        enriched_chunks, concept_registry, _ = self.preprocess_chunks(chunks)
         self.collection.reset()
 
-        for start in range(0, len(chunks), self.upsert_batch_size):
-            batch_chunks = chunks[start:start + self.upsert_batch_size]
-            texts = [str(chunk.get("text", "")).strip() for chunk in batch_chunks]
+        for start in range(0, len(enriched_chunks), self.upsert_batch_size):
+            batch_chunks = enriched_chunks[start:start + self.upsert_batch_size]
+            embedding_texts = [
+                str(chunk.get("embedding_text") or chunk.get("text", "")).strip()
+                for chunk in batch_chunks
+            ]
+            documents = [str(chunk.get("text", "")).strip() for chunk in batch_chunks]
             ids = [str(chunk["chunk_id"]) for chunk in batch_chunks]
             metadatas = [
                 self._normalize_metadata(chunk.get("metadata", {}))
@@ -73,16 +104,20 @@ class VectorIndexer:
             embeddings = embed_texts(
                 self.api_client,
                 self.model_name,
-                texts,
+                embedding_texts,
                 batch_size=self.embedding_batch_size,
             )
 
             self.collection.add(
                 ids=ids,
-                documents=texts,
+                documents=documents,
                 embeddings=embeddings,
                 metadatas=metadatas,
             )
+        print(
+            "[concept] Extracted and canonicalized "
+            f"{len(concept_registry)} concepts into {self.concept_registry_path}."
+        )
 
     def run(self, json_path: str) -> None:
         """Load chunks from disk and build the vector index."""

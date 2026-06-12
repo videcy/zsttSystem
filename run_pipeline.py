@@ -11,29 +11,25 @@ from dotenv import load_dotenv
 
 from src.data_processing.aligner import BimodalAligner
 from src.data_processing.kg_builder import KnowledgeGraphBuilder
+from src.data_processing.module_dependency import ModuleDependencyBuilder
 from src.data_processing.parser_chunker import SyllabusChunker
 from src.data_processing.vectorizer import VectorIndexer
+from src.config import config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-TRAINING_PLAN_DIR = Path(
-    os.getenv("TRAINING_PLAN_DIR", str(PROJECT_ROOT / "data" / "training_plans"))
-)
-SYLLABUS_DIR = Path(
-    os.getenv("SYLLABUS_DIR", str(PROJECT_ROOT / "data" / "syllabi"))
-)
-CHUNKED_OUTPUT_PATH = Path(
-    os.getenv("CHUNKED_OUTPUT_PATH", str(PROJECT_ROOT / "outputs" / "chunked_data.json"))
-)
-VECTOR_STORE_PATH = Path(os.getenv("VECTOR_DB_PATH", str(PROJECT_ROOT / "vector_store")))
-KG_OUTPUT_PATH = Path(
-    os.getenv("KG_OUTPUT_PATH", str(PROJECT_ROOT / "outputs" / "kg_extracted_data.json"))
-)
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+TRAINING_PLAN_DIR = config.training_plan_dir
+SYLLABUS_DIR = config.syllabus_dir
+CHUNKED_OUTPUT_PATH = config.chunked_output_path
+VECTOR_STORE_PATH = config.vector_db_path
+KG_OUTPUT_PATH = config.kg_output_path
+CONCEPT_REGISTRY_PATH = config.concept_registry_path
+CONCEPT_VERIFIED_EDGE_PATH = config.concept_verified_edge_path
+NEO4J_URI = config.neo4j_uri
+NEO4J_USER = config.neo4j_user
+NEO4J_PASSWORD = config.neo4j_password
 
 PipelineStep = Callable[[], None]
 
@@ -67,6 +63,9 @@ def run_kg_building() -> None:
         records = builder.run(
             json_path=str(CHUNKED_OUTPUT_PATH),
             output_path=str(KG_OUTPUT_PATH),
+            concept_registry_path=str(CONCEPT_REGISTRY_PATH),
+            concept_edge_path=str(CONCEPT_VERIFIED_EDGE_PATH),
+            reset_concept_subgraph=config.reset_concept_subgraph,
         )
     finally:
         builder.close()
@@ -85,10 +84,31 @@ def run_alignment() -> None:
         summary = aligner.run(
             chunk_data_path=str(CHUNKED_OUTPUT_PATH),
             extracted_kg_data_path=str(KG_OUTPUT_PATH),
+            concept_edge_path=str(CONCEPT_VERIFIED_EDGE_PATH),
+            concept_registry_path=str(CONCEPT_REGISTRY_PATH),
         )
     finally:
         aligner.close()
-    print(f"[alignment] Linked {summary['linked_chunks']} chunks and {summary['linked_nodes']} nodes.")
+    print(f"[alignment] Linked {summary['linked_chunks']} chunks and {summary['linked_nodes']} nodes "
+          f"(concept nodes: {summary.get('aligned_concept_nodes', 0)}).")
+
+
+def run_module_dependency() -> None:
+    """Build module-level course dependency graph from concept edges."""
+    builder = ModuleDependencyBuilder(
+        neo4j_uri=NEO4J_URI,
+        neo4j_user=NEO4J_USER,
+        neo4j_password=NEO4J_PASSWORD,
+    )
+    try:
+        summary = builder.run(
+            concept_registry_path=str(CONCEPT_REGISTRY_PATH),
+            concept_edge_path=str(CONCEPT_VERIFIED_EDGE_PATH),
+        )
+    finally:
+        builder.close()
+    print(f"[module] Built {summary['module_edge_count']} module-level dependency edges "
+          f"(written to Neo4j: {summary.get('written_to_neo4j', 0)}).")
 
 
 def build_stage_map() -> dict[str, list[PipelineStep]]:
@@ -98,11 +118,13 @@ def build_stage_map() -> dict[str, list[PipelineStep]]:
         "vectorization": [run_vectorization],
         "kg": [run_kg_building],
         "alignment": [run_alignment],
+        "module": [run_module_dependency],
         "all": [
             run_parsing,
             run_vectorization,
             run_kg_building,
             run_alignment,
+            run_module_dependency,
         ],
     }
 
@@ -114,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=["parsing", "vectorization", "kg", "alignment", "all"],
+        choices=["parsing", "vectorization", "kg", "alignment", "module", "all"],
         default="all",
         help="Specify which pipeline stage to execute.",
     )

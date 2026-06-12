@@ -16,7 +16,7 @@
 - Windows 10 或 Windows 11
 - Python 3.11
 - PowerShell
-- 可用的 GLM/OpenAI 兼容接口密钥
+- 可用的 DeepSeek API 密钥
 - 可选：本地或远程 Neo4j
 
 说明：
@@ -70,12 +70,17 @@ pip install -r requirements.txt
 如果项目根目录下还没有 `.env`，请手动新建该文件，并填写类似下面的内容：
 
 ```env
-ZAI_API_KEY=你的接口密钥
-ZAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
-GLM_TEXT_MODEL=glm-5
-GLM_EMBEDDING_MODEL=embedding-3
-GLM_RERANK_MODEL=glm-5
-GLM_JUDGE_MODEL=glm-5
+DEEPSEEK_API_KEY=你的 DeepSeek API 密钥
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+TEXT_MODEL=deepseek-v4-flash
+RERANK_MODEL=deepseek-v4-flash
+JUDGE_MODEL=deepseek-v4-flash
+
+EMBEDDING_PROVIDER=local
+EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+LOCAL_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+EMBEDDING_MAX_CHARS=3000
+SIMPLE_EMBEDDING_DIMENSIONS=384
 
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
@@ -93,7 +98,9 @@ KG_OUTPUT_PATH=outputs/kg_extracted_data.json
 说明：
 
 - 如果暂时没有可用的 Neo4j，可以先保留 Neo4j 配置，系统会在部分流程中自动降级
-- 如果你的模型名在接口侧不可用，可以后续再调整 `GLM_TEXT_MODEL`、`GLM_RERANK_MODEL`、`GLM_JUDGE_MODEL`
+- 如果你想更换 DeepSeek 模型，可以后续再调整 `TEXT_MODEL`、`RERANK_MODEL`、`JUDGE_MODEL`
+- DeepSeek 官方当前主要提供对话/推理模型；因此默认将 embedding 配置为本地 `sentence-transformers`
+- 如果本地 `sentence-transformers` 首次下载失败，系统会自动退回到纯本地的简易 embedding，不会中断流水线
 
 ## 第四步：运行离线构建
 
