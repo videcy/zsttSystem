@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from json import JSONDecodeError
 from typing import Any
 
 import tiktoken
 
-from src.utils.glm_client import generate_json
+from src.utils.deepseek_client import generate_json
 
 
 def fuse_results(
@@ -87,13 +88,16 @@ def rerank_with_cross_encoder(
   ]
 }}
 """
-    response = generate_json(
-        reranker_model,
-        os.getenv("GLM_RERANK_MODEL", os.getenv("GLM_TEXT_MODEL", "glm-5")),
-        prompt,
-        temperature=0.0,
-        max_output_tokens=300,
-    )
+    try:
+        response = generate_json(
+            reranker_model,
+            os.getenv("RERANK_MODEL", os.getenv("TEXT_MODEL", "deepseek-v4-flash")),
+            prompt,
+            temperature=0.0,
+            max_output_tokens=300,
+        )
+    except (ValueError, JSONDecodeError):
+        return top_documents
     score_map = {
         int(item["index"]): float(item["score"])
         for item in response.get("scores", [])
@@ -113,13 +117,21 @@ def compress_context(
     reranked_docs: list[dict[str, Any]],
     token_limit: int = 4096,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Assemble a context string within a fixed token budget."""
+    """Assemble a context string within a fixed token budget.
+
+    Graph paths are prioritised before vector documents because they
+    are compact and carry structural dependency information that is
+    critical for reasoning.
+    """
     encoding = tiktoken.get_encoding("cl100k_base")
+    graph_docs = [d for d in reranked_docs if d.get("source") == "graph"]
+    vector_docs = [d for d in reranked_docs if d.get("source") != "graph"]
+
     context_sections: list[str] = []
     selected_docs: list[dict[str, Any]] = []
     used_tokens = 0
 
-    for document in reranked_docs:
+    for document in graph_docs + vector_docs:
         if document.get("source") == "graph":
             candidate_text = (
                 f"知识路径: {' -> '.join(document.get('nodes', []))} "

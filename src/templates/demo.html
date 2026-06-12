@@ -1,0 +1,505 @@
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>跨课程知识问答系统 本地演示</title>
+        <style>
+            :root {
+                --primary: #4f46e5;
+                --primary-dark: #4338ca;
+                --primary-light: #eef2ff;
+                --secondary: #06b6d4;
+                --secondary-light: #d1fae5;
+                --accent: #8b5cf6;
+                --bg-gradient-start: #f0f4ff;
+                --bg-gradient-end: #f5f7fa;
+                --panel: #ffffff;
+                --border: #e5e7eb;
+                --border-light: #f3f4f6;
+                --text: #111827;
+                --text-secondary: #4b5563;
+                --text-muted: #9ca3af;
+                --success: #10b981;
+                --success-light: #d1fae5;
+                --warning: #f59e0b;
+                --warning-light: #fef3c7;
+                --error: #ef4444;
+                --error-light: #fee2e2;
+            }
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+                min-height: 100vh;
+                color: var(--text);
+                overflow-x: hidden;
+            }
+            .animated-bg {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(135deg, #f0f4ff 0%, #f5f7fa 50%, #f0f4ff 100%);
+                background-size: 400% 400%;
+                animation: gradientShift 15s ease infinite;
+                z-index: -1;
+            }
+            .floating-shapes {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                z-index: -1;
+                pointer-events: none;
+            }
+            .shape {
+                position: absolute;
+                border-radius: 50%;
+                opacity: 0.15;
+                animation: float 12s ease-in-out infinite;
+            }
+            .shape:nth-child(1) {
+                width: 200px;
+                height: 200px;
+                background: var(--primary);
+                top: 10%;
+                left: -10%;
+                animation-delay: 0s;
+            }
+            .shape:nth-child(2) {
+                width: 150px;
+                height: 150px;
+                background: var(--secondary);
+                top: 60%;
+                right: -8%;
+                animation-delay: -3s;
+            }
+            .shape:nth-child(3) {
+                width: 180px;
+                height: 180px;
+                background: var(--accent);
+                bottom: 10%;
+                left: 20%;
+                animation-delay: -6s;
+            }
+            .shape:nth-child(4) {
+                width: 120px;
+                height: 120px;
+                background: var(--success);
+                top: 30%;
+                right: 30%;
+                animation-delay: -9s;
+            }
+            .wrap {
+                position: relative;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 40px 24px;
+                z-index: 1;
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 40px;
+            }
+            .header-icon {
+                width: 80px;
+                height: 80px;
+                margin: 0 auto 20px;
+                background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+                border-radius: 20px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 10px 40px rgba(79, 70, 229, 0.3);
+                animation: fadeInUp 0.6s ease-out, iconFloat 4s ease-in-out infinite;
+                position: relative;
+            }
+            .header-icon::before {
+                content: "?";
+                font-size: 40px;
+                color: white;
+                font-weight: bold;
+            }
+            .header-icon::after {
+                content: "";
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                border-radius: 20px;
+                background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+                opacity: 0.5;
+                filter: blur(20px);
+                animation: pulse 2s ease-in-out infinite;
+            }
+            .header h1 {
+                font-size: 28px;
+                font-weight: 700;
+                color: var(--text);
+                margin-bottom: 12px;
+                animation: fadeInUp 0.6s ease-out 0.1s both;
+            }
+            .header p {
+                font-size: 16px;
+                color: var(--text-secondary);
+                animation: fadeInUp 0.6s ease-out 0.2s both;
+            }
+            .panel {
+                background: var(--panel);
+                border-radius: 24px;
+                padding: 32px;
+                box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+                animation: fadeInUp 0.6s ease-out 0.3s both;
+                transition: transform 0.3s ease, box-shadow 0.3s ease;
+                position: relative;
+                overflow: hidden;
+            }
+            .panel::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 3px;
+                background: linear-gradient(90deg, var(--primary), var(--secondary), var(--accent));
+                background-size: 200% 100%;
+                animation: shimmer 3s linear infinite;
+            }
+            .panel:hover {
+                transform: translateY(-4px);
+                box-shadow: 0 35px 60px -15px rgba(0, 0, 0, 0.2);
+            }
+            .input-group {
+                margin-bottom: 24px;
+            }
+            .input-group label {
+                display: block;
+                font-size: 14px;
+                font-weight: 500;
+                color: var(--text-secondary);
+                margin-bottom: 12px;
+                animation: fadeInUp 0.6s ease-out 0.4s both;
+            }
+            textarea {
+                width: 100%;
+                min-height: 140px;
+                border-radius: 16px;
+                border: 2px solid var(--border);
+                padding: 16px;
+                font-size: 16px;
+                font-family: inherit;
+                background: linear-gradient(180deg, white 0%, var(--bg-gradient-end) 100%);
+                resize: vertical;
+                transition: all 0.3s ease;
+                line-height: 1.6;
+                animation: fadeInUp 0.6s ease-out 0.5s both;
+                position: relative;
+            }
+            textarea:focus {
+                outline: none;
+                border-color: var(--primary);
+                box-shadow: 0 0 0 4px var(--primary-light), 0 0 30px rgba(79, 70, 229, 0.2);
+                background: white;
+                transform: translateY(-2px);
+            }
+            textarea::placeholder {
+                color: var(--text-muted);
+            }
+            .btn {
+                width: 100%;
+                height: 52px;
+                border: none;
+                border-radius: 16px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+                animation: fadeInUp 0.6s ease-out 0.6s both;
+                position: relative;
+                overflow: hidden;
+            }
+            .btn-primary {
+                background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+                color: white;
+                box-shadow: 0 4px 20px rgba(79, 70, 229, 0.4);
+            }
+            .btn-primary::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: -100%;
+                width: 100%;
+                height: 100%;
+                background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+                transition: left 0.5s ease;
+            }
+            .btn-primary:hover::before {
+                left: 100%;
+            }
+            .btn-primary:hover:not(:disabled) {
+                transform: translateY(-3px);
+                box-shadow: 0 8px 30px rgba(79, 70, 229, 0.5);
+            }
+            .btn-primary:active:not(:disabled) {
+                transform: translateY(-1px);
+            }
+            .btn:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+            }
+            .btn-loading::after {
+                content: "";
+                width: 20px;
+                height: 20px;
+                border: 2px solid white;
+                border-top-color: transparent;
+                border-radius: 50%;
+                animation: spin 0.8s linear infinite;
+            }
+            .status-bar {
+                margin-top: 20px;
+                padding: 16px 20px;
+                border-radius: 12px;
+                font-size: 14px;
+                font-weight: 500;
+                transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+                animation: fadeInUp 0.6s ease-out 0.7s both;
+                position: relative;
+                overflow: hidden;
+            }
+            .status-bar::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 4px;
+                height: 100%;
+                border-radius: 0 2px 2px 0;
+            }
+            .status-waiting {
+                background: var(--border-light);
+                color: var(--text-secondary);
+            }
+            .status-waiting::before {
+                background: var(--text-muted);
+            }
+            .status-querying {
+                background: var(--warning-light);
+                color: var(--warning);
+            }
+            .status-querying::before {
+                background: var(--warning);
+                animation: statusPulse 1s ease-in-out infinite;
+            }
+            .status-done {
+                background: var(--success-light);
+                color: var(--success);
+            }
+            .status-done::before {
+                background: var(--success);
+            }
+            .status-failed {
+                background: var(--error-light);
+                color: var(--error);
+            }
+            .status-failed::before {
+                background: var(--error);
+            }
+            .result-container {
+                margin-top: 20px;
+                animation: fadeInUp 0.6s ease-out 0.8s both;
+            }
+            .result-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 16px;
+                font-size: 14px;
+                font-weight: 600;
+                color: var(--text-secondary);
+                position: relative;
+            }
+            .result-header::before {
+                content: "";
+                width: 4px;
+                height: 16px;
+                background: linear-gradient(180deg, var(--primary) 0%, var(--secondary) 100%);
+                border-radius: 2px;
+            }
+            .result-header::after {
+                content: "";
+                position: absolute;
+                left: 12px;
+                right: 0;
+                top: 50%;
+                height: 1px;
+                background: linear-gradient(90deg, var(--border), transparent);
+                transform: translateY(-50%);
+            }
+            .result {
+                background: linear-gradient(180deg, white 0%, var(--bg-gradient-end) 100%);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 20px;
+                font-size: 15px;
+                line-height: 1.8;
+                white-space: pre-wrap;
+                min-height: 120px;
+                transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+                position: relative;
+            }
+            .result.empty {
+                color: var(--text-muted);
+                font-style: italic;
+            }
+            .result:not(.empty) {
+                border-color: var(--primary);
+                box-shadow: 0 0 20px rgba(79, 70, 229, 0.1);
+            }
+            @keyframes gradientShift {
+                0%, 100% { background-position: 0% 50%; }
+                50% { background-position: 100% 50%; }
+            }
+            @keyframes float {
+                0%, 100% { transform: translateY(0px) rotate(0deg); }
+                50% { transform: translateY(-30px) rotate(5deg); }
+            }
+            @keyframes fadeInUp {
+                from {
+                    opacity: 0;
+                    transform: translateY(20px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+            @keyframes spin {
+                to {
+                    transform: rotate(360deg);
+                }
+            }
+            @keyframes iconFloat {
+                0%, 100% { transform: translateY(0px); }
+                50% { transform: translateY(-8px); }
+            }
+            @keyframes pulse {
+                0%, 100% { opacity: 0.5; transform: scale(1); }
+                50% { opacity: 0.8; transform: scale(1.1); }
+            }
+            @keyframes shimmer {
+                0% { background-position: -200% 0; }
+                100% { background-position: 200% 0; }
+            }
+            @keyframes statusPulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.5; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="animated-bg"></div>
+        <div class="floating-shapes">
+            <div class="shape"></div>
+            <div class="shape"></div>
+            <div class="shape"></div>
+            <div class="shape"></div>
+        </div>
+        <div class="wrap">
+            <div class="header">
+                <div class="header-icon"></div>
+                <h1>跨课程知识问答系统</h1>
+                <p>基于课程大纲的智能问答助手</p>
+            </div>
+            <div class="panel">
+                <div class="input-group">
+                    <label for="query">输入您的问题</label>
+                    <textarea id="query" placeholder="例如：专业的核心课程有哪些？"></textarea>
+                </div>
+                <button id="submit" class="btn btn-primary">
+                    提问
+                </button>
+                <div class="status-bar status-waiting" id="status">等待输入</div>
+                <div class="result-container">
+                    <div class="result-header">回答结果</div>
+                    <div class="result empty" id="result">答案将显示在这里...</div>
+                </div>
+            </div>
+        </div>
+        <script>
+            const submit = document.getElementById("submit");
+            const queryInput = document.getElementById("query");
+            const status = document.getElementById("status");
+            const result = document.getElementById("result");
+
+            function updateStatus(text, type) {
+                status.textContent = text;
+                status.className = `status-bar status-${type}`;
+            }
+
+            submit.addEventListener("click", async () => {
+                const query = queryInput.value.trim();
+                if (!query) {
+                    updateStatus("请输入问题", "failed");
+                    setTimeout(() => updateStatus("等待输入", "waiting"), 2000);
+                    return;
+                }
+
+                submit.disabled = true;
+                submit.classList.add("btn-loading");
+                submit.textContent = "";
+                updateStatus("正在查询...", "querying");
+                result.textContent = "正在思考中，请稍候...";
+                result.classList.remove("empty");
+
+                try {
+                    const response = await fetch("/query", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ query })
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        throw new Error(data.detail || "请求失败");
+                    }
+
+                    const lines = [
+                        `状态: ${data.status || "正常"}`,
+                        `查询ID: ${data.query_id || ""}`,
+                        "",
+                        "答案:",
+                        data.answer || "",
+                    ];
+
+                    if (Array.isArray(data.linked_entities) && data.linked_entities.length) {
+                        lines.push("", "关联实体:", data.linked_entities.join(", "));
+                    }
+
+                    if (Array.isArray(data.citations) && data.citations.length) {
+                        lines.push("", "引用:", JSON.stringify(data.citations, null, 2));
+                    }
+
+                    result.textContent = lines.join("\\n");
+                    updateStatus("查询完成", "done");
+                } catch (error) {
+                    updateStatus("查询失败", "failed");
+                    result.textContent = "错误: " + String(error);
+                } finally {
+                    submit.disabled = false;
+                    submit.classList.remove("btn-loading");
+                    submit.textContent = "提问";
+                }
+            });
+        </script>
+    </body>
+    </html>

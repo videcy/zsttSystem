@@ -189,8 +189,33 @@ class BimodalAligner:
 
         return node_to_chunk_ids
 
+    DEPENDENCY_RELATION_TYPES = [
+        "FOUNDATION_OF",
+        "METHOD_ANALOGY",
+        "TOOL_PREREQ",
+        "CONCEPTUAL_BASIS",
+    ]
+
+    def _consistency_check_cypher(self) -> str:
+        """Build Cypher that checks all actual dependency relation types."""
+        conditions = " OR ".join(
+            f"type(r) = '{rel}'" for rel in self.DEPENDENCY_RELATION_TYPES
+        )
+        return f"""
+            MATCH (a:Knowledge_Point)-[r]->(b:Knowledge_Point)
+            WHERE a.concept_id IS NOT NULL
+              AND b.concept_id IS NOT NULL
+              AND ({conditions})
+            RETURN a.canonical_name AS source_name,
+                   b.canonical_name AS target_name,
+                   type(r) AS relation_type,
+                   coalesce(r.confidence, 0) AS confidence,
+                   coalesce(a.source_chunks, []) AS source_chunks,
+                   coalesce(b.source_chunks, []) AS target_chunks
+        """
+
     def consistency_check(self) -> dict[str, Any]:
-        """Check whether DEPENDS_ON relations have textual support in source chunks."""
+        """Check whether verified dependency relations have textual support in source chunks."""
         report: dict[str, Any] = {
             "checked_relations": 0,
             "warnings": [],
@@ -202,16 +227,7 @@ class BimodalAligner:
 
         try:
             with self.driver.session() as session:
-                result = session.run(
-                    """
-                    MATCH (a)-[r:DEPENDS_ON]->(b)
-                    RETURN a.name AS source_name,
-                           b.name AS target_name,
-                           coalesce(r.strength, 0) AS strength,
-                           coalesce(a.source_chunks, []) AS source_chunks,
-                           coalesce(b.source_chunks, []) AS target_chunks
-                    """
-                )
+                result = session.run(self._consistency_check_cypher())
                 records = list(result)
         except (AuthError, ServiceUnavailable, Neo4jError):
             self.graph_enabled = False
@@ -223,7 +239,8 @@ class BimodalAligner:
             report["checked_relations"] += 1
             source_name = str(record["source_name"])
             target_name = str(record["target_name"])
-            strength = int(record["strength"])
+            confidence = float(record["confidence"])
+            relation_type = str(record["relation_type"])
             source_chunk_ids = list(record["source_chunks"] or [])
             target_chunk_ids = list(record["target_chunks"] or [])
             candidate_ids = list(dict.fromkeys(source_chunk_ids + target_chunk_ids))
@@ -238,25 +255,104 @@ class BimodalAligner:
                         textual_support_found = True
                         break
 
-            if strength >= 5 and not textual_support_found:
+            if confidence >= 0.7 and not textual_support_found:
                 report["warnings"].append(
                     {
                         "source": source_name,
                         "target": target_name,
-                        "strength": strength,
+                        "confidence": confidence,
+                        "relation_type": relation_type,
                         "status": "待人工审核",
-                        "reason": "Strong DEPENDS_ON relation lacks direct textual evidence in linked chunks.",
+                        "reason": f"High-confidence {relation_type} relation lacks direct textual evidence in linked chunks.",
                     }
                 )
 
         return report
 
+    def align_concept_nodes_to_chunks(
+        self,
+        chunk_data_path: str = "outputs/chunked_data.json",
+        concept_edge_path: str = "outputs/concept_verified_edges.json",
+        concept_registry_path: str = "outputs/concept_registry.json",
+    ) -> dict[str, list[str]]:
+        """Write source_chunk_ids onto concept dependency Knowledge_Point nodes in Neo4j."""
+        if not self.graph_enabled:
+            return {}
+
+        chunks = self._load_json(chunk_data_path)
+        concept_edges = self._load_json(concept_edge_path)
+        concept_registry = self._load_json(concept_registry_path)
+
+        if not isinstance(chunks, list):
+            return {}
+
+        concept_lookup: dict[str, dict[str, Any]] = {}
+        if isinstance(concept_registry, list):
+            concept_lookup = {
+                str(c.get("id", "")): c
+                for c in concept_registry
+                if isinstance(c, dict)
+            }
+
+        concept_to_chunk_ids: dict[str, set[str]] = {}
+        if isinstance(concept_edges, list):
+            for edge in concept_edges:
+                if not isinstance(edge, dict) or not edge.get("requires"):
+                    continue
+                for role in ("source_id", "target_id"):
+                    concept_id = str(edge.get(role, ""))
+                    if not concept_id:
+                        continue
+                    concept_to_chunk_ids.setdefault(concept_id, set())
+
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            chunk_id = str(chunk.get("chunk_id", ""))
+            metadata = chunk.get("metadata", {})
+            if not chunk_id or not isinstance(metadata, dict):
+                continue
+            core_concepts = metadata.get("core_concepts", [])
+            if not isinstance(core_concepts, list):
+                continue
+            for concept in core_concepts:
+                if not isinstance(concept, dict):
+                    continue
+                concept_id = str(concept.get("id", ""))
+                if concept_id in concept_to_chunk_ids:
+                    concept_to_chunk_ids[concept_id].add(chunk_id)
+
+        node_to_chunk_ids: dict[str, list[str]] = {}
+        for concept_id, chunk_ids in concept_to_chunk_ids.items():
+            concept = concept_lookup.get(concept_id, {})
+            canonical_name = str(concept.get("canonical_name", ""))
+            if not canonical_name:
+                continue
+            sorted_ids = sorted(chunk_ids)
+            node_to_chunk_ids[canonical_name] = sorted_ids
+            try:
+                with self.driver.session() as session:
+                    session.run(
+                        """
+                        MATCH (n:Knowledge_Point {concept_id: $concept_id})
+                        SET n.source_chunks = $chunk_ids
+                        """,
+                        concept_id=concept_id,
+                        chunk_ids=sorted_ids,
+                    )
+            except (AuthError, ServiceUnavailable, Neo4jError):
+                pass
+
+        return node_to_chunk_ids
+
     def run(
         self,
         chunk_data_path: str = "outputs/chunked_data.json",
         extracted_kg_data_path: str = "outputs/kg_extracted_data.json",
+        concept_edge_path: str = "outputs/concept_verified_edges.json",
+        concept_registry_path: str = "outputs/concept_registry.json",
     ) -> dict[str, Any]:
-        """Run vector-to-KG linking, KG-to-vector linking, and consistency checks."""
+        """Run vector-to-KG linking, KG-to-vector linking, concept node alignment, and consistency checks."""
         chunk_to_kg_nodes = self.link_vector_to_kg(
             chunk_data_path=chunk_data_path,
             extracted_kg_data_path=extracted_kg_data_path,
@@ -265,11 +361,17 @@ class BimodalAligner:
             chunk_data_path=chunk_data_path,
             extracted_kg_data_path=extracted_kg_data_path,
         )
+        concept_alignment = self.align_concept_nodes_to_chunks(
+            chunk_data_path=chunk_data_path,
+            concept_edge_path=concept_edge_path,
+            concept_registry_path=concept_registry_path,
+        )
         report = self.consistency_check()
 
         summary = {
             "linked_chunks": len(chunk_to_kg_nodes),
             "linked_nodes": len(node_to_chunk_ids),
+            "aligned_concept_nodes": len(concept_alignment),
             "consistency_report": report,
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))

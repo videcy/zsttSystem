@@ -7,8 +7,10 @@ import math
 from pathlib import Path
 from typing import Any
 
+from src.online_service.vector_store_abc import VectorStore
 
-class LocalVectorCollection:
+
+class LocalVectorCollection(VectorStore):
     """Persist embeddings and query them with cosine similarity."""
 
     def __init__(self, db_path: str | Path, name: str = "scholar_collection") -> None:

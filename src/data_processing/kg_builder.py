@@ -5,14 +5,20 @@ from __future__ import annotations
 import json
 import os
 import re
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from openai import BadRequestError
+from dotenv import load_dotenv
 
-from src.utils.glm_client import create_glm_client, generate_json
+from src.utils.deepseek_client import create_deepseek_client, generate_json
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 class KnowledgeGraphBuilder:
@@ -29,6 +35,10 @@ class KnowledgeGraphBuilder:
         "TAUGHT_BY",
         "USES_TEXTBOOK",
         "HAS_PREREQUISITE",
+        "FOUNDATION_OF",
+        "METHOD_ANALOGY",
+        "TOOL_PREREQ",
+        "CONCEPTUAL_BASIS",
     }
 
     def __init__(
@@ -36,17 +46,17 @@ class KnowledgeGraphBuilder:
         neo4j_uri: str = "bolt://localhost:7687",
         neo4j_user: str = "neo4j",
         neo4j_password: str | None = None,
-        llm_model_name: str = "Qwen/Qwen2.5-7B-Instruct",
+        llm_model_name: str = "deepseek-v4-flash",
     ) -> None:
         self.neo4j_uri = neo4j_uri
         self.neo4j_user = neo4j_user
         self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD", "")
-        self.llm_model_name = llm_model_name or os.getenv("GLM_TEXT_MODEL", "glm-5")
+        self.llm_model_name = llm_model_name or os.getenv("TEXT_MODEL", "deepseek-v4-flash")
         self.driver = GraphDatabase.driver(
             self.neo4j_uri,
             auth=(self.neo4j_user, self.neo4j_password),
         )
-        self.llm = create_glm_client()
+        self.llm = None
         self.graph_enabled = True
 
     def close(self) -> None:
@@ -65,6 +75,58 @@ class KnowledgeGraphBuilder:
         if not isinstance(chunks, list):
             raise ValueError("Chunk JSON must contain a list of chunk objects.")
         return chunks
+
+    def _load_json_list(self, json_path: str | Path) -> list[dict[str, Any]]:
+        """Load a JSON list payload from disk."""
+        path = Path(json_path)
+        if not path.exists():
+            return []
+
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+
+        return payload if isinstance(payload, list) else []
+
+    def _load_existing_records(
+        self,
+        output_path: str | Path,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Load existing extraction results to support resumable runs."""
+        path = Path(output_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return [], {}
+
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+
+        if not isinstance(payload, list):
+            raise ValueError("KG output JSON must contain a list of extraction records.")
+
+        indexed_records: dict[str, dict[str, Any]] = {}
+        ordered_records: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            chunk_id = str(item.get("chunk_id", "")).strip()
+            if not chunk_id or chunk_id in indexed_records:
+                continue
+            indexed_records[chunk_id] = item
+            ordered_records.append(item)
+
+        return ordered_records, indexed_records
+
+    def _persist_records(
+        self,
+        output_path: str | Path,
+        records: list[dict[str, Any]],
+    ) -> None:
+        """Persist extraction records incrementally for crash-safe resumes."""
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(
+            json.dumps(records, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _course_display_name(self, metadata: dict[str, Any]) -> str:
         """Create a canonical display name for course nodes and relations."""
@@ -181,6 +243,8 @@ class KnowledgeGraphBuilder:
 
     def llm_extract(self, chunk_text: str, metadata: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         """Extract teaching entities and relations from a chunk with an LLM."""
+        if self.llm is None:
+            self.llm = create_deepseek_client()
         prompt = f"""
 你是一位教育知识图谱构建专家。请从以下课程大纲的片段中，抽取出教学相关的实体和关系。
 
@@ -224,6 +288,8 @@ class KnowledgeGraphBuilder:
             if "模型不存在" in str(exc):
                 return self._fallback_extract(chunk_text, metadata)
             raise
+        except (ValueError, JSONDecodeError):
+            return self._fallback_extract(chunk_text, metadata)
 
         raw_entities = parsed.get("entities", [])
         raw_relations = parsed.get("relations", [])
@@ -384,6 +450,7 @@ class KnowledgeGraphBuilder:
             "Knowledge_Point": """
                 MERGE (n:Knowledge_Point {name: $name})
                 SET n += $properties
+                SET n.source = coalesce(n.source, 'chunk_extraction')
             """,
             "Instructor": """
                 MERGE (n:Instructor {name: $name})
@@ -412,6 +479,22 @@ class KnowledgeGraphBuilder:
                 MATCH (source {name: $source}), (target {name: $target})
                 MERGE (source)-[:HAS_PREREQUISITE]->(target)
             """,
+            "FOUNDATION_OF": """
+                MATCH (source {name: $source}), (target {name: $target})
+                MERGE (source)-[:FOUNDATION_OF]->(target)
+            """,
+            "METHOD_ANALOGY": """
+                MATCH (source {name: $source}), (target {name: $target})
+                MERGE (source)-[:METHOD_ANALOGY]->(target)
+            """,
+            "TOOL_PREREQ": """
+                MATCH (source {name: $source}), (target {name: $target})
+                MERGE (source)-[:TOOL_PREREQ]->(target)
+            """,
+            "CONCEPTUAL_BASIS": """
+                MATCH (source {name: $source}), (target {name: $target})
+                MERGE (source)-[:CONCEPTUAL_BASIS]->(target)
+            """,
         }
 
         try:
@@ -439,15 +522,143 @@ class KnowledgeGraphBuilder:
         except (AuthError, ServiceUnavailable, Neo4jError):
             self.graph_enabled = False
 
+    def update_concept_dependency_graph(
+        self,
+        concept_registry: list[dict[str, Any]],
+        concept_edges: list[dict[str, Any]],
+    ) -> int:
+        """Write canonical concept nodes and verified dependency edges into Neo4j."""
+        if not self.graph_enabled:
+            return 0
+        if not concept_registry and not concept_edges:
+            return 0
+
+        node_query = """
+            MERGE (n:Knowledge_Point {name: $name})
+            SET n.concept_id = $concept_id,
+                n.canonical_name = $canonical_name,
+                n.type = $concept_type,
+                n.bloom_level = $bloom_level,
+                n.discipline = $discipline,
+                n.source_courses = $source_courses,
+                n.source_course_codes = $source_course_codes,
+                n.source_chapters = $source_chapters,
+                n.source = 'concept_dependency'
+        """
+        relation_query_template = """
+            MATCH (source:Knowledge_Point {concept_id: $source_id})
+            MATCH (target:Knowledge_Point {concept_id: $target_id})
+            MERGE (source)-[r:{relation_type}]->(target)
+            SET r.confidence = $confidence,
+                r.reason = $reason,
+                r.requires = $requires,
+                r.candidate_confidence = $candidate_confidence
+        """
+
+        written_edges = 0
+        try:
+            with self.driver.session() as session:
+                for concept in concept_registry:
+                    session.run(
+                        node_query,
+                        name=str(concept.get("canonical_name", "")).strip(),
+                        concept_id=str(concept.get("id", "")).strip(),
+                        canonical_name=str(concept.get("canonical_name", "")).strip(),
+                        concept_type=str(concept.get("type", "")).strip(),
+                        bloom_level=str(concept.get("bloom_level", "")).strip(),
+                        discipline=str(concept.get("discipline", "")).strip(),
+                        source_courses=list(concept.get("source_courses", [])),
+                        source_course_codes=list(concept.get("source_course_codes", [])),
+                        source_chapters=list(concept.get("source_chapters", [])),
+                    )
+
+                for edge in concept_edges:
+                    if not bool(edge.get("requires", False)):
+                        continue
+                    relation_type = str(edge.get("relation_type", "")).strip()
+                    source_id = str(edge.get("source_id", "")).strip()
+                    target_id = str(edge.get("target_id", "")).strip()
+                    if (
+                        not source_id
+                        or not target_id
+                        or relation_type not in self.ALLOWED_RELATION_TYPES
+                    ):
+                        continue
+
+                    session.run(
+                        relation_query_template.format(relation_type=relation_type),
+                        source_id=source_id,
+                        target_id=target_id,
+                        confidence=float(edge.get("confidence", 0.0)),
+                        reason=str(edge.get("reason", "")).strip(),
+                        requires=True,
+                        candidate_confidence=float(edge.get("candidate_confidence", 0.0)),
+                    )
+                    written_edges += 1
+        except (AuthError, ServiceUnavailable, Neo4jError):
+            self.graph_enabled = False
+            return 0
+
+        return written_edges
+
+    def reset_concept_dependency_subgraph(self) -> None:
+        """Delete only canonical concept dependency nodes/edges managed by this pipeline."""
+        if not self.graph_enabled:
+            return
+
+        delete_queries = [
+            """
+                MATCH ()-[r:FOUNDATION_OF|METHOD_ANALOGY|TOOL_PREREQ|CONCEPTUAL_BASIS]->()
+                DELETE r
+            """,
+            """
+                MATCH (n:Knowledge_Point)
+                WHERE n.concept_id IS NOT NULL
+                DETACH DELETE n
+            """,
+        ]
+
+        try:
+            with self.driver.session() as session:
+                for query in delete_queries:
+                    session.run(query)
+        except (AuthError, ServiceUnavailable, Neo4jError):
+            self.graph_enabled = False
+
     def run(
         self,
         json_path: str = "outputs/chunked_data.json",
         output_path: str = "outputs/kg_extracted_data.json",
+        concept_registry_path: str = "outputs/concept_registry.json",
+        concept_edge_path: str = "outputs/concept_verified_edges.json",
+        *,
+        resume: bool = True,
+        reset_concept_subgraph: bool = False,
     ) -> list[dict[str, Any]]:
         """Extract graph facts from each chunk, persist them, and save extraction logs."""
         chunks = self.load_chunks(json_path=json_path)
-        extraction_records: list[dict[str, Any]] = []
-        for chunk in chunks:
+        if resume:
+            extraction_records, existing_by_chunk_id = self._load_existing_records(output_path)
+        else:
+            extraction_records, existing_by_chunk_id = [], {}
+
+        if reset_concept_subgraph:
+            self.reset_concept_dependency_subgraph()
+
+        total_chunks = len(chunks)
+        skipped_count = 0
+        processed_count = 0
+
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_id = str(chunk.get("chunk_id", "")).strip()
+            if not chunk_id:
+                continue
+            if resume and chunk_id in existing_by_chunk_id:
+                skipped_count += 1
+                if skipped_count == 1 or skipped_count % 50 == 0 or index == total_chunks:
+                    print(f"[kg] Resume skip {skipped_count} existing chunks ({index}/{total_chunks}).")
+                continue
+
             chunk_text = str(chunk.get("text", "")).strip()
             metadata = chunk.get("metadata", {})
             if not chunk_text or not isinstance(metadata, dict):
@@ -455,24 +666,31 @@ class KnowledgeGraphBuilder:
 
             extraction = self.llm_extract(chunk_text, metadata)
             self.update_graph(extraction)
-            extraction_records.append(
-                {
-                    "chunk_id": str(chunk.get("chunk_id", "")).strip(),
-                    "metadata": metadata,
-                    "entities": extraction.get("entities", []),
-                    "relations": extraction.get("relations", []),
-                }
-            )
+            record = {
+                "chunk_id": chunk_id,
+                "metadata": metadata,
+                "entities": extraction.get("entities", []),
+                "relations": extraction.get("relations", []),
+            }
+            extraction_records.append(record)
+            existing_by_chunk_id[chunk_id] = record
+            self._persist_records(output_path, extraction_records)
+            processed_count += 1
+            print(f"[kg] Processed {index}/{total_chunks} (new: {processed_count}, skipped: {skipped_count}).")
 
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        output_file.write_text(
-            json.dumps(extraction_records, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        concept_registry = self._load_json_list(concept_registry_path)
+        concept_edges = self._load_json_list(concept_edge_path)
+        if not concept_registry:
+            print(f"[kg] No concept registry found at {concept_registry_path}; skipped concept nodes.")
+        if not concept_edges:
+            print(f"[kg] No verified concept edges found at {concept_edge_path}; skipped concept dependency edges.")
+        written_edges = self.update_concept_dependency_graph(concept_registry, concept_edges)
+
         print(
-            f"Knowledge graph updated from {len(chunks)} chunks and saved to {output_file}."
+            f"Knowledge graph updated from {len(chunks)} chunks and saved to {Path(output_path)}."
         )
+        if written_edges:
+            print(f"[kg] Wrote {written_edges} verified concept dependency edges to Neo4j.")
         if not self.graph_enabled:
             print("Neo4j is unavailable. Saved local KG extraction results without remote graph writes.")
         return extraction_records
@@ -496,6 +714,16 @@ def main() -> None:
         help="Path to save chunk-level KG extraction results.",
     )
     parser.add_argument(
+        "--concept-registry-path",
+        default="outputs/concept_registry.json",
+        help="Path to canonical concept registry JSON.",
+    )
+    parser.add_argument(
+        "--concept-edge-path",
+        default="outputs/concept_verified_edges.json",
+        help="Path to verified concept dependency edge JSON.",
+    )
+    parser.add_argument(
         "--neo4j-uri",
         default="bolt://localhost:7687",
         help="Neo4j connection URI.",
@@ -512,8 +740,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--llm-model-name",
-        default="Qwen/Qwen2.5-7B-Instruct",
+        default="deepseek-v4-flash",
         help="Instruction-tuned generation model used for extraction.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Rebuild KG extraction from scratch instead of resuming from existing output.",
+    )
+    parser.add_argument(
+        "--reset-concept-subgraph",
+        action="store_true",
+        help="Delete only the canonical concept dependency subgraph before writing new verified concept edges.",
     )
     args = parser.parse_args()
 
@@ -524,7 +762,14 @@ def main() -> None:
         llm_model_name=args.llm_model_name,
     )
     try:
-        builder.run(json_path=args.json_path, output_path=args.output_path)
+        builder.run(
+            json_path=args.json_path,
+            output_path=args.output_path,
+            concept_registry_path=args.concept_registry_path,
+            concept_edge_path=args.concept_edge_path,
+            resume=not args.no_resume,
+            reset_concept_subgraph=args.reset_concept_subgraph,
+        )
     finally:
         builder.close()
 

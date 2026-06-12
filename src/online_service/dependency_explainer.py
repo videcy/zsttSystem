@@ -1,0 +1,404 @@
+"""Structured explanations for verified concept dependency paths."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+from src.utils.deepseek_client import generate_json_value
+
+
+DEPENDENCY_RELATION_TYPES = (
+    "REQUIRES",
+    "FOUNDATION_OF",
+    "METHOD_ANALOGY",
+    "TOOL_PREREQ",
+    "CONCEPTUAL_BASIS",
+)
+
+
+def extract_query_entities(question: str, llm_client: Any) -> dict[str, list[str]]:
+    """Extract course and concept mentions from a natural-language question."""
+    prompt = (
+        "从用户问题中提取明确提到的课程名和概念名。只输出 JSON："
+        '{"courses": ["..."], "concepts": ["..."]}。'
+        "如果没有对应实体，输出空数组。不要输出额外解释。\n"
+        f"用户问题：{question}"
+    )
+    try:
+        payload = generate_json_value(
+            llm_client,
+            os.getenv("TEXT_MODEL", "deepseek-v4-flash"),
+            prompt,
+            temperature=0.0,
+            max_output_tokens=200,
+        )
+    except Exception:
+        payload = _fallback_extract_query_entities(question)
+
+    if not isinstance(payload, dict):
+        payload = _fallback_extract_query_entities(question)
+
+    entities = {
+        "courses": _normalize_string_list(payload.get("courses", [])),
+        "concepts": _normalize_string_list(payload.get("concepts", [])),
+    }
+    fallback = _fallback_extract_query_entities(question)
+    entities["courses"] = _merge_unique(entities["courses"], fallback["courses"])
+    entities["concepts"] = _merge_unique(entities["concepts"], fallback["concepts"])
+    return entities
+
+
+def build_dependency_answer(
+    question: str,
+    neo4j_session: Any,
+    llm_client: Any,
+    *,
+    max_depth: int = 3,
+) -> dict[str, Any] | None:
+    """Build a structured dependency answer from the concept dependency subgraph."""
+    entities = extract_query_entities(question, llm_client)
+    target_nodes = locate_target_concepts(entities, neo4j_session)
+    if not target_nodes:
+        return None
+
+    paths = retrieve_dependency_paths(target_nodes, neo4j_session, max_depth=max_depth)
+    if not paths:
+        return None
+
+    prerequisites = aggregate_prerequisites(paths)
+    explanation = generate_dependency_explanation(question, paths, prerequisites, llm_client)
+    return {
+        "linked_entities": entities,
+        "target_concepts": target_nodes,
+        "prerequisites": prerequisites,
+        "prerequisite_table": explanation.get("prerequisite_table", ""),
+        "explanation": explanation.get("explanation", ""),
+        "mermaid": explanation.get("mermaid") or build_mermaid_graph(paths),
+        "paths": paths,
+    }
+
+
+def locate_target_concepts(
+    entities: dict[str, list[str]],
+    neo4j_session: Any,
+) -> list[dict[str, Any]]:
+    """Locate concept nodes from mentioned concepts and courses."""
+    targets: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for concept in entities.get("concepts", []):
+        result = neo4j_session.run(
+            """
+            MATCH (n:Knowledge_Point)
+            WHERE n.concept_id IS NOT NULL
+              AND n.source = 'concept_dependency'
+              AND (
+                n.name CONTAINS $term
+                OR $term CONTAINS n.name
+                OR $term IN coalesce(n.aliases, [])
+              )
+            RETURN n.concept_id AS concept_id,
+                   n.name AS name,
+                   n.discipline AS discipline,
+                   n.bloom_level AS bloom_level,
+                   n.source_courses AS source_courses,
+                   n.source_course_codes AS source_course_codes,
+                   n.source_chapters AS source_chapters
+            LIMIT 30
+            """,
+            term=concept,
+        )
+        _append_unique_nodes(targets, seen_ids, result)
+
+    for course in entities.get("courses", []):
+        result = neo4j_session.run(
+            """
+            MATCH (n:Knowledge_Point)
+            WHERE n.concept_id IS NOT NULL
+              AND n.source = 'concept_dependency'
+              AND any(c IN coalesce(n.source_courses, [])
+                      WHERE c CONTAINS $course OR $course CONTAINS c)
+            RETURN n.concept_id AS concept_id,
+                   n.name AS name,
+                   n.discipline AS discipline,
+                   n.bloom_level AS bloom_level,
+                   n.source_courses AS source_courses,
+                   n.source_course_codes AS source_course_codes,
+                   n.source_chapters AS source_chapters
+            LIMIT 120
+            """,
+            course=course,
+        )
+        _append_unique_nodes(targets, seen_ids, result)
+
+    return targets
+
+
+def retrieve_dependency_paths(
+    target_nodes: list[dict[str, Any]],
+    neo4j_session: Any,
+    *,
+    max_depth: int = 3,
+) -> list[dict[str, Any]]:
+    """Traverse source-to-target dependency edges for the requested targets."""
+    target_ids = [node["concept_id"] for node in target_nodes if node.get("concept_id")]
+    if not target_ids:
+        return []
+
+    relation_filter = "|".join(DEPENDENCY_RELATION_TYPES)
+    query = f"""
+    MATCH p=(source:Knowledge_Point)-[rels:{relation_filter}*1..{max_depth}]->(target:Knowledge_Point)
+    WHERE target.concept_id IN $target_ids
+      AND source.concept_id IS NOT NULL
+      AND target.source = 'concept_dependency'
+      AND all(rel IN rels WHERE coalesce(rel.requires, true) = true)
+    RETURN
+      [node IN nodes(p) | {{
+        concept_id: node.concept_id,
+        name: node.name,
+        discipline: node.discipline,
+        bloom_level: node.bloom_level,
+        source_courses: node.source_courses,
+        source_course_codes: node.source_course_codes,
+        source_chapters: node.source_chapters
+      }}] AS nodes,
+      [rel IN relationships(p) | {{
+        type: type(rel),
+        confidence: rel.confidence,
+        reason: rel.reason
+      }}] AS relations,
+      reduce(total = 0.0, rel IN rels | total + coalesce(rel.confidence, 0.5)) / size(rels) AS avg_confidence
+    ORDER BY avg_confidence DESC
+    LIMIT 100
+    """
+    result = neo4j_session.run(query, target_ids=target_ids)
+
+    paths: list[dict[str, Any]] = []
+    for record in result:
+        nodes = [dict(node) for node in record["nodes"]]
+        relations = [dict(rel) for rel in record["relations"]]
+        paths.append(
+            {
+                "nodes": nodes,
+                "relations": relations,
+                "avg_confidence": float(record["avg_confidence"]),
+                "source": nodes[0] if nodes else {},
+                "target": nodes[-1] if nodes else {},
+            }
+        )
+    return paths
+
+
+def aggregate_prerequisites(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group prerequisite concepts by course and chapter."""
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for path in paths:
+        nodes = path.get("nodes", [])
+        if len(nodes) < 2:
+            continue
+        source = nodes[0]
+        courses = _normalize_string_list(source.get("source_courses", [])) or ["未知课程"]
+        chapters = _normalize_string_list(source.get("source_chapters", [])) or ["未知章节"]
+        for course in courses:
+            for chapter in chapters:
+                key = (course, chapter)
+                item = grouped.setdefault(
+                    key,
+                    {
+                        "course": course,
+                        "chapter": chapter,
+                        "concepts": [],
+                        "max_confidence": 0.0,
+                    },
+                )
+                concept = {
+                    "concept_id": source.get("concept_id", ""),
+                    "name": source.get("name", ""),
+                    "discipline": source.get("discipline", ""),
+                    "bloom_level": source.get("bloom_level", ""),
+                }
+                if concept not in item["concepts"]:
+                    item["concepts"].append(concept)
+                item["max_confidence"] = max(
+                    float(item["max_confidence"]),
+                    float(path.get("avg_confidence", 0.0)),
+                )
+
+    return sorted(
+        grouped.values(),
+        key=lambda item: (-float(item["max_confidence"]), item["course"], item["chapter"]),
+    )
+
+
+def generate_dependency_explanation(
+    question: str,
+    paths: list[dict[str, Any]],
+    prerequisites: list[dict[str, Any]],
+    llm_client: Any,
+) -> dict[str, str]:
+    """Generate a grounded Chinese explanation and Mermaid graph from paths."""
+    prompt = (
+        f"用户问题：{question}\n"
+        f"系统检索到的依赖路径：{json.dumps(_compact_paths_for_prompt(paths), ensure_ascii=False)}\n"
+        f"先修知识聚合：{json.dumps(prerequisites, ensure_ascii=False)}\n"
+        "请仅使用这些依赖关系，用通俗中文解释为什么必须先学这些先修知识。\n"
+        "输出 JSON 对象，包含字段：prerequisite_table, explanation, mermaid。\n"
+        "prerequisite_table 使用 Markdown 表格；explanation 不超过200字；"
+        "mermaid 必须是 graph TD 代码。不要输出 JSON 以外的内容。"
+    )
+    try:
+        payload = generate_json_value(
+            llm_client,
+            os.getenv("TEXT_MODEL", "deepseek-v4-flash"),
+            prompt,
+            temperature=0.1,
+            max_output_tokens=900,
+        )
+    except Exception:
+        payload = {}
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    return {
+        "prerequisite_table": str(payload.get("prerequisite_table", "")).strip()
+        or _build_prerequisite_table(prerequisites),
+        "explanation": str(payload.get("explanation", "")).strip()
+        or _fallback_explanation(prerequisites),
+        "mermaid": str(payload.get("mermaid", "")).strip() or build_mermaid_graph(paths),
+    }
+
+
+def build_mermaid_graph(paths: list[dict[str, Any]]) -> str:
+    """Convert dependency paths to Mermaid graph TD format."""
+    lines = ["graph TD"]
+    edges: set[tuple[str, str]] = set()
+    labels: dict[str, str] = {}
+
+    for path in paths:
+        nodes = path.get("nodes", [])
+        if len(nodes) < 2:
+            continue
+        for node in nodes:
+            node_id = _mermaid_node_id(str(node.get("concept_id") or node.get("name", "")))
+            labels[node_id] = _mermaid_label(node)
+        for left, right in zip(nodes, nodes[1:]):
+            left_id = _mermaid_node_id(str(left.get("concept_id") or left.get("name", "")))
+            right_id = _mermaid_node_id(str(right.get("concept_id") or right.get("name", "")))
+            edges.add((left_id, right_id))
+
+    for left_id, right_id in sorted(edges):
+        lines.append(f"    {left_id}[{labels[left_id]}] --> {right_id}[{labels[right_id]}]")
+    return "\n".join(lines)
+
+
+def _fallback_extract_query_entities(question: str) -> dict[str, list[str]]:
+    """Heuristic entity extraction for quoted course names and dependency wording."""
+    courses = re.findall(r"《([^》]+)》", question)
+    concepts: list[str] = []
+    if any(word in question for word in ("概念", "知识点", "算法", "定理", "算子")):
+        fragments = re.split(r"[，。？！?、\s]+", question)
+        concepts = [
+            fragment.strip("《》")
+            for fragment in fragments
+            if 2 <= len(fragment.strip("《》")) <= 30
+            and fragment.strip("《》") not in courses
+        ]
+    return {"courses": courses, "concepts": concepts}
+
+
+def _append_unique_nodes(targets: list[dict[str, Any]], seen_ids: set[str], records: Any) -> None:
+    """Append Neo4j records as unique concept node dictionaries."""
+    for record in records:
+        node = {
+            "concept_id": record.get("concept_id"),
+            "name": record.get("name"),
+            "discipline": record.get("discipline"),
+            "bloom_level": record.get("bloom_level"),
+            "source_courses": list(record.get("source_courses") or []),
+            "source_course_codes": list(record.get("source_course_codes") or []),
+            "source_chapters": list(record.get("source_chapters") or []),
+        }
+        concept_id = str(node.get("concept_id") or "")
+        if concept_id and concept_id not in seen_ids:
+            seen_ids.add(concept_id)
+            targets.append(node)
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    """Normalize string or list input to a clean list[str]."""
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _merge_unique(left: list[str], right: list[str]) -> list[str]:
+    """Merge two lists preserving order."""
+    merged = list(left)
+    for item in right:
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
+def _compact_paths_for_prompt(paths: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reduce path payload for LLM context."""
+    compact: list[dict[str, Any]] = []
+    for path in paths[:20]:
+        compact.append(
+            {
+                "nodes": [
+                    {
+                        "name": node.get("name", ""),
+                        "course": ", ".join(_normalize_string_list(node.get("source_courses", []))),
+                        "chapter": ", ".join(_normalize_string_list(node.get("source_chapters", []))),
+                    }
+                    for node in path.get("nodes", [])
+                ],
+                "relations": path.get("relations", []),
+                "avg_confidence": path.get("avg_confidence", 0.0),
+            }
+        )
+    return compact
+
+
+def _build_prerequisite_table(prerequisites: list[dict[str, Any]]) -> str:
+    """Build a Markdown prerequisite table."""
+    rows = ["| 课程 | 章节 | 先修概念 | 置信度 |", "|---|---|---|---|"]
+    for item in prerequisites:
+        concept_names = "、".join(concept.get("name", "") for concept in item.get("concepts", []))
+        rows.append(
+            f"| {item.get('course', '')} | {item.get('chapter', '')} | "
+            f"{concept_names} | {float(item.get('max_confidence', 0.0)):.2f} |"
+        )
+    return "\n".join(rows)
+
+
+def _fallback_explanation(prerequisites: list[dict[str, Any]]) -> str:
+    """Build a short deterministic explanation when LLM generation fails."""
+    if not prerequisites:
+        return "当前图谱中没有检索到足够的先修依赖路径。"
+    return "这些先修知识位于已验证的依赖路径上，先理解它们有助于掌握目标课程中的后续概念。"
+
+
+def _mermaid_node_id(value: str) -> str:
+    """Create a Mermaid-safe node id."""
+    safe = re.sub(r"[^0-9A-Za-z_]", "_", value)
+    if not safe or safe[0].isdigit():
+        safe = f"N_{safe}"
+    return safe
+
+
+def _mermaid_label(node: dict[str, Any]) -> str:
+    """Build Mermaid node label as course plus concept."""
+    courses = _normalize_string_list(node.get("source_courses", []))
+    course = courses[0] if courses else "未知课程"
+    name = str(node.get("name", "")).strip() or "未知概念"
+    return f"{course}·{name}"
