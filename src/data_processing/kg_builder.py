@@ -545,15 +545,29 @@ class KnowledgeGraphBuilder:
                 n.source_chapters = $source_chapters,
                 n.source = 'concept_dependency'
         """
-        relation_query_template = """
-            MATCH (source:Knowledge_Point {concept_id: $source_id})
-            MATCH (target:Knowledge_Point {concept_id: $target_id})
-            MERGE (source)-[r:{relation_type}]->(target)
-            SET r.confidence = $confidence,
-                r.reason = $reason,
-                r.requires = $requires,
-                r.candidate_confidence = $candidate_confidence
-        """
+
+        _SET_CLAUSE = (
+            "SET r.confidence = $confidence, r.reason = $reason, "
+            "r.requires = $requires, r.candidate_confidence = $candidate_confidence"
+        )
+        _MATCH_CLAUSE = (
+            "MATCH (source:Knowledge_Point {concept_id: $source_id}) "
+            "MATCH (target:Knowledge_Point {concept_id: $target_id}) "
+        )
+        concept_relation_queries: dict[str, str] = {
+            "FOUNDATION_OF": (
+                f"{_MATCH_CLAUSE} MERGE (source)-[r:FOUNDATION_OF]->(target) {_SET_CLAUSE}"
+            ),
+            "METHOD_ANALOGY": (
+                f"{_MATCH_CLAUSE} MERGE (source)-[r:METHOD_ANALOGY]->(target) {_SET_CLAUSE}"
+            ),
+            "TOOL_PREREQ": (
+                f"{_MATCH_CLAUSE} MERGE (source)-[r:TOOL_PREREQ]->(target) {_SET_CLAUSE}"
+            ),
+            "CONCEPTUAL_BASIS": (
+                f"{_MATCH_CLAUSE} MERGE (source)-[r:CONCEPTUAL_BASIS]->(target) {_SET_CLAUSE}"
+            ),
+        }
 
         written_edges = 0
         try:
@@ -578,15 +592,15 @@ class KnowledgeGraphBuilder:
                     relation_type = str(edge.get("relation_type", "")).strip()
                     source_id = str(edge.get("source_id", "")).strip()
                     target_id = str(edge.get("target_id", "")).strip()
-                    if (
-                        not source_id
-                        or not target_id
-                        or relation_type not in self.ALLOWED_RELATION_TYPES
-                    ):
+                    if not source_id or not target_id:
+                        continue
+
+                    query = concept_relation_queries.get(relation_type)
+                    if query is None:
                         continue
 
                     session.run(
-                        relation_query_template.format(relation_type=relation_type),
+                        query,
                         source_id=source_id,
                         target_id=target_id,
                         confidence=float(edge.get("confidence", 0.0)),
@@ -648,35 +662,43 @@ class KnowledgeGraphBuilder:
         total_chunks = len(chunks)
         skipped_count = 0
         processed_count = 0
+        _PERSIST_INTERVAL = 50
 
-        for index, chunk in enumerate(chunks, start=1):
-            chunk_id = str(chunk.get("chunk_id", "")).strip()
-            if not chunk_id:
-                continue
-            if resume and chunk_id in existing_by_chunk_id:
-                skipped_count += 1
-                if skipped_count == 1 or skipped_count % 50 == 0 or index == total_chunks:
-                    print(f"[kg] Resume skip {skipped_count} existing chunks ({index}/{total_chunks}).")
-                continue
+        try:
+            for index, chunk in enumerate(chunks, start=1):
+                chunk_id = str(chunk.get("chunk_id", "")).strip()
+                if not chunk_id:
+                    continue
+                if resume and chunk_id in existing_by_chunk_id:
+                    skipped_count += 1
+                    if skipped_count == 1 or skipped_count % 50 == 0 or index == total_chunks:
+                        print(f"[kg] Resume skip {skipped_count} existing chunks ({index}/{total_chunks}).")
+                    continue
 
-            chunk_text = str(chunk.get("text", "")).strip()
-            metadata = chunk.get("metadata", {})
-            if not chunk_text or not isinstance(metadata, dict):
-                continue
+                chunk_text = str(chunk.get("text", "")).strip()
+                metadata = chunk.get("metadata", {})
+                if not chunk_text or not isinstance(metadata, dict):
+                    continue
 
-            extraction = self.llm_extract(chunk_text, metadata)
-            self.update_graph(extraction)
-            record = {
-                "chunk_id": chunk_id,
-                "metadata": metadata,
-                "entities": extraction.get("entities", []),
-                "relations": extraction.get("relations", []),
-            }
-            extraction_records.append(record)
-            existing_by_chunk_id[chunk_id] = record
-            self._persist_records(output_path, extraction_records)
-            processed_count += 1
-            print(f"[kg] Processed {index}/{total_chunks} (new: {processed_count}, skipped: {skipped_count}).")
+                extraction = self.llm_extract(chunk_text, metadata)
+                self.update_graph(extraction)
+                record = {
+                    "chunk_id": chunk_id,
+                    "metadata": metadata,
+                    "entities": extraction.get("entities", []),
+                    "relations": extraction.get("relations", []),
+                }
+                extraction_records.append(record)
+                existing_by_chunk_id[chunk_id] = record
+                processed_count += 1
+
+                if processed_count % _PERSIST_INTERVAL == 0:
+                    self._persist_records(output_path, extraction_records)
+
+                print(f"[kg] Processed {index}/{total_chunks} (new: {processed_count}, skipped: {skipped_count}).")
+        finally:
+            if processed_count > 0:
+                self._persist_records(output_path, extraction_records)
 
         concept_registry = self._load_json_list(concept_registry_path)
         concept_edges = self._load_json_list(concept_edge_path)

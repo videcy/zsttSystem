@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import unicodedata
 import urllib.error
@@ -12,8 +13,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from src.utils.deepseek_client import create_deepseek_client, embed_texts, generate_json_value
 from src.config import config
+
+logger = logging.getLogger(__name__)
 
 
 class ConceptNormalizer:
@@ -60,21 +65,46 @@ class ConceptNormalizer:
         self.llm_model_name = llm_model_name or config.text_model
         self.embedding_model_name = embedding_model_name or config.concept_normalization_model
         self.retrieval_model_name = retrieval_model_name or config.concept_retrieval_model
-        self.similarity_threshold = similarity_threshold or config.concept_cluster_threshold
+        self.similarity_threshold = (
+            similarity_threshold if similarity_threshold is not None
+            else config.concept_cluster_threshold
+        )
         self.wikipedia_enabled = (
             wikipedia_enabled
             if wikipedia_enabled is not None
             else config.concept_wikipedia_enabled
         )
-        self.candidate_top_k = candidate_top_k or config.concept_top_k
-        self.course_order_bonus = course_order_bonus or config.concept_course_order_bonus
-        self.cross_discipline_decay = cross_discipline_decay or config.concept_cross_discipline_decay
-        self.score_weight_vector = score_weight_vector or config.concept_score_weight_vector
-        self.score_weight_structure = score_weight_structure or config.concept_score_weight_structure
-        self.score_weight_rule = score_weight_rule or config.concept_score_weight_rule
+        self.candidate_top_k = (
+            candidate_top_k if candidate_top_k is not None else config.concept_top_k
+        )
+        self.course_order_bonus = (
+            course_order_bonus if course_order_bonus is not None
+            else config.concept_course_order_bonus
+        )
+        self.cross_discipline_decay = (
+            cross_discipline_decay if cross_discipline_decay is not None
+            else config.concept_cross_discipline_decay
+        )
+        self.score_weight_vector = (
+            score_weight_vector if score_weight_vector is not None
+            else config.concept_score_weight_vector
+        )
+        self.score_weight_structure = (
+            score_weight_structure if score_weight_structure is not None
+            else config.concept_score_weight_structure
+        )
+        self.score_weight_rule = (
+            score_weight_rule if score_weight_rule is not None
+            else config.concept_score_weight_rule
+        )
         self.score_weight_external = config.concept_score_weight_external
-        self.llm_vote_count = llm_vote_count or config.concept_llm_vote_count
-        self.llm_vote_temperature = llm_vote_temperature or config.concept_llm_vote_temperature
+        self.llm_vote_count = (
+            llm_vote_count if llm_vote_count is not None else config.concept_llm_vote_count
+        )
+        self.llm_vote_temperature = (
+            llm_vote_temperature if llm_vote_temperature is not None
+            else config.concept_llm_vote_temperature
+        )
         self._normalize_score_weights()
         self.api_client = create_deepseek_client()
         self.embedding_client = self.api_client
@@ -182,7 +212,10 @@ class ConceptNormalizer:
                 temperature=0.0,
                 max_output_tokens=1000,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[concept_normalizer] LLM concept extraction failed, using fallback: %s", exc
+            )
             return self._fallback_extract_core_concepts(normalized_text, metadata)
 
         if not isinstance(response, list):
@@ -407,7 +440,10 @@ class ConceptNormalizer:
         for _ in range(self.llm_vote_count):
             try:
                 vote = self._call_dependency_validator(candidate, source, target)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "[concept_normalizer] LLM dependency vote failed, using fallback: %s", exc
+                )
                 vote = self._fallback_dependency_vote(candidate)
             votes.append(vote)
 
@@ -548,8 +584,13 @@ class ConceptNormalizer:
         return 1.0 if same_discipline else 0.5
 
     def _bloom_allowed(self, source_level: str, target_level: str) -> bool:
-        """Keep only candidates whose Bloom level is not above the target."""
-        return self.BLOOM_ORDER.get(source_level, 999) <= self.BLOOM_ORDER.get(target_level, -1)
+        """Keep only candidates whose Bloom level is not above the target.
+
+        When the target level is unrecognised (empty string, LLM parse error,
+        etc.) we default to 999 so the pair is accepted rather than silently
+        dropped — a strict filter on unknown data would eliminate all candidates.
+        """
+        return self.BLOOM_ORDER.get(source_level, 999) <= self.BLOOM_ORDER.get(target_level, 999)
 
     def _course_order_bonus_for_pair(self, source: dict[str, Any], target: dict[str, Any]) -> float:
         """Add bonus when the source concept comes from an earlier course."""
@@ -611,13 +652,13 @@ class ConceptNormalizer:
         seen_names: set[str] = set()
 
         type_keywords = [
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{2,40}(?:算法))", "algorithm"),
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{2,40}(?:定理))", "theorem"),
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{1,40}(?:算子|operator))", "operator"),
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{2,40}(?:方法|方法学))", "method"),
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{2,40}(?:模型))", "model"),
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{2,40}(?:框架))", "framework"),
-            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_\-+/]{2,40}(?:结构|数据结构))", "data_structure"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{2,40}(?:算法))", "algorithm"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{2,40}(?:定理))", "theorem"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{1,40}(?:算子|operator))", "operator"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{2,40}(?:方法|方法学))", "method"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{2,40}(?:模型))", "model"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{2,40}(?:框架))", "framework"),
+            (r"[《""]?([A-Za-z\u4e00-\u9fff0-9_+/-]{2,40}(?:结构|数据结构))", "data_structure"),
         ]
         for pattern, concept_type in type_keywords:
             for match in re.findall(pattern, chunk_text, flags=re.IGNORECASE):
@@ -749,10 +790,14 @@ class ConceptNormalizer:
             names,
             batch_size=min(32, max(1, len(names))),
         )
-        for left in range(len(names)):
-            for right in range(left + 1, len(names)):
-                if self._cosine_similarity(embeddings[left], embeddings[right]) >= self.similarity_threshold:
-                    union(left, right)
+        if embeddings:
+            # Vectorised cosine similarity via numpy: embeddings are already L2-normalised
+            # so cosine_sim(a, b) == dot(a, b).  One BLAS call replaces n*(n-1)/2 Python calls.
+            mat = np.array(embeddings, dtype=np.float32)
+            sim_matrix = np.dot(mat, mat.T)
+            rows, cols = np.where(np.triu(sim_matrix, k=1) >= self.similarity_threshold)
+            for left, right in zip(rows.tolist(), cols.tolist()):
+                union(int(left), int(right))
 
         grouped: dict[int, list[str]] = defaultdict(list)
         for index, name in enumerate(names):

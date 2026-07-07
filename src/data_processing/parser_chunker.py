@@ -427,6 +427,7 @@ class SyllabusChunker:
                     {
                         "chunk_id": str(uuid.uuid4()),
                         "text": text,
+                        "source_file": str(docx_file.relative_to(syllabus_dir)),
                         "metadata": {
                             "course_code": self._normalize_text(course_metadata.get("course_code", "")),
                             "course_name": self._normalize_text(course_metadata.get("course_name", "")),
