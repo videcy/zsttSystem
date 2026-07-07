@@ -1,204 +1,257 @@
-# zsttSystem 本地部署说明
+# zsttSystem v2.0 本地部署说明
 
 ## 项目说明
 
-本项目用于本地演示课程培养方案与教学大纲的智能问答系统，整体流程分为两个阶段：
+本项目是一个面向高校课程教学大纲与培养方案的智能问答系统，采用"领域知识层 + LightRAG 检索引擎层"双层协作架构：
 
-- 离线构建：解析培养方案和课程大纲，生成分块数据、向量索引和知识抽取结果
-- 在线服务：启动本地 FastAPI 接口，提供问答与反馈功能
+- **zsttSystem 领域知识层**：负责教学大纲解析、概念标准化、知识图谱构建（Neo4j）、课程依赖推理，以及 HyDE 查询扩展和 NLI 事实验证
+- **LightRAG 检索引擎层**：提供文本索引、多模式检索（5 种）、结果重排、答案生成和 LLM 响应缓存
 
-当前仓库已经按“本地可运行、可展示”的目标调整，不再依赖云端部署流程。
+两层通过 HTTP API 协作，互不侵入，各自独立演进。
 
 ## 运行环境
 
-建议使用以下环境：
-
-- Windows 10 或 Windows 11
-- Python 3.11
-- PowerShell
-- 可用的 DeepSeek API 密钥
-- 可选：本地或远程 Neo4j
-
-说明：
-
-- 即使 Neo4j 当前不可用，系统也可以用本地降级模式完成离线构建和基础问答展示
-- Neo4j 可用时，会启用图谱相关能力
+- Windows 10 / 11（Linux 和 macOS 亦可）
+- Python 3.11+
+- 可用的 DeepSeek API 密钥（或其他 OpenAI 兼容 API）
+- LightRAG v1.5+
+- 可选：本地或远程 Neo4j（依赖查询和知识图谱构建需要）
 
 ## 项目结构
 
-- `run_pipeline.py`：离线流程入口
-- `src/main.py`：在线服务入口
-- `data/training_plans`：培养方案 Excel
-- `data/syllabi`：课程大纲 Word 文档
-- `outputs`：离线处理结果和日志
-- `vector_store`：本地向量库文件
+```
+zsttSystem/
+├── run_pipeline.py              # 离线管线入口（含 sync 阶段）
+├── src/
+│   ├── main.py                  # FastAPI 在线服务入口
+│   ├── config.py                # 统一配置管理
+│   ├── data_processing/         # 离线管线模块
+│   │   ├── parser_chunker.py    #   教学大纲解析
+│   │   ├── kg_builder.py        #   知识图谱构建
+│   │   ├── aligner.py           #   KG 节点元数据对齐
+│   │   ├── module_dependency.py #   课程依赖聚合
+│   │   └── data_bridge.py       #   LightRAG 数据同步
+│   ├── online_service/          # 在线服务模块
+│   │   ├── query_router.py      #   查询路由（意图分类 + HyDE + NLI）
+│   │   ├── lightrag_adapter.py  #   LightRAG API 客户端
+│   │   ├── dependency_explainer.py  #   依赖解释
+│   │   ├── generator.py         #   NLI 事实验证
+│   │   └── feedback_handler.py  #   反馈日志
+│   └── utils/
+├── data/                        # 原始数据
+│   ├── training_plans/          #   培养方案（XLSX）
+│   └── syllabi/                 #   教学大纲（DOCX）
+├── outputs/                     # 管线产出
+├── .env.example                 # 环境变量模板
+└── requirements.txt             # Python 依赖
+```
 
 ## 第一步：创建虚拟环境
 
-在项目根目录执行：
-
 ```powershell
-cd D:\python\zsttSystem
+cd D:\python\zsttSystem1.1\zsttSystem
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-如果 PowerShell 提示脚本执行被禁止，先执行：
+如果 PowerShell 提示脚本执行被禁止：
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-然后重新执行：
-
-```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
 ## 第二步：安装依赖
 
-激活虚拟环境后执行：
-
 ```powershell
 pip install -r requirements.txt
+pip install "lightrag-hku[api]"
 ```
 
-## 第三步：填写 `.env`
+## 第三步：配置环境变量
 
-本项目直接使用根目录下的 `.env` 文件。
+```powershell
+copy .env.example .env
+```
 
-如果项目根目录下还没有 `.env`，请手动新建该文件，并填写类似下面的内容：
+编辑 `.env`，填入必要信息：
 
 ```env
-DEEPSEEK_API_KEY=你的 DeepSeek API 密钥
+# DeepSeek API
+DEEPSEEK_API_KEY=sk-你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 TEXT_MODEL=deepseek-v4-flash
-RERANK_MODEL=deepseek-v4-flash
-JUDGE_MODEL=deepseek-v4-flash
 
-EMBEDDING_PROVIDER=local
-EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-LOCAL_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-EMBEDDING_MAX_CHARS=3000
-SIMPLE_EMBEDDING_DIMENSIONS=384
-
+# Neo4j（可选，依赖查询需要）
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=你的密码
 
-VECTOR_DB_PATH=vector_store
-QUERY_LOG_PATH=outputs/query_log.jsonl
-FEEDBACK_LOG_PATH=outputs/feedback_log.jsonl
-TRAINING_PLAN_DIR=data/training_plans
-SYLLABUS_DIR=data/syllabi
-CHUNKED_OUTPUT_PATH=outputs/chunked_data.json
-KG_OUTPUT_PATH=outputs/kg_extracted_data.json
+# LightRAG
+LIGHTRAG_BASE_URL=http://127.0.0.1:9621
+DEFAULT_QUERY_MODE=mix
+ENABLE_HYDE_EXPANSION=true
+ENABLE_NLI_VERIFICATION=false
+ENABLE_CONCEPT_NORMALIZATION=true
 ```
 
-说明：
+完整的配置项说明见 `.env.example`。
 
-- 如果暂时没有可用的 Neo4j，可以先保留 Neo4j 配置，系统会在部分流程中自动降级
-- 如果你想更换 DeepSeek 模型，可以后续再调整 `TEXT_MODEL`、`RERANK_MODEL`、`JUDGE_MODEL`
-- DeepSeek 官方当前主要提供对话/推理模型；因此默认将 embedding 配置为本地 `sentence-transformers`
-- 如果本地 `sentence-transformers` 首次下载失败，系统会自动退回到纯本地的简易 embedding，不会中断流水线
+## 第四步：启动基础设施
 
-## 第四步：运行离线构建
+### 一键启动（推荐）
 
-推荐直接执行：
+双击 `start_all.bat`，或在 PowerShell 中执行：
 
 ```powershell
-.\run_local_pipeline.ps1
+cd D:\python\zsttSystem1.1\zsttSystem
+.\start_all.bat
 ```
 
-它会顺序运行以下阶段：
+该脚本会依次启动：Embedding 服务（端口 11435）→ LightRAG（端口 9621）→ zsttSystem API（端口 8000）。
 
-- `parsing`
-- `vectorization`
-- `kg`
-- `alignment`
+### 手动分步启动
 
-如果你要单独调试某一阶段，也可以执行：
+如需分别启动各个服务：
+
+**终端 1** — Embedding 服务（本地确定性嵌入，无需下载模型）：
+```powershell
+.venv\Scripts\Activate.ps1
+python -m src.utils.embedding_server --port 11435
+```
+
+**终端 2** — LightRAG 检索引擎：
+```powershell
+.venv\Scripts\Activate.ps1
+set EMBEDDING_DIM=384
+python run_lightrag.py --port 9621 --llm-binding openai --key zstt_local_dev_key
+```
+
+看到 `Uvicorn running on http://0.0.0.0:9621` 表示启动成功。
+
+## 第五步：运行离线管线
+
+打开终端 2：
 
 ```powershell
-python run_pipeline.py --stage parsing
-python run_pipeline.py --stage vectorization
-python run_pipeline.py --stage kg
-python run_pipeline.py --stage alignment
+.\.venv\Scripts\Activate.ps1
+python run_pipeline.py --stage all
 ```
 
-离线构建成功后，常见输出文件包括：
+管线会依次执行：
+1. `parsing`——解析教学大纲和培养方案
+2. `kg`——知识图谱构建（需要 Neo4j）
+3. `alignment`——KG 节点元数据对齐
+4. `module`——课程依赖聚合
+5. `sync`——同步数据到 LightRAG
 
-- `outputs/chunked_data.json`
-- `outputs/kg_extracted_data.json`
-- `vector_store/scholar_collection.json`
-
-## 第五步：启动本地服务
-
-推荐执行：
+如需增量运行（只处理新增/变更的大纲文件）：
 
 ```powershell
-.\start_local_api.ps1
+python run_pipeline.py --incremental
 ```
 
-等价命令为：
+如需单独执行某一阶段：
 
 ```powershell
-python -m uvicorn src.main:app --host 127.0.0.1 --port 8000
+python run_pipeline.py --stage parsing     # 仅解析
+python run_pipeline.py --stage sync        # 仅同步到 LightRAG
 ```
 
-## 第六步：打开演示页面
+## 第六步：启动 zsttSystem API
 
-服务启动后，可以直接在浏览器访问：
+如果未使用 `start_all.bat`，需单独启动：
 
-- `http://127.0.0.1:8000/`：本地演示页
-- `http://127.0.0.1:8000/health`：健康检查接口
+```powershell
+uvicorn src.main:app --host 127.0.0.1 --port 8000
+```
 
-可用接口如下：
+## 第七步：验证
 
-- `GET /`
-- `GET /health`
-- `POST /query`
-- `POST /feedback`
+浏览器访问：
+
+- `http://127.0.0.1:8000/`——演示页面
+- `http://127.0.0.1:8000/health`——健康检查（返回 LightRAG 和 Neo4j 连接状态）
+
+### API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/` | 演示页面 |
+| GET | `/health` | 健康检查 |
+| POST | `/query` | 主问答接口（自动路由） |
+| GET | `/dependency?query=...` | 课程依赖查询 |
+| POST | `/feedback` | 用户反馈 |
+
+### 查询示例
+
+```powershell
+# 复杂问答（自动走 HyDE + LightRAG mix）
+curl -X POST http://127.0.0.1:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "信息组织课程主要讲什么内容？"}'
+
+# 依赖查询（走 Neo4j）
+curl "http://127.0.0.1:8000/dependency?query=数据库原理需要哪些先修课程"
+
+# 简单查询（走 LightRAG naive）
+curl -X POST http://127.0.0.1:8000/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "数据库原理多少学分？"}'
+```
+
+三种查询路径由 QueryRouter 根据意图自动分发，无需手动指定。
 
 ## 常见问题
 
-### 1. 培养方案缺少课程代码和课程名称
+### 1. LightRAG 连接失败
 
-这个问题通常来自 Excel 表头不在第一行。当前代码已经兼容扫描课程表头，如果再次出现，优先检查新增 Excel 的表格结构是否异常。
+检查 `http://127.0.0.1:9621/health` 是否可达。如果 LightRAG 未启动，简单查询和复杂问答会返回 fallback 响应，依赖查询（Neo4j）不受影响。
 
-### 2. embedding 接口报批量上限或参数错误
+### 2. Neo4j 认证失败
 
-当前代码已经做了两层处理：
+Neo4j 不可用时，知识图谱构建和依赖查询功能不可用，但基础的文本索引和检索问答（LightRAG naive 模式）可以正常工作。
 
-- embedding 请求自动分批
-- 超长文本自动截断
+### 3. 管线执行中断
 
-如果仍然报错，优先检查 `.env` 中的模型名和接口密钥。
+支持断点续跑。例如 kg 阶段失败，修复问题后从该阶段继续：
 
-### 3. Neo4j 认证失败
+```powershell
+python run_pipeline.py --stage kg
+python run_pipeline.py --stage alignment
+python run_pipeline.py --stage module
+python run_pipeline.py --stage sync
+```
 
-如果 Neo4j 用户名、密码或地址错误，图谱相关能力会受影响，但当前本地演示流程已经支持降级运行，不会直接阻塞基础问答展示。
+### 4. 增量更新
 
-### 4. 问答接口返回 500
+新增或修改大纲后，使用 `--incremental` 模式只处理变更文件：
 
-优先检查：
+```powershell
+python run_pipeline.py --stage parsing --incremental
+python run_pipeline.py --stage sync
+```
 
-- 服务是否已经重启到最新代码
-- `.env` 是否填写完整
-- 离线构建是否执行成功
-- `outputs/chunked_data.json` 和 `vector_store/scholar_collection.json` 是否已经生成
+也可全量重新处理：
 
-## 建议的本地演示顺序
+```powershell
+python run_pipeline.py --stage parsing --force
+```
+
+增量模式通过 SHA256 文件哈希检测变更，manifest 存储在 `outputs/.file_manifest.json`。
+
+## 建议的演示顺序
 
 1. 激活虚拟环境
 2. 检查 `.env`
-3. 运行 `.\run_local_pipeline.ps1`
-4. 运行 `.\start_local_api.ps1`
-5. 打开 `http://127.0.0.1:8000/`
-6. 输入问题进行展示
+3. 终端 1：`lightrag-server`
+4. 终端 2：`python run_pipeline.py --stage all`
+5. 终端 2：`uvicorn src.main:app --host 127.0.0.1 --port 8000`
+6. 浏览器打开 `http://127.0.0.1:8000/`，输入问题展示
 
 ## 注意事项
 
-- 不要提交真实 `.env`
-- `outputs/` 和 `vector_store/` 会随着本地构建不断更新
-- 如果你修改了代码，重新启动 `uvicorn` 后新逻辑才会生效
+- 不要提交 `.env` 到版本控制
+- 新增或修改大纲后，使用 `--incremental` 增量同步；用 `--force` 强制全量重跑
+- 修改代码后重启 uvicorn 新逻辑才会生效
+- LightRAG 依赖的 `.env` 变量（LLM_BINDING、EMBEDDING_BINDING 等）与 zsttSystem 共用一个 `.env` 文件

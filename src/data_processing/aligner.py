@@ -1,4 +1,4 @@
-"""Link vector-store chunks with graph nodes for bidirectional retrieval."""
+"""Link KG node metadata in Neo4j (vector-side linking removed — delegated to LightRAG)."""
 
 from __future__ import annotations
 
@@ -10,24 +10,16 @@ from typing import Any
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 
-from src.online_service.local_vector_store import LocalVectorCollection
-
 
 class BimodalAligner:
-    """Align ChromaDB chunks with Neo4j graph nodes and run basic consistency checks."""
+    """Align chunks with Neo4j graph nodes (Neo4j metadata only)."""
 
     def __init__(
         self,
-        chroma_db_path: str = "vector_store/",
-        collection_name: str = "scholar_collection",
         neo4j_uri: str = "bolt://localhost:7687",
         neo4j_user: str = "neo4j",
         neo4j_password: str | None = None,
     ) -> None:
-        self.collection = LocalVectorCollection(
-            db_path=chroma_db_path,
-            name=collection_name,
-        )
         self.driver = GraphDatabase.driver(
             neo4j_uri,
             auth=(neo4j_user, neo4j_password or os.getenv("NEO4J_PASSWORD", "")),
@@ -122,34 +114,7 @@ class BimodalAligner:
 
         return mapping
 
-    def link_vector_to_kg(
-        self,
-        chunk_data_path: str = "outputs/chunked_data.json",
-        extracted_kg_data_path: str = "outputs/kg_extracted_data.json",
-    ) -> dict[str, list[str]]:
-        """Attach linked KG node names to the metadata of each vector chunk."""
-        chunks = self._load_json(chunk_data_path)
-        kg_results = self._load_json(extracted_kg_data_path)
-
-        if not isinstance(chunks, list) or not isinstance(kg_results, list):
-            raise ValueError("Chunk data and KG extraction data must both be JSON lists.")
-
-        chunk_to_kg_nodes = self._build_chunk_to_kg_mapping(chunks, kg_results)
-
-        for chunk_id, linked_kg_nodes in chunk_to_kg_nodes.items():
-            existing = self.collection.get(ids=[chunk_id], include=["metadatas"])
-            existing_metadatas = existing.get("metadatas", [])
-            existing_metadata = existing_metadatas[0] if existing_metadatas else {}
-            if existing_metadata is None:
-                existing_metadata = {}
-
-            merged_metadata = dict(existing_metadata)
-            merged_metadata["linked_kg_nodes"] = json.dumps(linked_kg_nodes, ensure_ascii=False)
-            self.collection.update(ids=[chunk_id], metadatas=[merged_metadata])
-
-        return chunk_to_kg_nodes
-
-    def link_kg_to_vector(
+    def link_kg_to_chunks(
         self,
         chunk_data_path: str = "outputs/chunked_data.json",
         extracted_kg_data_path: str = "outputs/kg_extracted_data.json",
@@ -215,58 +180,26 @@ class BimodalAligner:
         """
 
     def consistency_check(self) -> dict[str, Any]:
-        """Check whether verified dependency relations have textual support in source chunks."""
+        """Check KG relation metadata is present (textual support check removed — delegated to LightRAG)."""
         report: dict[str, Any] = {
             "checked_relations": 0,
             "warnings": [],
+            "status": "skipped",
+            "reason": "Textual support check delegated to LightRAG (ChromaDB removed).",
         }
         if not self.graph_enabled:
-            report["status"] = "skipped"
-            report["reason"] = "Neo4j unavailable during local demo run."
             return report
 
         try:
             with self.driver.session() as session:
                 result = session.run(self._consistency_check_cypher())
                 records = list(result)
+                report["checked_relations"] = len(records)
         except (AuthError, ServiceUnavailable, Neo4jError):
             self.graph_enabled = False
-            report["status"] = "skipped"
-            report["reason"] = "Neo4j unavailable during local demo run."
             return report
 
-        for record in records:
-            report["checked_relations"] += 1
-            source_name = str(record["source_name"])
-            target_name = str(record["target_name"])
-            confidence = float(record["confidence"])
-            relation_type = str(record["relation_type"])
-            source_chunk_ids = list(record["source_chunks"] or [])
-            target_chunk_ids = list(record["target_chunks"] or [])
-            candidate_ids = list(dict.fromkeys(source_chunk_ids + target_chunk_ids))
-
-            textual_support_found = False
-            if candidate_ids:
-                chunk_payload = self.collection.get(ids=candidate_ids, include=["documents"])
-                documents = chunk_payload.get("documents", []) or []
-                for document in documents:
-                    text = str(document or "")
-                    if source_name in text and target_name in text:
-                        textual_support_found = True
-                        break
-
-            if confidence >= 0.7 and not textual_support_found:
-                report["warnings"].append(
-                    {
-                        "source": source_name,
-                        "target": target_name,
-                        "confidence": confidence,
-                        "relation_type": relation_type,
-                        "status": "待人工审核",
-                        "reason": f"High-confidence {relation_type} relation lacks direct textual evidence in linked chunks.",
-                    }
-                )
-
+        # LightRAG handles retrieval quality; skip per-relation text verification
         return report
 
     def align_concept_nodes_to_chunks(
@@ -277,6 +210,18 @@ class BimodalAligner:
     ) -> dict[str, list[str]]:
         """Write source_chunk_ids onto concept dependency Knowledge_Point nodes in Neo4j."""
         if not self.graph_enabled:
+            return {}
+
+        # Concept files are produced by ConceptNormalizer; if that stage was
+        # skipped they won't exist.  Degrade gracefully like kg_builder /
+        # module_dependency instead of crashing the whole pipeline.
+        if not Path(concept_edge_path).exists():
+            print(f"[alignment] No verified concept edges at {concept_edge_path}; "
+                  "skipped concept node alignment.")
+            return {}
+        if not Path(concept_registry_path).exists():
+            print(f"[alignment] No concept registry at {concept_registry_path}; "
+                  "skipped concept node alignment.")
             return {}
 
         chunks = self._load_json(chunk_data_path)
@@ -352,12 +297,8 @@ class BimodalAligner:
         concept_edge_path: str = "outputs/concept_verified_edges.json",
         concept_registry_path: str = "outputs/concept_registry.json",
     ) -> dict[str, Any]:
-        """Run vector-to-KG linking, KG-to-vector linking, concept node alignment, and consistency checks."""
-        chunk_to_kg_nodes = self.link_vector_to_kg(
-            chunk_data_path=chunk_data_path,
-            extracted_kg_data_path=extracted_kg_data_path,
-        )
-        node_to_chunk_ids = self.link_kg_to_vector(
+        """Run KG-to-chunk linking, concept node alignment, and consistency checks."""
+        node_to_chunk_ids = self.link_kg_to_chunks(
             chunk_data_path=chunk_data_path,
             extracted_kg_data_path=extracted_kg_data_path,
         )
@@ -369,7 +310,6 @@ class BimodalAligner:
         report = self.consistency_check()
 
         summary = {
-            "linked_chunks": len(chunk_to_kg_nodes),
             "linked_nodes": len(node_to_chunk_ids),
             "aligned_concept_nodes": len(concept_alignment),
             "consistency_report": report,
@@ -379,11 +319,11 @@ class BimodalAligner:
 
 
 def main() -> None:
-    """Provide a simple CLI for bimodal alignment."""
+    """Provide a simple CLI for bimodal alignment (Neo4j metadata only)."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Align ChromaDB chunks with Neo4j knowledge graph nodes."
+        description="Align chunks with Neo4j knowledge graph nodes (Neo4j metadata only)."
     )
     parser.add_argument(
         "--chunk-data-path",
@@ -394,16 +334,6 @@ def main() -> None:
         "--kg-data-path",
         default="outputs/kg_extracted_data.json",
         help="Path to saved KG extraction results.",
-    )
-    parser.add_argument(
-        "--chroma-db-path",
-        default="vector_store/",
-        help="Path to the persistent ChromaDB directory.",
-    )
-    parser.add_argument(
-        "--collection-name",
-        default="scholar_collection",
-        help="ChromaDB collection name.",
     )
     parser.add_argument(
         "--neo4j-uri",
@@ -423,8 +353,6 @@ def main() -> None:
     args = parser.parse_args()
 
     aligner = BimodalAligner(
-        chroma_db_path=args.chroma_db_path,
-        collection_name=args.collection_name,
         neo4j_uri=args.neo4j_uri,
         neo4j_user=args.neo4j_user,
         neo4j_password=args.neo4j_password,

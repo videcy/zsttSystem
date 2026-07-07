@@ -61,7 +61,7 @@ class Config:
         return os.getenv("LOCAL_EMBEDDING_MODEL", self.embedding_model).strip()
 
     @property
-    def embedding_max_chars(self) -> int | None:
+    def embedding_max_chars(self) -> int:
         val = os.getenv("EMBEDDING_MAX_CHARS", "").strip()
         return int(val) if val else 3000
 
@@ -201,6 +201,35 @@ class Config:
     @property
     def openai_base_url(self) -> str:
         return os.getenv("OPENAI_BASE_URL", "").strip()
+
+    # -- LightRAG integration -------------------------------------------------
+    @property
+    def lightrag_base_url(self) -> str:
+        return os.getenv("LIGHTRAG_BASE_URL", "http://127.0.0.1:9621").strip()
+
+    @property
+    def lightrag_api_key(self) -> str:
+        return os.getenv("LIGHTRAG_API_KEY", "").strip()
+
+    @property
+    def default_query_mode(self) -> str:
+        return os.getenv("DEFAULT_QUERY_MODE", "mix").strip()
+
+    @property
+    def enable_query_classification(self) -> bool:
+        return _bool(os.getenv("ENABLE_QUERY_CLASSIFICATION", "true"))
+
+    @property
+    def enable_hyde_expansion(self) -> bool:
+        return _bool(os.getenv("ENABLE_HYDE_EXPANSION", "true"))
+
+    @property
+    def enable_nli_verification(self) -> bool:
+        return _bool(os.getenv("ENABLE_NLI_VERIFICATION", "false"))
+
+    @property
+    def enable_concept_normalization(self) -> bool:
+        return _bool(os.getenv("ENABLE_CONCEPT_NORMALIZATION", "true"))
 
 
 config = Config()

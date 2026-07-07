@@ -7,5 +7,23 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .env
+.env.local
+.env.production
+
+# 运行时产物
 outputs/*.jsonl
+outputs/*.json
+outputs/.file_manifest.json
 vector_store/
+rag_storage/
+logs/
+*.log
+lightrag.log
+
+# 临时文件
+.claude/
+.dockerignore
+*.db-journal
+
+# Docker
+docker-compose.override.yml

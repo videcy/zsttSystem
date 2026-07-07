@@ -1,2 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Windows 批处理/CMD 脚本必须用 CRLF，否则 cmd 解析错乱
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# PowerShell 在 Windows 上也用 CRLF
+*.ps1 text eol=crlf
+
+# Unix shell 脚本必须保持 LF
+*.sh text eol=lf

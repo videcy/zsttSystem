@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
-import os
+import logging
 import re
 from typing import Any
 
+from src.config import config
 from src.utils.deepseek_client import generate_json_value
+
+logger = logging.getLogger(__name__)
 
 
 DEPENDENCY_RELATION_TYPES = (
@@ -30,12 +33,15 @@ def extract_query_entities(question: str, llm_client: Any) -> dict[str, list[str
     try:
         payload = generate_json_value(
             llm_client,
-            os.getenv("TEXT_MODEL", "deepseek-v4-flash"),
+            config.text_model,
             prompt,
             temperature=0.0,
             max_output_tokens=200,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "[dependency_explainer] LLM entity extraction failed, using fallback: %s", exc
+        )
         payload = _fallback_extract_query_entities(question)
 
     if not isinstance(payload, dict):
@@ -252,12 +258,15 @@ def generate_dependency_explanation(
     try:
         payload = generate_json_value(
             llm_client,
-            os.getenv("TEXT_MODEL", "deepseek-v4-flash"),
+            config.text_model,
             prompt,
             temperature=0.1,
             max_output_tokens=900,
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "[dependency_explainer] LLM explanation generation failed, using fallback: %s", exc
+        )
         payload = {}
 
     if not isinstance(payload, dict):
