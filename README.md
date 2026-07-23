@@ -4,7 +4,7 @@
 
 - FastAPI 提供查询、课程和反馈 API。
 - ChromaDB 保存课程文本向量并执行语义检索。
-- Neo4j 提供可选的课程依赖图查询。
+- 本地 Neo4j Community 保存课程依赖图并执行图查询。
 - DeepSeek 或其他兼容 OpenAI Chat Completions 的模型生成基于证据的回答。
 
 项目不依赖 LightRAG，也不需要单独的 Embedding HTTP 服务。
@@ -18,7 +18,7 @@ DOCX/XLSX
 离线管线：parse → concept → graph → embed
     │                    │        │
     │                    │        └── ChromaDB
-    │                    └─────────── Neo4j（可选）
+    │                    └─────────── Neo4j Community
     ▼
 FastAPI → QueryRouter → ChromaDB / Neo4j → DeepSeek
 ```
@@ -27,8 +27,7 @@ FastAPI → QueryRouter → ChromaDB / Neo4j → DeepSeek
 
 - Python 3.11 或 3.12
 - DeepSeek API 密钥
-- Docker Desktop（推荐，用于启动 ChromaDB）
-- Neo4j（可选，仅依赖关系查询需要）
+- Docker Desktop（用于启动 ChromaDB 和 Neo4j Community）
 
 ## 快速开始
 
@@ -59,16 +58,26 @@ DEEPSEEK_API_KEY=your-deepseek-api-key
 CHROMA_MODE=http
 CHROMA_HOST=127.0.0.1
 CHROMA_PORT=8001
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your-secure-local-password
 ```
 
-### 2. 启动 ChromaDB
+Neo4j 密码至少应为 8 个字符。
+
+### 2. 启动 ChromaDB 和 Neo4j
 
 ```bash
-docker compose up -d chromadb
+docker compose up -d --wait chromadb neo4j
 ```
 
-服务仅监听宿主机 `127.0.0.1:8001`，数据保存在 Docker 命名卷
-`chroma_data` 中。
+服务只监听本机：
+
+- ChromaDB：`127.0.0.1:8001`
+- Neo4j Browser：`http://127.0.0.1:7474`
+- Neo4j Bolt：`127.0.0.1:7687`
+
+数据分别保存在 Docker 命名卷 `chroma_data` 和 `neo4j_data` 中。
 
 检查容器状态：
 
@@ -86,7 +95,7 @@ python run_pipeline.py --stage all
 
 1. `parse`：解析培养方案和教学大纲。
 2. `concept`：提取课程级概念。
-3. `graph`：生成图摘要，并在 Neo4j 可用时写入图数据。
+3. `graph`：生成图摘要并写入本地 Neo4j Community。
 4. `embed`：生成向量并写入 ChromaDB 的 `zstt_chunks` collection。
 
 单独运行阶段：
@@ -122,7 +131,8 @@ Windows 也可以运行：
 .\start_all.bat
 ```
 
-该脚本会从脚本所在目录启动 ChromaDB 和 FastAPI，不依赖本机绝对路径。
+该脚本会从脚本所在目录启动 ChromaDB、Neo4j 和 FastAPI，不依赖本机
+绝对路径，并等待 Neo4j 健康检查通过后再启动 API。
 
 ### 5. 验证
 
@@ -166,7 +176,7 @@ VECTOR_DB_PATH=chroma_data
 
 - `fact`：优先匹配课程结构化信息，然后查询 ChromaDB。
 - `content`：从 ChromaDB 返回最相关课程片段。
-- `dependency`：查询 Neo4j；Neo4j 不可用时返回降级响应。
+- `dependency`：查询本地 Neo4j；数据库不可用时返回降级响应。
 - `hybrid`：组合 ChromaDB 证据、Neo4j 路径和 LLM 生成。
 
 LLM 暂时不可用时，hybrid 查询会退化为返回检索证据，不会直接产生
@@ -224,7 +234,18 @@ python run_pipeline.py --stage embed
 
 ### Neo4j 不可用
 
-内容检索仍可正常使用。只有 dependency 查询和 hybrid 图路径会降级。
+```bash
+docker compose ps neo4j
+docker compose logs neo4j
+```
+
+确认 `.env` 中使用 `bolt://127.0.0.1:7687`，且 API 使用的密码与
+Docker Compose 初始化密码一致。首次创建 `neo4j_data` 后，修改
+`NEO4J_PASSWORD` 不会自动修改已有数据库密码；需要在 Neo4j 中修改密码，
+或明确删除本地开发卷后重新初始化。
+
+内容检索不依赖 Neo4j；数据库停止时，只有 dependency 查询和 hybrid 图
+路径会降级。
 
 ### Embedding 模型无法下载
 
