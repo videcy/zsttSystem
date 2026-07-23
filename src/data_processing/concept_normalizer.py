@@ -9,6 +9,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,7 @@ class ConceptNormalizer:
         score_weight_rule: float | None = None,
         llm_vote_count: int | None = None,
         llm_vote_temperature: float | None = None,
+        api_concurrency: int | None = None,
     ) -> None:
         self.llm_model_name = llm_model_name or config.text_model
         self.embedding_model_name = embedding_model_name or config.concept_normalization_model
@@ -105,6 +107,10 @@ class ConceptNormalizer:
             llm_vote_temperature if llm_vote_temperature is not None
             else config.concept_llm_vote_temperature
         )
+        self.api_concurrency = max(
+            1,
+            api_concurrency if api_concurrency is not None else config.concept_api_concurrency,
+        )
         self._normalize_score_weights()
         self.api_client = create_deepseek_client()
         self.embedding_client = self.api_client
@@ -139,16 +145,20 @@ class ConceptNormalizer:
         if not chunks:
             return [], [], {}
 
-        extracted_by_chunk: list[list[dict[str, str]]] = []
-        all_concepts: list[dict[str, str]] = []
-        for chunk in chunks:
+        def extract_chunk(chunk: dict[str, Any]) -> list[dict[str, str]]:
             metadata = chunk.get("metadata", {})
             chunk_text = str(chunk.get("text", "")).strip()
-            concepts = self.extract_core_concepts(
+            return self.extract_core_concepts(
                 chunk_text,
                 metadata if isinstance(metadata, dict) else {},
             )
-            extracted_by_chunk.append(concepts)
+
+        with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
+            # executor.map preserves input order, keeping generated artifacts deterministic.
+            extracted_by_chunk = list(executor.map(extract_chunk, chunks))
+
+        all_concepts: list[dict[str, str]] = []
+        for concepts in extracted_by_chunk:
             all_concepts.extend(concepts)
 
         alias_table, canonical_registry = self._canonicalize_concepts(all_concepts)
@@ -260,13 +270,16 @@ class ConceptNormalizer:
             return []
 
         concept_lookup = {item["id"]: item for item in canonical_registry}
-        verified_edges: list[dict[str, Any]] = []
-        for candidate in candidate_links:
+        def verify_candidate(candidate: dict[str, Any]) -> dict[str, Any] | None:
             source = concept_lookup.get(candidate["source_id"])
             target = concept_lookup.get(candidate["target_id"])
             if source is None or target is None:
-                continue
-            verified_edges.append(self._llm_verify_candidate(candidate, source, target))
+                return None
+            return self._llm_verify_candidate(candidate, source, target)
+
+        with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
+            verified_results = executor.map(verify_candidate, candidate_links)
+            verified_edges = [edge for edge in verified_results if edge is not None]
 
         verified_edges.sort(
             key=lambda item: (-item["confidence"], item["target_id"], item["source_id"])

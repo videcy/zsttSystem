@@ -14,11 +14,13 @@ __pycache__/
 outputs/*.jsonl
 outputs/*.json
 outputs/.file_manifest.json
+chroma_data/
 vector_store/
 rag_storage/
 logs/
 *.log
 lightrag.log
+outputs/*.npy
 
 # 临时文件
 .claude/

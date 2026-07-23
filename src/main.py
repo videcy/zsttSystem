@@ -2,8 +2,7 @@
 FastAPI entry point for the zsttSystem v2.0 online RAG-KG service.
 
 Architecture (Plan C):
-  zsttSystem domain layer  ──HTTP API──>  LightRAG retrieval engine
-  (concept normalisation, dependency reasoning, NLI verification)
+  ChromaDB vector retrieval + Neo4j dependency graph + DeepSeek generation
 
 Endpoints:
   GET  /              Demo page
@@ -14,6 +13,8 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,8 +33,8 @@ from src.online_service.feedback_handler import (
     build_feedback_log_record,
     build_query_log_record,
 )
-from src.online_service.lightrag_adapter import LightRAGClient
 from src.online_service.query_router import QueryRouter
+from src.online_service.chroma_retriever import ChromaRetriever
 from src.utils.deepseek_client import create_deepseek_client
 
 
@@ -73,35 +74,29 @@ async def lifespan(app: FastAPI):
     # LLM client (DeepSeek) – used for HyDE, dependency reasoning, NLI
     llm_client = create_deepseek_client()
 
-    # LightRAG client
-    lightrag = LightRAGClient()
-    lightrag_available = lightrag.health_check()
-    if lightrag_available:
-        print("[lifespan] LightRAG server is reachable.")
-    else:
-        print("[lifespan] WARNING: LightRAG server is NOT reachable – "
-              "retrieval-dependent queries will return fallback responses.")
-
     # Query router
-    router = QueryRouter(lightrag)
+    vector_retriever = ChromaRetriever(config.local_embedding_model)
+    router = QueryRouter(vector_retriever)
 
     # Neo4j driver
     neo4j_driver = None
+    candidate = None
     try:
-        candidate = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        candidate.verify_connectivity()
+        candidate = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD), connection_timeout=2, connection_acquisition_timeout=2)
+        await asyncio.to_thread(candidate.verify_connectivity)
         neo4j_driver = candidate
         print("[lifespan] Neo4j connection established.")
     except (AuthError, ServiceUnavailable, Neo4jError):
+        if candidate is not None:
+            candidate.close()
         print("[lifespan] WARNING: Neo4j is not available – "
               "dependency queries will return fallback responses.")
 
     # Store on app.state
     app.state.llm_client = llm_client
-    app.state.lightrag = lightrag
-    app.state.lightrag_available = lightrag_available
     app.state.router = router
     app.state.neo4j_driver = neo4j_driver
+    app.state.vector_retriever = vector_retriever
 
     try:
         yield
@@ -129,10 +124,16 @@ async def demo_home() -> str:
 @app.get("/health")
 async def healthcheck() -> dict[str, Any]:
     """Health check – reports backend availability."""
+    retriever = getattr(app.state, "vector_retriever", None)
+    chroma_connected = bool(retriever and retriever.connected)
+    chunk_count = retriever.count if retriever else 0
     return {
-        "status": "ok",
-        "lightrag": "connected" if app.state.lightrag_available else "unavailable",
+        "status": "ok" if chroma_connected and chunk_count > 0 else "degraded",
         "neo4j": "connected" if app.state.neo4j_driver else "unavailable",
+        "chroma": "connected" if chroma_connected else "unavailable",
+        "vector_index": "loaded" if chunk_count > 0 else "empty",
+        "embedding_model": "loaded" if chunk_count > 0 else "unavailable",
+        "chunk_count": chunk_count,
     }
 
 
@@ -144,8 +145,8 @@ async def process_query(
 
     Routes to the appropriate backend based on query intent:
     - dependency queries → Neo4j concept graph
-    - simple fact lookups → LightRAG naive mode
-    - complex questions  → HyDE expansion + LightRAG mix mode
+    - simple fact lookups → ChromaDB vector retrieval
+    - complex questions  → ChromaDB + Neo4j + grounded generation
     """
     query = request.query.strip()
     if not query:
@@ -172,6 +173,9 @@ async def process_query(
         "query_type": result.query_type,
         "metadata": result.metadata,
     }
+    response["status"] = result.metadata.get("status", "ok")
+    if result.dependency_info and "graph_paths" not in response:
+        response["graph_paths"] = result.dependency_info.get("paths", [])
     if result.dependency_info:
         response["dependency_info"] = result.dependency_info
 
@@ -182,6 +186,16 @@ async def process_query(
     )
 
     return response
+
+
+@app.get("/courses/{course_code}")
+async def course_info(course_code: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_find_course, course_code)
+
+
+@app.get("/courses/{course_code}/graph")
+async def course_graph(course_code: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_build_course_graph, course_code)
 
 
 @app.get("/dependency")
@@ -224,6 +238,112 @@ async def handle_feedback(feedback: FeedbackRequest) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"invalid local data file: {path.name}",
+        ) from exc
+
+
+def _find_course(course_code: str) -> dict[str, Any]:
+    courses = _load_json(config.courses_output_path, [])
+    for course in courses:
+        if str(course.get("course_code", "")).casefold() == course_code.casefold():
+            return course
+    raise HTTPException(status_code=404, detail="course not found")
+
+
+def _build_course_graph(course_code: str) -> dict[str, Any]:
+    course = _find_course(course_code)
+    canonical_code = str(course["course_code"])
+    concepts = [
+        concept
+        for concept in _load_json(config.concept_cache_path.with_name("concepts.json"), [])
+        if str(concept.get("course_code", "")).casefold()
+        == canonical_code.casefold()
+    ]
+    chunks = [
+        chunk
+        for chunk in _load_json(config.chunks_output_path, [])
+        if str(
+            (chunk.get("metadata") or {}).get("course_code")
+            or chunk.get("course_code", "")
+        ).casefold()
+        == canonical_code.casefold()
+    ]
+
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": canonical_code,
+            "label": "Course",
+            **course,
+        }
+    ]
+    edges: list[dict[str, str]] = []
+    for prerequisite in course.get("prerequisites", []) or []:
+        prerequisite = str(prerequisite)
+        nodes.append(
+            {
+                "id": prerequisite,
+                "label": "Course",
+                "course_code": prerequisite,
+            }
+        )
+        edges.append(
+            {
+                "source": prerequisite,
+                "target": canonical_code,
+                "type": "PREREQUISITE_OF",
+            }
+        )
+    for concept in concepts:
+        concept_id = str(concept.get("concept_id", ""))
+        if not concept_id:
+            continue
+        nodes.append({"id": concept_id, "label": "Concept", **concept})
+        edges.append(
+            {
+                "source": canonical_code,
+                "target": concept_id,
+                "type": "TEACHES",
+            }
+        )
+    for chunk in chunks:
+        chunk_id = str(chunk.get("chunk_id", ""))
+        if not chunk_id:
+            continue
+        nodes.append(
+            {
+                "id": chunk_id,
+                "label": "Chunk",
+                "chunk_id": chunk_id,
+                "section": chunk.get("section"),
+                "source_file": chunk.get("source_file"),
+            }
+        )
+        edges.append(
+            {
+                "source": canonical_code,
+                "target": chunk_id,
+                "type": "CONTAINS",
+            }
+        )
+    return {
+        "course_code": canonical_code,
+        "nodes": nodes,
+        "edges": edges,
+        "summary": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+        },
+    }
+
 
 async def _log_query(
     query_id: str,

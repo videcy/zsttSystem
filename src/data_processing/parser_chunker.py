@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-import uuid
+import hashlib
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -423,11 +423,19 @@ class SyllabusChunker:
                 if not text:
                     continue
 
+                source_file = str(docx_file.relative_to(syllabus_dir).as_posix())
+                section = self._normalize_text(chunk.get("section_title", ""))
+                text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                chunk_id = hashlib.sha256(
+                    f"{source_file}|{section}|{text_hash}".encode("utf-8")
+                ).hexdigest()
                 final_chunks.append(
                     {
-                        "chunk_id": str(uuid.uuid4()),
+                        "chunk_id": chunk_id,
                         "text": text,
-                        "source_file": str(docx_file.relative_to(syllabus_dir)),
+                        "source_file": source_file,
+                        "document_hash": hashlib.sha256(docx_file.read_bytes()).hexdigest(),
+                        "section": section,
                         "metadata": {
                             "course_code": self._normalize_text(course_metadata.get("course_code", "")),
                             "course_name": self._normalize_text(course_metadata.get("course_name", "")),
