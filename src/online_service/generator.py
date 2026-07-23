@@ -1,4 +1,4 @@
-"""Hallucination interception — NLI verification only (generation delegated to LightRAG)."""
+"""Grounded answer generation and optional NLI verification."""
 
 from __future__ import annotations
 
@@ -8,6 +8,15 @@ from typing import Any
 
 from src.config import config
 from src.utils.deepseek_client import generate_json, generate_text
+
+
+def generate_answer_once(query: str, evidence: str, llm_client: Any = None) -> str:
+    """Single-pass grounded answer generation used by the lightweight router."""
+    if llm_client is None:
+        return evidence[:1200]
+    prompt = ("仅根据给定证据回答问题，不要补充证据之外的事实。\n"
+              f"问题：{query}\n证据：{evidence}")
+    return generate_text(llm_client, config.text_model, prompt, temperature=0.1, max_output_tokens=512) or evidence[:1200]
 
 
 def _split_sentences(answer: str) -> list[str]:

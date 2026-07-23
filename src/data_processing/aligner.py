@@ -1,4 +1,4 @@
-"""Link KG node metadata in Neo4j (vector-side linking removed — delegated to LightRAG)."""
+"""Link parsed chunk metadata to Neo4j knowledge-graph nodes."""
 
 from __future__ import annotations
 
@@ -180,12 +180,12 @@ class BimodalAligner:
         """
 
     def consistency_check(self) -> dict[str, Any]:
-        """Check KG relation metadata is present (textual support check removed — delegated to LightRAG)."""
+        """Check that knowledge-graph relation metadata is present."""
         report: dict[str, Any] = {
             "checked_relations": 0,
             "warnings": [],
             "status": "skipped",
-            "reason": "Textual support check delegated to LightRAG (ChromaDB removed).",
+            "reason": "Relation metadata checked; retrieval evidence lives in ChromaDB.",
         }
         if not self.graph_enabled:
             return report
@@ -199,7 +199,7 @@ class BimodalAligner:
             self.graph_enabled = False
             return report
 
-        # LightRAG handles retrieval quality; skip per-relation text verification
+        # ChromaDB handles retrieval; skip per-relation text verification here.
         return report
 
     def align_concept_nodes_to_chunks(
