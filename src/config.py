@@ -93,7 +93,27 @@ class Config:
     # -- Paths ---------------------------------------------------------------
     @property
     def vector_db_path(self) -> Path:
-        return _path(os.getenv("VECTOR_DB_PATH", "vector_store"))
+        return _path(os.getenv("VECTOR_DB_PATH", "chroma_data"))
+
+    @property
+    def chroma_mode(self) -> str:
+        return os.getenv("CHROMA_MODE", "local").strip().lower()
+
+    @property
+    def chroma_host(self) -> str:
+        return os.getenv("CHROMA_HOST", "127.0.0.1").strip()
+
+    @property
+    def chroma_port(self) -> int:
+        return int(os.getenv("CHROMA_PORT", "8001"))
+
+    @property
+    def chroma_ssl(self) -> bool:
+        return _bool(os.getenv("CHROMA_SSL", "false"))
+
+    @property
+    def chroma_collection(self) -> str:
+        return os.getenv("CHROMA_COLLECTION", "zstt_chunks").strip()
 
     @property
     def query_log_path(self) -> Path:
@@ -112,12 +132,20 @@ class Config:
         return _path(os.getenv("SYLLABUS_DIR", "data/syllabi"))
 
     @property
-    def chunked_output_path(self) -> Path:
-        return _path(os.getenv("CHUNKED_OUTPUT_PATH", "outputs/chunked_data.json"))
+    def courses_output_path(self) -> Path:
+        return _path(os.getenv("COURSES_OUTPUT_PATH", "outputs/courses.json"))
 
     @property
-    def kg_output_path(self) -> Path:
-        return _path(os.getenv("KG_OUTPUT_PATH", "outputs/kg_extracted_data.json"))
+    def chunks_output_path(self) -> Path:
+        return _path(os.getenv("CHUNKS_OUTPUT_PATH", "outputs/chunks.json"))
+
+    @property
+    def concept_cache_path(self) -> Path:
+        return _path(os.getenv("CONCEPT_CACHE_PATH", "outputs/concept_cache.json"))
+
+    @property
+    def graph_manifest_path(self) -> Path:
+        return _path(os.getenv("GRAPH_MANIFEST_PATH", "outputs/graph_manifest.json"))
 
     @property
     def concept_registry_path(self) -> Path:
@@ -177,6 +205,10 @@ class Config:
         return int(os.getenv("CONCEPT_LLM_VOTE_COUNT", "3"))
 
     @property
+    def concept_api_concurrency(self) -> int:
+        return max(1, int(os.getenv("CONCEPT_API_CONCURRENCY", "4")))
+
+    @property
     def concept_llm_vote_temperature(self) -> float:
         return float(os.getenv("CONCEPT_LLM_VOTE_TEMPERATURE", "0.2"))
 
@@ -201,35 +233,5 @@ class Config:
     @property
     def openai_base_url(self) -> str:
         return os.getenv("OPENAI_BASE_URL", "").strip()
-
-    # -- LightRAG integration -------------------------------------------------
-    @property
-    def lightrag_base_url(self) -> str:
-        return os.getenv("LIGHTRAG_BASE_URL", "http://127.0.0.1:9621").strip()
-
-    @property
-    def lightrag_api_key(self) -> str:
-        return os.getenv("LIGHTRAG_API_KEY", "").strip()
-
-    @property
-    def default_query_mode(self) -> str:
-        return os.getenv("DEFAULT_QUERY_MODE", "mix").strip()
-
-    @property
-    def enable_query_classification(self) -> bool:
-        return _bool(os.getenv("ENABLE_QUERY_CLASSIFICATION", "true"))
-
-    @property
-    def enable_hyde_expansion(self) -> bool:
-        return _bool(os.getenv("ENABLE_HYDE_EXPANSION", "true"))
-
-    @property
-    def enable_nli_verification(self) -> bool:
-        return _bool(os.getenv("ENABLE_NLI_VERIFICATION", "false"))
-
-    @property
-    def enable_concept_normalization(self) -> bool:
-        return _bool(os.getenv("ENABLE_CONCEPT_NORMALIZATION", "true"))
-
 
 config = Config()

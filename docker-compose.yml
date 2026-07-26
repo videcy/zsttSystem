@@ -1,46 +1,38 @@
-# zsttSystem + LightRAG 基础设施
-# 使用方式:
-#   # 终端1: 本地 embedding 服务（供 LightRAG 容器使用）
-#   python3 -m src.utils.embedding_server --port 11435
-#
-#   # 终端2: LightRAG + Neo4j
-#   docker compose up -d lightrag
-#
-# 注意：Docker Hub（docker.io）在某些网络下被封锁，
-# 需先 pull lightrag 镜像：docker pull ghcr.io/hkuds/lightrag:latest
-
 services:
-  # ===== LightRAG 检索引擎 =====
-  lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
-    container_name: zstt_lightrag
+  chromadb:
+    image: chromadb/chroma:1.5.9
+    container_name: zstt_chromadb
     ports:
-      - "9621:9621"
+      - "127.0.0.1:8001:8000"
     environment:
-      # LLM: DeepSeek（兼容 OpenAI API）
-      - LLM_BINDING=openai
-      - LLM_BINDING_API_KEY=${DEEPSEEK_API_KEY:?err}
-      - LLM_BINDING_HOST=https://api.deepseek.com
-      - LLM_MODEL=${TEXT_MODEL:-deepseek-v4-flash}
-      # Embedding: 指向宿主机上的本地 embedding 服务
-      - EMBEDDING_BINDING=openai
-      - EMBEDDING_BINDING_API_KEY=not-needed
-      - EMBEDDING_BINDING_HOST=http://host.docker.internal:11435
-      - EMBEDDING_MODEL=local-embedding
-      - LIGHTRAG_ENABLE_API_KEY=true
-      - LIGHTRAG_API_KEY=${LIGHTRAG_API_KEY:-zstt_local_dev_key}
-      - SUMMARY_LANGUAGE=Chinese
+      ANONYMIZED_TELEMETRY: "FALSE"
     volumes:
-      - lightrag_data:/app/data
+      - chroma_data:/data
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
-  # ===== Neo4j 图数据库（可选） =====
-  # 用户已有 Neo4j AuraDB 云实例，无需本地部署
-  # neo4j:
-  #   image: neo4j:5-community
-  #   ...
+  neo4j:
+    image: neo4j:2026.06.0
+    container_name: zstt_neo4j
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687
+          -u neo4j -p "$${NEO4J_AUTH#*/}" "RETURN 1"
+          >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
 
 volumes:
-  lightrag_data:
+  chroma_data:
+  neo4j_data:

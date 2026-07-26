@@ -58,6 +58,9 @@ def build_query_log_record(
     linked_entities: list[str],
     citations: list[dict[str, Any]],
     status: str,
+    persona: str = "student",
+    persona_mode: str = "retrieval",
+    persona_profile_version: str = "v1",
 ) -> dict[str, Any]:
     """Create a structured query log record."""
     return {
@@ -71,6 +74,9 @@ def build_query_log_record(
         "linked_entities": linked_entities,
         "citations": citations,
         "status": status,
+        "persona": persona,
+        "persona_mode": persona_mode,
+        "persona_profile_version": persona_profile_version,
     }
 
 

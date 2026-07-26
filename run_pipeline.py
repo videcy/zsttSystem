@@ -1,25 +1,27 @@
 """Command-line entry point for the offline zsttSystem data pipeline.
 
-With Plan C, the vectorisation stage is delegated to LightRAG.
-Use ``--sync`` (or ``--stage sync``) after parsing + kg to push enriched chunks.
-Use ``--incremental`` to skip unchanged syllabus files based on a SHA256 manifest.
+Use ``--incremental`` to skip unchanged syllabus files based on a SHA256
+manifest. The ``all`` stage builds local parsing, concept, graph, and vector
+artifacts in ChromaDB and optional Neo4j.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
+from neo4j.exceptions import Neo4jError, ServiceUnavailable, AuthError
 
 from src.config import config
-from src.data_processing.aligner import BimodalAligner
-from src.data_processing.concept_normalizer import ConceptNormalizer
-from src.data_processing.data_bridge import run_sync
-from src.data_processing.kg_builder import KnowledgeGraphBuilder
-from src.data_processing.module_dependency import ModuleDependencyBuilder
 from src.data_processing.parser_chunker import SyllabusChunker
+from src.data_processing.chroma_index import build_index
+from src.data_processing.concept_extractor import extract_course_concepts
+from src.data_processing.graph_builder import build_graph_records, write_neo4j
 from src.utils.file_manifest import FileManifest
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -28,10 +30,8 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Paths
 TRAINING_PLAN_DIR = config.training_plan_dir
 SYLLABUS_DIR = config.syllabus_dir
-CHUNKED_OUTPUT_PATH = config.chunked_output_path
-KG_OUTPUT_PATH = config.kg_output_path
-CONCEPT_REGISTRY_PATH = config.concept_registry_path
-CONCEPT_VERIFIED_EDGE_PATH = config.concept_verified_edge_path
+CHUNKS_OUTPUT_PATH = config.chunks_output_path
+OUTPUT_DIR = CHUNKS_OUTPUT_PATH.parent
 NEO4J_URI = config.neo4j_uri
 NEO4J_USER = config.neo4j_user
 NEO4J_PASSWORD = config.neo4j_password
@@ -52,36 +52,36 @@ def run_parsing(*, incremental: bool = False, force: bool = False) -> None:
     """
     chunker = SyllabusChunker()
 
-    if incremental and not force and CHUNKED_OUTPUT_PATH.exists():
+    if incremental and not force and CHUNKS_OUTPUT_PATH.exists():
         _incremental_parse(chunker)
     else:
         results = chunker.run(
             plan_dir=TRAINING_PLAN_DIR,
             syllabus_dir=SYLLABUS_DIR,
-            output_path=CHUNKED_OUTPUT_PATH,
+            output_path=CHUNKS_OUTPUT_PATH,
         )
         tag = "force" if force else "full"
-        print(f"[parsing] ({tag}) Generated {len(results)} chunks → {CHUNKED_OUTPUT_PATH}")
+        print(f"[parsing] ({tag}) Generated {len(results)} chunks → {CHUNKS_OUTPUT_PATH}")
 
 
 def _incremental_parse(chunker: SyllabusChunker) -> None:
-    """Detect changed syllabus files and patch chunked_data.json in-place."""
+    """Detect changed syllabus files and patch chunks.json in-place."""
     manifest = FileManifest()
+    course_catalog = chunker.parse_training_plans(TRAINING_PLAN_DIR)
+    training_plan_chunks = chunker.build_training_plan_chunks(course_catalog)
     syllabus_files = sorted(
         p for p in SYLLABUS_DIR.rglob("*.docx") if not p.name.startswith("~$")
     )
 
     added, changed, removed = manifest.check(syllabus_files)
 
-    if not added and not changed and not removed:
-        print("[parsing] (incremental) No changes detected — skipping.")
-        return
-
     # Load existing chunks
-    existing = json.loads(CHUNKED_OUTPUT_PATH.read_text(encoding="utf-8"))
+    existing = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
     existing_by_file: dict[str, list[dict]] = {}
     other_chunks: list[dict] = []
     for ch in existing:
+        if (ch.get("metadata") or {}).get("source_type") == "training_plan":
+            continue
         src = ch.get("source_file", "")
         if src:
             existing_by_file.setdefault(src, []).append(ch)
@@ -96,40 +96,13 @@ def _incremental_parse(chunker: SyllabusChunker) -> None:
     # Re-parse changed / added files
     files_to_parse = added + changed
     if files_to_parse:
-        # Load training plan metadata (read once)
-        all_course_metadata: dict[str, dict] = {}
-        for xlsx_file in sorted(TRAINING_PLAN_DIR.glob("*.xlsx")):
-            all_course_metadata.update(chunker.parse_training_plan(xlsx_file))
-
         for f in files_to_parse:
             rel = str(f.relative_to(SYLLABUS_DIR).as_posix())
-            syllabus_chunks = chunker.parse_syllabus(f)
-            if not syllabus_chunks:
-                continue
-
-            course_metadata = chunker._match_course_metadata(
-                f, syllabus_chunks, all_course_metadata,
+            new_chunks = chunker.build_syllabus_chunks(
+                f,
+                SYLLABUS_DIR,
+                course_catalog,
             )
-            new_chunks: list[dict] = []
-            # Import uuid here for chunk_id generation
-            import uuid
-            for chk in syllabus_chunks:
-                text_parts = [chk.get("section_title", ""), chk.get("content", "")]
-                text = chunker._normalize_text("\n\n".join(part for part in text_parts if part))
-                if not text:
-                    continue
-                new_chunks.append({
-                    "chunk_id": str(uuid.uuid4()),
-                    "text": text,
-                    "source_file": rel,
-                    "metadata": {
-                        "course_code": chunker._normalize_text(course_metadata.get("course_code", "")),
-                        "course_name": chunker._normalize_text(course_metadata.get("course_name", "")),
-                        "syllabus_section": chunker._normalize_text(chk.get("section_title", "")),
-                        "prerequisites": list(course_metadata.get("prerequisites", [])),
-                        "credits": course_metadata.get("credits"),
-                    },
-                })
 
             old_count = len(existing_by_file.get(rel, []))
             existing_by_file[rel] = new_chunks
@@ -138,116 +111,193 @@ def _incremental_parse(chunker: SyllabusChunker) -> None:
                   f"({old_count}→{len(new_chunks)} chunks)")
 
     # Merge and write
-    merged = list(other_chunks)
+    merged = [*training_plan_chunks, *other_chunks]
     for chunks in existing_by_file.values():
         merged.extend(chunks)
 
-    CHUNKED_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CHUNKED_OUTPUT_PATH.write_text(
+    CHUNKS_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHUNKS_OUTPUT_PATH.write_text(
         json.dumps(merged, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(f"[parsing] (incremental) Merged {len(merged)} chunks → {CHUNKED_OUTPUT_PATH}")
+    print(f"[parsing] (incremental) Merged {len(merged)} chunks → {CHUNKS_OUTPUT_PATH}")
 
     # Update manifest
     manifest.update(syllabus_files)
     manifest.save()
 
 
-def run_concept_normalization() -> None:
-    """Extract & canonicalise teaching concepts, then write the concept
-    registry + verified dependency edges and inject ``core_concepts`` back
-    into ``chunked_data.json`` so the kg / alignment / module stages can use them.
+def run_concept_stage() -> None:
+    chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
+    syllabus_chunks = [
+        chunk
+        for chunk in chunks
+        if (chunk.get("metadata") or {}).get("source_type") != "training_plan"
+    ]
+    concepts = extract_course_concepts(syllabus_chunks, OUTPUT_DIR / "concept_cache.json", config.text_model)
+    (OUTPUT_DIR / "concepts.json").write_text(json.dumps(concepts, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[concept] {len(concepts)} course-level concepts")
 
-    Requires the LightRAG embedding stack? No — it calls DeepSeek directly for
-    concept extraction + pairwise dependency verification, so it can be slow and
-    consumes API quota proportional to the number of chunks and concept pairs.
-    """
-    chunks = json.loads(CHUNKED_OUTPUT_PATH.read_text(encoding="utf-8"))
-    normalizer = ConceptNormalizer()
-    enriched_chunks, registry, _alias = normalizer.preprocess_chunks(
+def run_embed_stage() -> None:
+    chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
+    summary = build_index(
         chunks,
-        registry_output_path=CONCEPT_REGISTRY_PATH,
-        verified_output_path=CONCEPT_VERIFIED_EDGE_PATH,
-        enriched_chunks_output_path=CHUNKED_OUTPUT_PATH,
+        OUTPUT_DIR,
+        model_name=(
+            config.local_embedding_model
+            if config.embedding_provider == "local"
+            else "hash"
+        ),
+        dimensions=config.simple_embedding_dimensions,
     )
     print(
-        f"[concept] {len(registry)} canonical concepts; "
-        f"enriched {len(enriched_chunks)} chunks → {CHUNKED_OUTPUT_PATH}\n"
-        f"[concept] registry → {CONCEPT_REGISTRY_PATH}\n"
-        f"[concept] verified edges → {CONCEPT_VERIFIED_EDGE_PATH}"
+        f"[embed] ChromaDB collection {summary['collection']} "
+        f"contains {summary['count']} chunks"
     )
 
-
-def run_kg_building() -> None:
-    """Extract entities and relations from chunks → Neo4j knowledge graph."""
-    builder = KnowledgeGraphBuilder(
-        neo4j_uri=NEO4J_URI,
-        neo4j_user=NEO4J_USER,
-        neo4j_password=NEO4J_PASSWORD,
-    )
-    try:
-        records = builder.run(
-            json_path=str(CHUNKED_OUTPUT_PATH),
-            output_path=str(KG_OUTPUT_PATH),
-            concept_registry_path=str(CONCEPT_REGISTRY_PATH),
-            concept_edge_path=str(CONCEPT_VERIFIED_EDGE_PATH),
-            reset_concept_subgraph=config.reset_concept_subgraph,
+def run_parse_stage(incremental: bool = False, force: bool = False) -> None:
+    run_parsing(incremental=incremental, force=force)
+    chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
+    chunker = SyllabusChunker()
+    courses = chunker.parse_training_plans(TRAINING_PLAN_DIR)
+    unresolved: list[dict] = []
+    unresolved_keys: set[str] = set()
+    for code, course in courses.items():
+        raw_values = course.get("prerequisites") or []
+        if not isinstance(raw_values, list):
+            raw_values = [raw_values]
+        offerings = course.get("offerings") or []
+        source_file = offerings[0].get("source_file", "") if offerings else ""
+        resolved, pending = chunker.resolve_prerequisites(
+            [
+                name
+                for value in raw_values
+                for name in chunker._split_prerequisites(value)
+            ],
+            courses,
+            dependent_course_code=code,
+            source_file=source_file,
+            section="培养方案课程信息",
+            source_year=chunker._source_year(source_file),
+            source_type="training_plan",
         )
-    finally:
-        builder.close()
-    print(f"[kg] {len(records)} chunk-level KG records → {KG_OUTPUT_PATH}")
+        course["prerequisites"] = [item["course_code"] for item in resolved]
+        course["prerequisite_evidence"] = resolved
+        for item in pending:
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if key not in unresolved_keys:
+                unresolved.append(item)
+                unresolved_keys.add(key)
+    for c in chunks:
+        if (c.get("metadata") or {}).get("source_type") == "training_plan":
+            continue
+        m = c.get("metadata", {})
+        code = m.get("course_code") or c.get("course_code")
+        if code:
+            course = courses.setdefault(
+                code,
+                {
+                    "course_code": code,
+                    "course_name": m.get("course_name", ""),
+                    "credits": m.get("credits"),
+                    "hours": None,
+                    "semester": None,
+                    "instructor": "",
+                    "course_category": "",
+                    "course_subcategory": "",
+                    "prerequisites": [],
+                    "program_names": [],
+                    "offerings": [],
+                },
+            )
+            course["prerequisites"] = list(
+                dict.fromkeys(
+                    [
+                        *(course.get("prerequisites") or []),
+                        *(m.get("prerequisites") or []),
+                    ]
+                )
+            )
+            known_evidence = {
+                json.dumps(item, ensure_ascii=False, sort_keys=True)
+                for item in course.get("prerequisite_evidence", []) or []
+            }
+            for item in m.get("prerequisite_evidence", []) or []:
+                key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                if key not in known_evidence:
+                    course.setdefault("prerequisite_evidence", []).append(item)
+                    known_evidence.add(key)
+            for item in m.get("unresolved_prerequisites", []) or []:
+                key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                if key not in unresolved_keys:
+                    unresolved.append(item)
+                    unresolved_keys.add(key)
 
-
-def run_alignment() -> None:
-    """Link chunk metadata to KG nodes in Neo4j."""
-    aligner = BimodalAligner(
-        neo4j_uri=NEO4J_URI,
-        neo4j_user=NEO4J_USER,
-        neo4j_password=NEO4J_PASSWORD,
+    course_rows = [courses[code] for code in sorted(courses)]
+    (OUTPUT_DIR / "courses.json").write_text(
+        json.dumps(course_rows, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+    (OUTPUT_DIR / "unresolved_prerequisites.json").write_text(
+        json.dumps(unresolved, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def run_graph_stage() -> None:
+    """Write a deterministic graph manifest; Neo4j writing remains optional."""
+    chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
+    concepts = json.loads((OUTPUT_DIR / "concepts.json").read_text(encoding="utf-8")) if (OUTPUT_DIR / "concepts.json").exists() else []
+    courses = json.loads((OUTPUT_DIR / "courses.json").read_text(encoding="utf-8")) if (OUTPUT_DIR / "courses.json").exists() else []
+    graph = build_graph_records(courses, concepts, chunks)
+    neo4j_status = "unavailable"
+    build_id = None
     try:
-        summary = aligner.run(
-            chunk_data_path=str(CHUNKED_OUTPUT_PATH),
-            extracted_kg_data_path=str(KG_OUTPUT_PATH),
-            concept_edge_path=str(CONCEPT_VERIFIED_EDGE_PATH),
-            concept_registry_path=str(CONCEPT_REGISTRY_PATH),
+        driver = GraphDatabase.driver(
+            NEO4J_URI,
+            auth=(NEO4J_USER, NEO4J_PASSWORD),
+            connection_timeout=2,
+            connection_acquisition_timeout=2,
+            max_transaction_retry_time=1,
         )
-    finally:
-        aligner.close()
-    print(
-        f"[alignment] {summary['linked_nodes']} nodes, "
-        f"{summary.get('aligned_concept_nodes', 0)} concept nodes linked."
-    )
+        driver.verify_connectivity()
+        try:
+            write_summary = write_neo4j(
+                driver,
+                graph,
+                courses,
+                concepts,
+                chunks,
+            )
+            build_id = write_summary["build_id"]
+            neo4j_status = "written"
+        finally:
+            driver.close()
+    except (Neo4jError, ServiceUnavailable, AuthError, OSError) as exc:
+        print(f"[graph] Neo4j unavailable: {exc}")
+    manifest = {"build_id": build_id, "courses": sorted({c.get("course_code") for c in courses}), "concepts": [c["concept_id"] for c in concepts], "nodes": len(graph["nodes"]), "edges": len(graph["edges"]), "neo4j": neo4j_status, "updated_at": __import__('datetime').datetime.now().isoformat()}
+    (OUTPUT_DIR / "graph_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[graph] manifest written ({len(manifest['courses'])} courses)")
 
-
-def run_module_dependency() -> None:
-    """Aggregate concept-level edges → course-level dependency edges in Neo4j."""
-    builder = ModuleDependencyBuilder(
-        neo4j_uri=NEO4J_URI,
-        neo4j_user=NEO4J_USER,
-        neo4j_password=NEO4J_PASSWORD,
-    )
-    try:
-        summary = builder.run(
-            concept_registry_path=str(CONCEPT_REGISTRY_PATH),
-            concept_edge_path=str(CONCEPT_VERIFIED_EDGE_PATH),
-        )
-    finally:
-        builder.close()
-    print(
-        f"[module] {summary['module_edge_count']} module dependency edges "
-        f"(Neo4j: {summary.get('written_to_neo4j', 0)})."
-    )
-
-
-def run_lightrag_sync() -> None:
-    """Sync chunked + concept-normalised data to LightRAG."""
-    result = run_sync(
-        chunk_path=str(CHUNKED_OUTPUT_PATH),
-        concept_registry_path=str(CONCEPT_REGISTRY_PATH),
-    )
-    print(f"[sync] LightRAG sync done. success={result['success']}, failed={result['failed']}")
+def run_baseline_stage() -> None:
+    """Freeze a reproducible baseline without requiring external services."""
+    baseline = OUTPUT_DIR / "baseline"
+    baseline.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for src in OUTPUT_DIR.glob("*"):
+        if src.is_file() and src.name != "baseline.json":
+            dst = baseline / src.name
+            shutil.copy2(src, dst)
+            copied.append(src.name)
+    summary = {"created_at": datetime.now(timezone.utc).isoformat(), "outputs": copied, "chunk_count": 0, "api_calls": 0}
+    if CHUNKS_OUTPUT_PATH.exists():
+        try:
+            summary["chunk_count"] = len(
+                json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
+            )
+        except json.JSONDecodeError:
+            pass
+    (baseline / "baseline.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[baseline] saved to {baseline}")
 
 
 # ---------------------------------------------------------------------------
@@ -260,24 +310,15 @@ def build_stage_map(incremental: bool = False, force: bool = False) -> dict[str,
     When *incremental* is True, the parsing stage acts as a patch rather
     than a full re-parse.
     """
-    def _parse():
-        run_parsing(incremental=incremental, force=force)
-
     return {
-        "parsing": [_parse],
-        "concept": [run_concept_normalization],
-        "kg": [run_kg_building],
-        "alignment": [run_alignment],
-        "module": [run_module_dependency],
-        "sync": [run_lightrag_sync],
+        "parse": [lambda: run_parse_stage(incremental=incremental, force=force)],
+        "baseline": [run_baseline_stage],
+        "concept": [run_concept_stage],
         "all": [
-            _parse,
-            run_concept_normalization,
-            run_kg_building,
-            run_alignment,
-            run_module_dependency,
-            run_lightrag_sync,
+            lambda: run_parse_stage(incremental=incremental, force=force), run_concept_stage, run_graph_stage, run_embed_stage,
         ],
+        "graph": [run_graph_stage],
+        "embed": [run_embed_stage],
     }
 
 
@@ -285,7 +326,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="zsttSystem offline data pipeline (v2.0)")
     parser.add_argument(
         "--stage",
-        choices=["parsing", "concept", "kg", "alignment", "module", "sync", "all"],
+        choices=["baseline", "parse", "concept", "graph", "embed", "all"],
         default="all",
         help="Pipeline stage to execute (default: all).",
     )
@@ -303,8 +344,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    CHUNKED_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    KG_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHUNKS_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     args = parse_args()
     stage_map = build_stage_map(

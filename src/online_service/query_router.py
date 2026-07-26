@@ -4,26 +4,37 @@ Query router for the zsttSystem online service.
 Routes user queries to the most appropriate backend based on intent
 classification:
 - **dependency**  → Neo4j concept dependency reasoning (zsttSystem native)
-- **simple**      → LightRAG naive/local mode (fast, low-LLM-cost)
-- **complex**     → zsttSystem HyDE + concept normalisation → LightRAG mix mode
+- **fact/content** → ChromaDB vector retrieval
+- **hybrid**      → ChromaDB + Neo4j + grounded LLM generation
 """
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
 from src.config import config
-from src.online_service.lightrag_adapter import LightRAGClient
+from src.online_service.chroma_retriever import ChromaRetriever
+from src.online_service.persona import (
+    DEFAULT_PERSONA,
+    PERSONA_MODE,
+    PERSONA_PROFILES,
+    PERSONA_PROFILE_VERSION,
+    Persona,
+)
 
 
 class QueryType(Enum):
     DEPENDENCY = "dependency"
-    SIMPLE = "simple"
-    COMPLEX = "complex"
+    FACT = "fact"
+    CONTENT = "content"
+    CATALOG = "catalog"
+    HYBRID = "hybrid"
+    SIMPLE = "fact"
+    COMPLEX = "hybrid"
 
 
 # ---------------------------------------------------------------------------
@@ -39,12 +50,17 @@ _DEPENDENCY_PATTERNS: list[str] = [
     r"(怎么|如何).{0,4}(选修|选课|规划|安排)",
 ]
 
-_SIMPLE_PATTERNS: list[str] = [
-    r"(学分|学时|开课学期|考核方式|任课教师|教材|上课地点|教室)",
+_FACT_PATTERNS: list[str] = [
+    r"(学分|学时|开课学期|考核方式|任课教师|课程负责人|谁负责|负责人|教材|上课地点|教室)",
     r"(课程代码|课程编号|课号)",
     r"(几学分|多少学时|哪个老师|谁教)",
     r"(必修|选修|任选|公选|通识)",
     r"(期末考试|期中|平时成绩|考核|评分).{0,4}(方式|办法|比例|占比)",
+]
+
+_CATALOG_PATTERNS: list[str] = [
+    r"(培养方案|课程设置|课程体系)",
+    r"(专业|主修|辅修).{0,8}(核心课|核心课程|基础课|必修课|选修课|课程)",
 ]
 
 
@@ -70,8 +86,16 @@ class RouteResult:
 class QueryRouter:
     """Intent classifier + dispatcher for the zsttSystem query pipeline."""
 
-    def __init__(self, lightrag: LightRAGClient):
-        self.lightrag = lightrag
+    def __init__(self, vector_retriever: ChromaRetriever | None = None):
+        self.vector_retriever = vector_retriever or ChromaRetriever()
+        self.courses = []
+        if config.courses_output_path.exists():
+            try:
+                self.courses = json.loads(
+                    config.courses_output_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                pass
 
     # ------------------------------------------------------------------
     # Intent classification
@@ -85,11 +109,17 @@ class QueryRouter:
             if re.search(pattern, textual):
                 return QueryType.DEPENDENCY
 
-        for pattern in _SIMPLE_PATTERNS:
+        for pattern in _FACT_PATTERNS:
             if re.search(pattern, textual):
-                return QueryType.SIMPLE
+                return QueryType.FACT
 
-        return QueryType.COMPLEX
+        for pattern in _CATALOG_PATTERNS:
+            if re.search(pattern, textual):
+                return QueryType.CATALOG
+
+        if re.search(r"(主要讲|主要学习|学什么|讲什么|内容|介绍|包括)", textual):
+            return QueryType.CONTENT
+        return QueryType.HYBRID
 
     # ------------------------------------------------------------------
     # Main dispatch
@@ -101,38 +131,523 @@ class QueryRouter:
         *,
         neo4j_driver: Any = None,
         llm_client: Any = None,
-        enable_hyde: Optional[bool] = None,
-        enable_nli: Optional[bool] = None,
+        persona: Persona = DEFAULT_PERSONA,
     ) -> RouteResult:
         """Route a query to the appropriate backend.
 
         Required callbacks for zsttSystem-native paths:
         * ``neo4j_driver`` – Neo4j driver for dependency reasoning.
-        * ``llm_client`` – LLM client for HyDE expansion and NLI verification.
+        * ``llm_client`` – LLM client for grounded hybrid generation.
 
         Returns a ``RouteResult`` with the final answer, citations, and
         metadata indicating which backends were used.
         """
-        enable_hyde = config.enable_hyde_expansion if enable_hyde is None else enable_hyde
-        enable_nli = config.enable_nli_verification if enable_nli is None else enable_nli
         query_type = self.classify(query)
 
         # ---- Path 1: Dependency reasoning (zsttSystem-native) ----
         if query_type == QueryType.DEPENDENCY:
-            return await self._handle_dependency(query, neo4j_driver, llm_client)
-
-        # ---- Path 2: Simple factual query (LightRAG naive) ----
-        if query_type == QueryType.SIMPLE:
-            return await self._handle_simple(query)
-
-        # ---- Path 3: Complex query (HyDE + LightRAG mix) ----
-        return await self._handle_complex(
-            query, llm_client, enable_hyde=enable_hyde, enable_nli=enable_nli
+            result = await self._handle_dependency(query, neo4j_driver, llm_client)
+        elif query_type == QueryType.FACT:
+            # ---- Path 2: ChromaDB retrieval ----
+            result = await self._handle_fact(query)
+        elif query_type == QueryType.CONTENT:
+            result = await self._handle_content(
+                query,
+                llm_client,
+                neo4j_driver=neo4j_driver,
+                persona=persona,
+            )
+        elif query_type == QueryType.CATALOG:
+            result = self._handle_catalog(query)
+        else:
+            # ---- Path 3: ChromaDB + Neo4j + grounded generation ----
+            result = await self._handle_hybrid(
+                query,
+                llm_client,
+                neo4j_driver=neo4j_driver,
+                persona=persona,
+            )
+        result.metadata.update(
+            persona=persona,
+            persona_mode=PERSONA_MODE,
+            persona_profile_version=PERSONA_PROFILE_VERSION,
         )
+        return result
 
     # ------------------------------------------------------------------
     # Path handlers
     # ------------------------------------------------------------------
+    async def _handle_fact(self, query: str) -> RouteResult:
+        course = self._link_course(query)
+        if course:
+            offering = self._select_offering(course, query)
+            requested_fields = [
+                field
+                for field, pattern in (
+                    ("credits", r"学分"),
+                    ("hours", r"学时|课时"),
+                    ("semester", r"学期"),
+                    (
+                        "instructor",
+                        r"任课教师|课程负责人|谁负责|负责人|谁教|哪个老师",
+                    ),
+                )
+                if re.search(pattern, query)
+            ]
+            if requested_fields:
+                labels = {
+                    "credits": "学分",
+                    "hours": "总学时",
+                    "semester": "开课学期",
+                    "instructor": "课程负责人",
+                }
+                facts = []
+                for field in requested_fields:
+                    value = (
+                        offering.get(field)
+                        if offering and offering.get(field) not in (None, "")
+                        else course.get(field)
+                    )
+                    facts.append(f"{labels[field]}为 {value}")
+                citation = self._catalog_citation(course, offering)
+                return RouteResult(
+                    f"{course.get('course_name') or course.get('course_code')}："
+                    f"{'，'.join(facts)}。",
+                    [citation],
+                    "fact",
+                    {
+                        "vector_hits": 0,
+                        "graph_nodes": 0,
+                        "llm_used": False,
+                        "source_type": "training_plan",
+                    },
+                )
+        hits = await asyncio.to_thread(self.vector_retriever.search, query, 5)
+        if not hits:
+            return RouteResult("本地知识库暂无可用证据。", query_type="fact", metadata={"status": "degraded", "error_code": "VECTOR_INDEX_UNAVAILABLE"})
+        return RouteResult(hits[0].get("text", "")[:500], self._vector_citations(hits), "fact", {"vector_hits": len(hits), "graph_nodes": 0, "llm_used": False})
+
+    def _link_course(self, query: str) -> dict[str, Any] | None:
+        lowered = query.lower()
+        matches = [c for c in self.courses if str(c.get("course_code", "")).lower() in lowered or str(c.get("course_name", "")) in query]
+        return max(matches, key=lambda c: len(str(c.get("course_name", "")))) if matches else None
+
+    @staticmethod
+    def _program_keyword(query: str) -> str:
+        if "信管" in query:
+            return "信息管理与信息系统"
+        for keyword in (
+            "信息管理与信息系统",
+            "图书情报与档案管理类",
+            "图书馆学",
+            "档案学",
+        ):
+            if keyword in query:
+                return keyword
+        return ""
+
+    @staticmethod
+    def _program_type_matches(program_type: str, query: str) -> bool:
+        if "辅修微专业" in query or "微专业" in query:
+            return program_type == "辅修微专业"
+        if "辅修" in query:
+            return program_type in {"辅修专业", "辅修微专业"}
+        return program_type in {"主修专业", "主修专业类"}
+
+    def _select_offering(
+        self,
+        course: dict[str, Any],
+        query: str,
+    ) -> dict[str, Any] | None:
+        offerings = list(course.get("offerings") or [])
+        if not offerings:
+            return None
+        program_keyword = self._program_keyword(query)
+        matches = [
+            offering
+            for offering in offerings
+            if (
+                not program_keyword
+                or program_keyword in str(offering.get("program_name", ""))
+            )
+            and self._program_type_matches(
+                str(offering.get("program_type", "")),
+                query,
+            )
+        ]
+        return (matches or offerings)[0]
+
+    @staticmethod
+    def _catalog_citation(
+        course: dict[str, Any],
+        offering: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        offering = offering or {}
+        source_file = str(
+            offering.get("source_file") or course.get("source_file") or ""
+        ).replace("\\", "/")
+        return {
+            "source_file": source_file.rsplit("/", 1)[-1] or None,
+            "course_code": course.get("course_code"),
+            "course_name": course.get("course_name"),
+            "section": "培养方案课程信息",
+        }
+
+    def _handle_catalog(self, query: str) -> RouteResult:
+        program_keyword = self._program_keyword(query)
+        category_keyword = (
+            "核心"
+            if "核心" in query
+            else "基础"
+            if "基础" in query
+            else "必修"
+            if "必修" in query
+            else "选修"
+            if "选修" in query
+            else ""
+        )
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for course in self.courses:
+            for offering in course.get("offerings") or []:
+                program_name = str(offering.get("program_name", ""))
+                category = " ".join(
+                    [
+                        str(offering.get("course_category", "")),
+                        str(offering.get("course_subcategory", "")),
+                    ]
+                )
+                if program_keyword and program_keyword not in program_name:
+                    continue
+                if not self._program_type_matches(
+                    str(offering.get("program_type", "")),
+                    query,
+                ):
+                    continue
+                if category_keyword and category_keyword not in category:
+                    continue
+                matches.append((course, offering))
+                break
+
+        if not matches:
+            return RouteResult(
+                "培养方案中未找到符合条件的课程。",
+                query_type="catalog",
+                metadata={
+                    "status": "degraded",
+                    "error_code": "CATALOG_NO_MATCH",
+                    "llm_used": False,
+                },
+            )
+
+        def sort_key(item: tuple[dict[str, Any], dict[str, Any]]) -> tuple:
+            course, offering = item
+            semester = offering.get("semester")
+            semester_key = float(semester) if isinstance(semester, (int, float)) else 99
+            return semester_key, str(course.get("course_code", ""))
+
+        matches.sort(key=sort_key)
+        lines = [
+            f"{course.get('course_name')}（{course.get('course_code')}）"
+            for course, _offering in matches
+        ]
+        description = (
+            f"{program_keyword or '目标专业'}的"
+            f"{category_keyword or ''}课程包括：\n"
+            + "\n".join(f"{index}. {line}" for index, line in enumerate(lines, 1))
+        )
+        citations: list[dict[str, Any]] = []
+        seen_sources: set[str] = set()
+        for course, offering in matches:
+            citation = self._catalog_citation(course, offering)
+            citation["course_code"] = None
+            citation["course_name"] = offering.get("program_name")
+            citation["section"] = (
+                f"{offering.get('course_category', '')}"
+                f" / {offering.get('course_subcategory', '')}"
+            ).strip(" /")
+            source = str(citation.get("source_file", ""))
+            if source and source not in seen_sources:
+                citations.append(citation)
+                seen_sources.add(source)
+        return RouteResult(
+            description,
+            citations,
+            "catalog",
+            {
+                "catalog_matches": len(matches),
+                "llm_used": False,
+                "source_type": "training_plan",
+            },
+        )
+
+    async def _retrieve_course_evidence(
+        self,
+        query: str,
+        persona: Persona = DEFAULT_PERSONA,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        profile = PERSONA_PROFILES[persona]
+        course = self._link_course(query)
+        course_code = str(course.get("course_code", "")) if course else None
+        syllabus_min_score = 0.12 if course else 0.5
+        plan_min_score = 0.08 if course else 0.5
+        preferred = profile["preferred_sections"]
+        syllabus_hits = await asyncio.to_thread(
+            self.vector_retriever.search,
+            query,
+            profile["syllabus_top_k"],
+            course_code=course_code,
+            source_types=("syllabus",),
+            min_score=syllabus_min_score,
+            preferred_section_types=preferred,
+            source_boosts=profile["source_boosts"],
+        )
+        plan_query = (
+            f"{course.get('course_name', '')} {course_code} 培养方案 课程信息"
+            if course
+            else query
+        )
+        plan_hits = await asyncio.to_thread(
+            self.vector_retriever.search,
+            plan_query,
+            profile["plan_top_k"],
+            course_code=course_code,
+            source_types=("training_plan",),
+            min_score=plan_min_score,
+            preferred_section_types=preferred,
+            source_boosts=profile["source_boosts"],
+        )
+        hits: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hit in [*syllabus_hits, *plan_hits]:
+            identity = str(hit.get("chunk_id") or hit.get("text", ""))
+            if identity and identity not in seen:
+                hits.append(hit)
+                seen.add(identity)
+        hits.sort(
+            key=lambda hit: float(
+                hit.get("rerank_score", hit.get("score", 0.0))
+            ),
+            reverse=True,
+        )
+        return course, hits
+
+    @staticmethod
+    def _evidence_terms(query: str) -> set[str]:
+        chinese = re.sub(r"[^\u4e00-\u9fff]", "", query)
+        terms = {
+            chinese[index : index + 2]
+            for index in range(max(0, len(chinese) - 1))
+        }
+        terms.update(re.findall(r"[a-z][a-z0-9]+", query.lower()))
+        return terms
+
+    @classmethod
+    def _relevant_excerpt(cls, query: str, text: str, limit: int = 700) -> str:
+        """Keep complete, query-relevant passages instead of a fixed prefix."""
+        text = text.strip()
+        if len(text) <= limit:
+            return text
+        terms = cls._evidence_terms(query)
+        passages = [
+            passage.strip()
+            for passage in re.split(r"(?<=[。！？；])|\n+", text)
+            if passage.strip()
+        ]
+        ranked = sorted(
+            enumerate(passages),
+            key=lambda item: (
+                -sum(term in item[1].lower() for term in terms),
+                item[0],
+            ),
+        )
+        selected: list[tuple[int, str]] = []
+        used = 0
+        for index, passage in ranked:
+            if used + len(passage) > limit and selected:
+                continue
+            selected.append((index, passage))
+            used += len(passage)
+            if used >= limit:
+                break
+        return "\n".join(passage for _, passage in sorted(selected))
+
+    @classmethod
+    def _build_evidence_items(
+        cls,
+        query: str,
+        hits: list[dict[str, Any]],
+        graph_paths: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        budget = 4200
+        for hit in hits:
+            metadata = hit.get("metadata") or {}
+            section = (
+                hit.get("section")
+                or metadata.get("syllabus_section")
+                or "课程资料"
+            )
+            excerpt = cls._relevant_excerpt(query, str(hit.get("text", "")))
+            if (
+                not excerpt
+                or sum(len(str(item.get("excerpt", ""))) for item in items)
+                + len(excerpt)
+                > budget
+            ):
+                continue
+            items.append(
+                {
+                    "course_code": metadata.get("course_code")
+                    or hit.get("course_code"),
+                    "course_name": metadata.get("course_name")
+                    or hit.get("course_name"),
+                    "section": section,
+                    "source_file": hit.get("source_file"),
+                    "source_type": metadata.get("source_type")
+                    or hit.get("source_type"),
+                    "section_type": hit.get("section_type")
+                    or metadata.get("section_type"),
+                    "excerpt": excerpt,
+                }
+            )
+        if graph_paths:
+            readable_paths = [
+                " → ".join(str(node) for node in path.get("path", []) if node)
+                for path in graph_paths
+            ]
+            readable_paths = [path for path in readable_paths if path]
+            if readable_paths:
+                items.append(
+                    {
+                        "course_code": None,
+                        "course_name": None,
+                        "section": "知识图谱关联",
+                        "source_file": "Neo4j",
+                        "source_type": "knowledge_graph",
+                        "excerpt": "\n".join(readable_paths[:8]),
+                    }
+                )
+        return items
+
+    async def _handle_content(
+        self,
+        query: str,
+        llm_client: Any,
+        *,
+        neo4j_driver: Any = None,
+        persona: Persona = DEFAULT_PERSONA,
+    ) -> RouteResult:
+        _course, hits = await self._retrieve_course_evidence(query, persona)
+        graph_paths: list[dict[str, Any]] = []
+        if neo4j_driver is not None:
+            try:
+                graph_paths = await asyncio.to_thread(
+                    _query_graph_paths,
+                    neo4j_driver,
+                    query,
+                )
+            except Exception:
+                graph_paths = []
+        if not hits and not graph_paths:
+            from src.online_service.generator import build_fallback_answer
+
+            return RouteResult(build_fallback_answer(query, [], persona), query_type="content", metadata={"status": "degraded", "error_code": "NO_RELEVANT_EVIDENCE"})
+        evidence_items = self._build_evidence_items(query, hits, graph_paths)
+        from src.online_service.generator import (
+            build_fallback_answer,
+            generate_answer_once,
+        )
+
+        try:
+            answer = await asyncio.to_thread(
+                generate_answer_once,
+                query,
+                evidence_items,
+                llm_client,
+                persona,
+            )
+        except Exception:
+            answer = build_fallback_answer(query, evidence_items, persona)
+        return RouteResult(answer, self._vector_citations(hits), "content", {"vector_hits": len(hits), "graph_nodes": len(graph_paths), "llm_used": llm_client is not None})
+
+    async def _handle_hybrid(
+        self,
+        query: str,
+        llm_client: Any,
+        neo4j_driver: Any = None,
+        persona: Persona = DEFAULT_PERSONA,
+        **kwargs: Any,
+    ) -> RouteResult:
+        _course, hits = await self._retrieve_course_evidence(query, persona)
+        graph_paths = []
+        if neo4j_driver is not None:
+            try:
+                graph_paths = await asyncio.to_thread(
+                    _query_graph_paths,
+                    neo4j_driver,
+                    query,
+                )
+            except Exception:
+                graph_paths = []
+        if not hits and not graph_paths:
+            from src.online_service.generator import build_fallback_answer
+
+            return RouteResult(build_fallback_answer(query, [], persona), query_type="hybrid", metadata={"status": "degraded", "error_code": "NO_EVIDENCE"})
+        evidence_items = self._build_evidence_items(query, hits, graph_paths)
+        from src.online_service.generator import (
+            build_fallback_answer,
+            generate_answer_once,
+        )
+        metadata = {
+            "vector_hits": len(hits),
+            "graph_nodes": len(graph_paths),
+            "llm_used": llm_client is not None,
+        }
+        try:
+            answer = await asyncio.to_thread(
+                generate_answer_once,
+                query,
+                evidence_items,
+                llm_client,
+                persona,
+            )
+        except Exception:
+            answer = build_fallback_answer(query, evidence_items, persona)
+            metadata.update(
+                status="degraded",
+                error_code="LLM_UNAVAILABLE",
+            )
+        return RouteResult(
+            answer,
+            self._vector_citations(hits),
+            "hybrid",
+            metadata,
+            {"paths": graph_paths},
+        )
+
+    @staticmethod
+    def _vector_citations(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        citations: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for hit in hits:
+            metadata = hit.get("metadata") or {}
+            source_file = str(hit.get("source_file") or "").replace("\\", "/")
+            citation = {
+                "source_file": source_file.rsplit("/", 1)[-1].split("#", 1)[0]
+                or None,
+                "course_code": metadata.get("course_code")
+                or hit.get("course_code"),
+                "course_name": metadata.get("course_name")
+                or hit.get("course_name"),
+                "section": hit.get("section")
+                or metadata.get("syllabus_section"),
+            }
+            identity = tuple(citation.values())
+            if identity not in seen:
+                citations.append(citation)
+                seen.add(identity)
+        return citations
+
     async def _handle_dependency(
         self,
         query: str,
@@ -140,7 +655,88 @@ class QueryRouter:
         llm_client: Any,
     ) -> RouteResult:
         """Dependency reasoning via Neo4j concept graph."""
+        from src.online_service.course_dependency_service import (
+            get_course_dependency_subgraph,
+        )
         from src.online_service.dependency_explainer import build_dependency_answer
+
+        course = self._link_course(query)
+        if course and re.search(r"先修课程|先修课|前置课程|预修课", query):
+            prerequisites = [
+                str(value).strip()
+                for value in course.get("prerequisites") or []
+                if str(value).strip()
+            ]
+            hits: list[dict[str, Any]] = []
+            supporting_hits: list[dict[str, Any]] = []
+            if not prerequisites:
+                hits = await asyncio.to_thread(
+                    self.vector_retriever.search,
+                    query,
+                    10,
+                    course_code=str(course.get("course_code", "")),
+                    source_types=("syllabus",),
+                    min_score=0.2,
+                    preferred_section_types=("prerequisites", "basic_info"),
+                )
+                for hit in hits:
+                    matched = False
+                    for value in re.findall(
+                        r"先修课程\s*[：:]\s*([^\n。；]+)",
+                        str(hit.get("text", "")),
+                    ):
+                        normalized = value.strip()
+                        if normalized and normalized not in prerequisites:
+                            prerequisites.append(normalized)
+                        matched = True
+                    if matched:
+                        supporting_hits.append(hit)
+            if prerequisites:
+                course_label = course.get("course_name") or course.get("course_code")
+                course_by_code = {
+                    str(item.get("course_code", "")): item
+                    for item in self.courses
+                }
+                prerequisite_labels = [
+                    (
+                        f"{course_by_code[value].get('course_name')}（{value}）"
+                        if value in course_by_code
+                        else value
+                    )
+                    for value in prerequisites
+                ]
+                dependency_info = None
+                if neo4j_driver is not None:
+                    try:
+                        dependency_info = await asyncio.to_thread(
+                            get_course_dependency_subgraph,
+                            neo4j_driver,
+                            str(course.get("course_code", "")),
+                            depth=2,
+                            max_nodes=30,
+                        )
+                    except Exception:
+                        dependency_info = None
+                return RouteResult(
+                    answer=(
+                        f"{course_label}的先修课程为："
+                        f"{'、'.join(prerequisite_labels)}。"
+                    ),
+                    citations=self._vector_citations(supporting_hits)
+                    if supporting_hits
+                    else [self._catalog_citation(course, None)],
+                    query_type="dependency",
+                    dependency_info=dependency_info,
+                    metadata={
+                        "backend": (
+                            "syllabus+Neo4j"
+                            if dependency_info
+                            else "syllabus"
+                        ),
+                        "llm_used": False,
+                        "prerequisite_count": len(prerequisites),
+                    },
+                )
 
         if neo4j_driver is None:
             return RouteResult(
@@ -175,202 +771,28 @@ class QueryRouter:
             metadata={"backend": "zsttSystem_Neo4j"},
         )
 
-    async def _handle_simple(self, query: str) -> RouteResult:
-        """Simple fact lookup via LightRAG naive mode."""
-        try:
-            result = await asyncio.to_thread(
-                self.lightrag.query, query, "naive", True
-            )
-        except Exception as naive_exc:
-            # Fallback: try local mode with explicit entity matching
-            logging.getLogger(__name__).warning(
-                "[query_router] naive mode failed, falling back to local: %s", naive_exc
-            )
-            try:
-                result = await asyncio.to_thread(
-                    self.lightrag.query, query, "local", True
-                )
-            except Exception as exc:
-                return RouteResult(
-                    answer="检索服务暂时不可用，请检查 LightRAG 服务是否正常运行。",
-                    query_type="simple",
-                    metadata={"backend": "LightRAG", "error": str(exc)},
-                )
-
-        return RouteResult(
-            answer=result.get("response", ""),
-            citations=self._extract_citations(result),
-            query_type="simple",
-            metadata={"backend": "LightRAG_naive"},
-        )
-
-    async def _handle_complex(
-        self,
-        query: str,
-        llm_client: Any,
-        *,
-        enable_hyde: bool = True,
-        enable_nli: bool = False,
-    ) -> RouteResult:
-        """Complex QA: HyDE + concept normalisation → LightRAG mix mode."""
-        metadata: dict[str, Any] = {"backend": "zsttSystem_HyDE + LightRAG_mix"}
-
-        # Step 1: Standardise concepts in the query
-        concepts: list[str] = []
-        if config.enable_concept_normalization:
-            concepts = await asyncio.to_thread(_normalize_query_concepts, query)
-
-        # Step 2: HyDE expansion (generate hypothetical answer for embedding)
-        hyde_answer = ""
-        if enable_hyde and llm_client is not None:
-            hyde_answer = await asyncio.to_thread(_hyde_expand, query, llm_client)
-
-        # Step 3: Build enhanced query
-        enhanced = _build_enhanced_query(query, hyde_answer, concepts)
-
-        # Step 4: LightRAG mix-mode retrieval + generation
-        try:
-            result = await asyncio.to_thread(
-                self.lightrag.query, enhanced, "mix", True
-            )
-        except Exception as exc:
-            # Fallback: try without HyDE enrichment
-            try:
-                result = await asyncio.to_thread(
-                    self.lightrag.query, query, "mix", True
-                )
-                metadata["fallback"] = "removed_hyde"
-            except Exception:
-                return RouteResult(
-                    answer="检索服务暂时不可用，请检查 LightRAG 服务是否正常运行。",
-                    query_type="complex",
-                    metadata={**metadata, "error": str(exc)},
-                )
-
-        answer = result.get("response", "")
-        context = result.get("context", [])
-
-        # Step 5: Optional NLI verification
-        if enable_nli and llm_client is not None and answer and context:
-            verified, nli_details = await asyncio.to_thread(
-                _nli_verify, answer, context, llm_client
-            )
-            metadata["nli_status"] = "verified" if verified else "failed"
-            metadata["nli_details"] = nli_details
-            if not verified:
-                # One retry with stricter prompt
-                retry_query = (
-                    f"请严格仅基于以下资料回答，不要推测: {query}\n"
-                    f"上一轮回答已通过事实核查标注为需修正。"
-                )
-                try:
-                    retry = await asyncio.to_thread(
-                        self.lightrag.query, retry_query, "mix", True
-                    )
-                    retry_answer = retry.get("response", "")
-                    if retry_answer:
-                        re_verified, retry_details = await asyncio.to_thread(
-                            _nli_verify, retry_answer, context, llm_client
-                        )
-                        if re_verified:
-                            answer = retry_answer
-                            metadata["nli_status"] = "verified_after_retry"
-                            metadata["nli_details"] = retry_details
-                except Exception as nli_retry_exc:
-                    logging.getLogger(__name__).warning(
-                        "[query_router] NLI retry failed: %s", nli_retry_exc
-                    )
-        else:
-            metadata["nli_status"] = "disabled"
-
-        return RouteResult(
-            answer=answer,
-            citations=self._extract_citations(result),
-            query_type="complex",
-            metadata=metadata,
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _extract_citations(lightrag_result: dict[str, Any]) -> list[dict[str, Any]]:
-        """Convert LightRAG context entries to zsttSystem-style citations."""
-        citations: list[dict[str, Any]] = []
-        for i, ctx in enumerate(lightrag_result.get("context", []) or []):
-            citations.append({
-                "index": i + 1,
-                "content": str(ctx.get("content", ""))[:300],
-                "source": str(ctx.get("source", ctx.get("source_id", "unknown"))),
-            })
-        return citations
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers (used by the router)
 # ---------------------------------------------------------------------------
 
-def _hyde_expand(query: str, llm_client: Any) -> str:
-    """Generate a short hypothetical answer for HyDE embedding."""
-    from src.utils.deepseek_client import generate_text
-
-    prompt = (
-        "你是一名课程问答助教。请针对下面的用户问题，生成一段简洁、可信、偏教材风格的"
-        "假设性参考答案，用于后续检索相关资料。不要输出解释，不要编造超出教学范围的内容。\n\n"
-        f"用户问题：{query}"
-    )
-    return generate_text(
-        llm_client,
-        config.text_model,
-        prompt,
-        temperature=0.1,
-        max_output_tokens=256,
-    ) or ""
-
-
-def _normalize_query_concepts(query: str) -> list[str]:
-    """Extract and normalise concept names from the query text.
-
-    Lightweight version that uses simple tokenisation and a few heuristics
-    rather than the full LLM-based pipeline used during offline processing.
+def _query_graph_paths(neo4j_driver: Any, query: str) -> list[dict[str, Any]]:
+    """Fetch nearby graph paths without blocking the async event loop."""
+    cypher = """
+    MATCH p=(c:Course)-[*1..2]-(n)
+    WHERE toLower($query) CONTAINS toLower(c.course_name)
+       OR toLower($query) CONTAINS toLower(c.course_code)
+    RETURN [x IN nodes(p) |
+        coalesce(x.course_name, x.name, x.course_code)
+    ] AS path
+    LIMIT 20
     """
-    tokens = re.findall(r"[\u4e00-\u9fff\w]{2,20}", query)
-    # Filter out trivial stopwords-like tokens
-    stop = {"什么", "如何", "怎么", "哪些", "哪个", "为什么", "是不是", "有没有",
-            "请问", "问题", "回答", "用户", "帮我", "可以", "这个", "那个",
-            "的", "了", "是", "在", "有", "和", "与", "或", "等", "及",
-            "吗", "呢", "啊", "吧", "的是", "关于", "对于"}
-    return [t for t in tokens if t not in stop][:8]
-
-
-def _build_enhanced_query(
-    query: str,
-    hyde_answer: str,
-    concepts: list[str],
-) -> str:
-    """Build the enriched query string for LightRAG."""
-    parts = [f"问题: {query}"]
-    if concepts:
-        parts.append(f"相关概念: {'、'.join(concepts)}")
-    if hyde_answer:
-        parts.append(
-            f"参考信息（以下内容仅做术语参考，请以实际检索到的资料为准）:\n{hyde_answer}"
-        )
-    return "\n\n".join(parts)
-
-
-def _nli_verify(
-    answer: str,
-    context: list[dict[str, Any]],
-    llm_client: Any,
-) -> tuple[bool, dict[str, Any]]:
-    """Run per-sentence NLI entailment check against retrieved context."""
-    from src.online_service.generator import verify_answer_with_nli
-
-    context_text = "\n".join(
-        str(ctx.get("content", "")) for ctx in (context or [])[:10]
-    )
-    if not context_text.strip():
-        return True, {"status": "no_context"}
-
-    return verify_answer_with_nli(answer, context_text, llm_client)
+    with neo4j_driver.session() as session:
+        rows = session.run(cypher, query=query)
+        return [
+            {
+                "path": row["path"],
+                "relationship": "NEIGHBOR",
+                "confidence": 1.0,
+            }
+            for row in rows
+        ]
