@@ -1,257 +1,363 @@
-# zsttSystem v2.0 本地部署说明
+# zsttSystem
 
-## 项目说明
+面向高校培养方案与课程教学大纲的 RAG-KG 问答系统。系统使用：
 
-本项目是一个面向高校课程教学大纲与培养方案的智能问答系统，采用"领域知识层 + LightRAG 检索引擎层"双层协作架构：
+- FastAPI 提供查询、课程和反馈 API。
+- ChromaDB 保存课程文本向量并执行语义检索。
+- 本地 Neo4j Community 保存课程依赖图并执行图查询。
+- DeepSeek 或其他兼容 OpenAI Chat Completions 的模型生成基于证据的回答。
 
-- **zsttSystem 领域知识层**：负责教学大纲解析、概念标准化、知识图谱构建（Neo4j）、课程依赖推理，以及 HyDE 查询扩展和 NLI 事实验证
-- **LightRAG 检索引擎层**：提供文本索引、多模式检索（5 种）、结果重排、答案生成和 LLM 响应缓存
+项目不依赖 LightRAG，也不需要单独的 Embedding HTTP 服务。
 
-两层通过 HTTP API 协作，互不侵入，各自独立演进。
+## 架构
 
-## 运行环境
-
-- Windows 10 / 11（Linux 和 macOS 亦可）
-- Python 3.11+
-- 可用的 DeepSeek API 密钥（或其他 OpenAI 兼容 API）
-- LightRAG v1.5+
-- 可选：本地或远程 Neo4j（依赖查询和知识图谱构建需要）
-
-## 项目结构
-
-```
-zsttSystem/
-├── run_pipeline.py              # 离线管线入口（含 sync 阶段）
-├── src/
-│   ├── main.py                  # FastAPI 在线服务入口
-│   ├── config.py                # 统一配置管理
-│   ├── data_processing/         # 离线管线模块
-│   │   ├── parser_chunker.py    #   教学大纲解析
-│   │   ├── kg_builder.py        #   知识图谱构建
-│   │   ├── aligner.py           #   KG 节点元数据对齐
-│   │   ├── module_dependency.py #   课程依赖聚合
-│   │   └── data_bridge.py       #   LightRAG 数据同步
-│   ├── online_service/          # 在线服务模块
-│   │   ├── query_router.py      #   查询路由（意图分类 + HyDE + NLI）
-│   │   ├── lightrag_adapter.py  #   LightRAG API 客户端
-│   │   ├── dependency_explainer.py  #   依赖解释
-│   │   ├── generator.py         #   NLI 事实验证
-│   │   └── feedback_handler.py  #   反馈日志
-│   └── utils/
-├── data/                        # 原始数据
-│   ├── training_plans/          #   培养方案（XLSX）
-│   └── syllabi/                 #   教学大纲（DOCX）
-├── outputs/                     # 管线产出
-├── .env.example                 # 环境变量模板
-└── requirements.txt             # Python 依赖
+```text
+DOCX/XLSX
+    │
+    ▼
+离线管线：parse → concept → graph → embed
+    │                    │        │
+    │                    │        └── ChromaDB
+    │                    └─────────── Neo4j Community
+    ▼
+FastAPI → QueryRouter → ChromaDB / Neo4j → DeepSeek
 ```
 
-## 第一步：创建虚拟环境
+## 运行要求
+
+- Python 3.11 或 3.12
+- Docker Desktop（用于启动 ChromaDB 和 Neo4j Community）
+
+DeepSeek API 密钥是可选项。配置后，系统会使用兼容 OpenAI Chat
+Completions 的模型生成基于证据的回答；未配置或生成服务不可用时，系统会
+根据结构化证据生成模板化摘要。
+
+## 快速开始
+
+### 1. 创建环境
+
+Windows PowerShell：
 
 ```powershell
-cd D:\python\zsttSystem1.1\zsttSystem
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-如果 PowerShell 提示脚本执行被禁止：
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-.\.venv\Scripts\Activate.ps1
-```
-
-## 第二步：安装依赖
-
-```powershell
-pip install -r requirements.txt
-pip install "lightrag-hku[api]"
-```
-
-## 第三步：配置环境变量
-
-```powershell
+python -m pip install -r requirements.txt
 copy .env.example .env
 ```
 
-编辑 `.env`，填入必要信息：
+Linux/macOS：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+编辑 `.env`，设置本地数据库连接：
 
 ```env
-# DeepSeek API
-DEEPSEEK_API_KEY=sk-你的密钥
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-TEXT_MODEL=deepseek-v4-flash
-
-# Neo4j（可选，依赖查询需要）
-NEO4J_URI=bolt://localhost:7687
+CHROMA_MODE=http
+CHROMA_HOST=127.0.0.1
+CHROMA_PORT=8001
+NEO4J_URI=bolt://127.0.0.1:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=你的密码
-
-# LightRAG
-LIGHTRAG_BASE_URL=http://127.0.0.1:9621
-DEFAULT_QUERY_MODE=mix
-ENABLE_HYDE_EXPANSION=true
-ENABLE_NLI_VERIFICATION=false
-ENABLE_CONCEPT_NORMALIZATION=true
+NEO4J_PASSWORD=your-secure-local-password
 ```
 
-完整的配置项说明见 `.env.example`。
+如需使用 LLM 生成回答，再设置：
 
-## 第四步：启动基础设施
-
-### 一键启动（推荐）
-
-双击 `start_all.bat`，或在 PowerShell 中执行：
-
-```powershell
-cd D:\python\zsttSystem1.1\zsttSystem
-.\start_all.bat
+```env
+DEEPSEEK_API_KEY=your-deepseek-api-key
 ```
 
-该脚本会依次启动：Embedding 服务（端口 11435）→ LightRAG（端口 9621）→ zsttSystem API（端口 8000）。
+Neo4j 密码至少应为 8 个字符。
 
-### 手动分步启动
+### 2. 启动 ChromaDB 和 Neo4j
 
-如需分别启动各个服务：
-
-**终端 1** — Embedding 服务（本地确定性嵌入，无需下载模型）：
-```powershell
-.venv\Scripts\Activate.ps1
-python -m src.utils.embedding_server --port 11435
+```bash
+docker compose up -d --wait chromadb neo4j
 ```
 
-**终端 2** — LightRAG 检索引擎：
-```powershell
-.venv\Scripts\Activate.ps1
-set EMBEDDING_DIM=384
-python run_lightrag.py --port 9621 --llm-binding openai --key zstt_local_dev_key
+服务只监听本机：
+
+- ChromaDB：`127.0.0.1:8001`
+- Neo4j Browser：`http://127.0.0.1:7474`
+- Neo4j Bolt：`127.0.0.1:7687`
+
+数据分别保存在 Docker 命名卷 `chroma_data` 和 `neo4j_data` 中。
+
+检查容器状态：
+
+```bash
+docker compose ps
 ```
 
-看到 `Uvicorn running on http://0.0.0.0:9621` 表示启动成功。
+### 3. 构建数据
 
-## 第五步：运行离线管线
-
-打开终端 2：
-
-```powershell
-.\.venv\Scripts\Activate.ps1
+```bash
 python run_pipeline.py --stage all
 ```
 
-管线会依次执行：
-1. `parsing`——解析教学大纲和培养方案
-2. `kg`——知识图谱构建（需要 Neo4j）
-3. `alignment`——KG 节点元数据对齐
-4. `module`——课程依赖聚合
-5. `sync`——同步数据到 LightRAG
+`all` 会依次执行：
 
-如需增量运行（只处理新增/变更的大纲文件）：
+1. `parse`：解析培养方案和教学大纲，抽取并严格对齐显式先修课程。
+2. `concept`：提取课程级概念。
+3. `graph`：生成图摘要并写入本地 Neo4j Community。
+4. `embed`：生成向量并写入 ChromaDB 的 `zstt_chunks` collection。
 
-```powershell
-python run_pipeline.py --incremental
+无法唯一对齐的先修名称不会写成硬依赖边，而会保存到
+`outputs/unresolved_prerequisites.json`，供人工确认。
+
+单独运行阶段：
+
+```bash
+python run_pipeline.py --stage parse
+python run_pipeline.py --stage concept
+python run_pipeline.py --stage graph
+python run_pipeline.py --stage embed
 ```
 
-如需单独执行某一阶段：
+增量解析：
 
-```powershell
-python run_pipeline.py --stage parsing     # 仅解析
-python run_pipeline.py --stage sync        # 仅同步到 LightRAG
+```bash
+python run_pipeline.py --stage parse --incremental
 ```
 
-## 第六步：启动 zsttSystem API
+强制全量解析：
 
-如果未使用 `start_all.bat`，需单独启动：
-
-```powershell
-uvicorn src.main:app --host 127.0.0.1 --port 8000
+```bash
+python run_pipeline.py --stage parse --force
 ```
 
-## 第七步：验证
+### 4. 启动 API
 
-浏览器访问：
+```powershell
+.\start_all.bat
+```
 
-- `http://127.0.0.1:8000/`——演示页面
-- `http://127.0.0.1:8000/health`——健康检查（返回 LightRAG 和 Neo4j 连接状态）
+该脚本会从脚本所在目录启动 ChromaDB、Neo4j 和 FastAPI，不依赖本机
+绝对路径，并等待 Neo4j 健康检查通过后再启动 API。
 
-### API 端点
+### 5. 验证
+
+- 演示页：`http://127.0.0.1:8000/`
+- OpenAPI：`http://127.0.0.1:8000/docs`
+- 健康检查：`http://127.0.0.1:8000/health`
+
+查询示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/query \
+  -H "Content-Type: application/json" \
+  -d "{\"query\":\"管理运筹学主要学什么？\"}"
+```
+
+## 不使用 Docker 的 ChromaDB
+
+将 `.env` 改为：
+
+```env
+CHROMA_MODE=local
+VECTOR_DB_PATH=chroma_data
+```
+
+随后直接运行管线和 API。ChromaDB 会持久化到项目目录下的
+`chroma_data/`，该目录已被 Git 忽略。
+
+## API
 
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/` | 演示页面 |
-| GET | `/health` | 健康检查 |
-| POST | `/query` | 主问答接口（自动路由） |
+| --- | --- | --- |
+| GET | `/` | 本地演示页 |
+| GET | `/health` | ChromaDB、向量集合和 Neo4j 状态 |
+| POST | `/query` | 自动路由问答 |
+| GET | `/courses/{course_code}` | 课程信息 |
+| GET | `/courses/{course_code}/graph` | 课程专属子图 |
+| GET | `/courses/{course_code}/dependencies?depth=2&max_nodes=30&program_name=...` | 先修子图与选课路径 |
 | GET | `/dependency?query=...` | 课程依赖查询 |
-| POST | `/feedback` | 用户反馈 |
+| POST | `/feedback` | 记录用户反馈 |
 
-### 查询示例
+`POST /query` 可显式传入 `persona`，支持 `student`、`teacher` 和
+`visitor`，默认值为 `student`。角色只调整检索证据优先级、回答深度和组织
+方式，不改变课程事实。例如：
 
-```powershell
-# 复杂问答（自动走 HyDE + LightRAG mix）
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "信息组织课程主要讲什么内容？"}'
-
-# 依赖查询（走 Neo4j）
-curl "http://127.0.0.1:8000/dependency?query=数据库原理需要哪些先修课程"
-
-# 简单查询（走 LightRAG naive）
-curl -X POST http://127.0.0.1:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "数据库原理多少学分？"}'
+```json
+{
+  "query": "管理运筹学主要学什么？",
+  "persona": "student"
+}
 ```
 
-三种查询路径由 QueryRouter 根据意图自动分发，无需手动指定。
+课程先修子图只接受 `depth=1/2/3`，最多返回 30 个节点。边的统一方向是
+`先修课程 --PREREQUISITE_OF--> 后续课程`；发生裁剪时响应中的
+`truncated` 为 `true`，并通过 `total_nodes` 返回裁剪前节点数。
+
+依赖响应中的 `plan` 使用完整硬先修祖先图进行 DAG 检查和拓扑分层，不受
+展示子图的二跳裁剪影响。`stage` 表示建议学习层级，不等同于学校真实学期；
+`official_semester` 才是培养方案中的开课学期。同一课程属于多个培养方案时，
+`plan.status` 会返回 `program_required`，需要通过 `program_name` 明确选择，
+系统不会混用不同方案的学期。
+
+演示页使用项目内固定的 Mermaid 11.16.0 渲染课程依赖图，配置
+`securityLevel: "strict"`，不依赖公共 CDN。图形失败时仍保留课程边列表。
+
+## 查询路由
+
+- `fact`：优先匹配培养方案中的课程结构化信息，可在一个问题中同时回答
+  学分、学时等多个字段。
+- `content`：先识别课程名称或代码，再按课程过滤 ChromaDB，合并课程大纲
+  和培养方案证据。
+- `dependency`：明确询问课程先修关系时，优先读取课程大纲中的先修字段；
+  其他知识依赖问题使用本地 Neo4j。
+- `catalog`：根据专业、主修或辅修类型和课程类别查询培养方案。
+- `hybrid`：组合 ChromaDB 结构化证据、Neo4j 路径和 LLM 生成。
+
+内容与混合查询使用相关度阈值和轻量重排。未识别到明确课程时会提高相关度
+要求，避免把弱相关课程强行作为答案。
+
+生成器接收结构化证据项，回答顺序为：
+
+1. 直接回答问题。
+2. 列出核心内容。
+3. 列出资料来源。
+
+LLM 暂时不可用或返回空内容时，系统会生成模板化摘要，不会返回原始
+evidence、JSON 或 HTTP 500。没有足够可靠证据时会明确说明无法回答。
+
+`citations` 与答案分离，仅向客户端公开：
+
+- `course_name`
+- `course_code`
+- `section`
+- `source_file`
+
+查询 ID、检索分数、`chunk_id` 和内部元数据不会作为引用内容展示。
+
+## 维护反馈数据
+
+生成待审核样本：
+
+```bash
+python maintenance/active_learning_sampler.py
+```
+
+应用人工修正：
+
+```bash
+python maintenance/retraining_updater.py
+```
+
+修正课程片段后，维护脚本会更新本地 JSON，并重建当前配置的 ChromaDB
+collection。
+
+## 开发与测试
+
+```bash
+python -m pip install -r requirements-dev.txt
+ruff check src tests run_pipeline.py
+python -m compileall -q src maintenance tests run_pipeline.py
+pytest -q
+```
+
+当前完整测试包含 53 项，其中
+`tests/test_quality_regression.py` 固定覆盖：
+
+- “管理运筹学主要学什么”。
+- “信管专业核心课程有哪些”。
+- “管理运筹学多少学分、多少学时”。
+- “信息组织基础有哪些先修课程”。
+- 无答案和弱相关问题。
+- 页面不得显示字面量 `\n`、原始 JSON 或内部检索字段。
+
+只运行质量回归集：
+
+```bash
+pytest tests/test_quality_regression.py -q
+```
+
+GitHub Actions 会在 Python 3.11 和 3.12 上安装开发依赖、检查依赖一致性、
+编译 Python 源码、运行关键 Ruff 静态错误检查并执行完整测试。
+
+P0–P2 的问题背景、修复过程和验收结果见
+[P0–P2 修复记录](P0-P2修复记录.md)。
 
 ## 常见问题
 
-### 1. LightRAG 连接失败
+### API 报端口 8000 已被占用
 
-检查 `http://127.0.0.1:9621/health` 是否可达。如果 LightRAG 未启动，简单查询和复杂问答会返回 fallback 响应，依赖查询（Neo4j）不受影响。
+Windows 错误 `10048` 或 `[Errno 10048]` 表示已经有进程监听
+`127.0.0.1:8000`。新版 `start_all.bat` 会先检查 `/health`：
 
-### 2. Neo4j 认证失败
+- 已有健康的 zsttSystem 实例时直接复用。
+- 端口由异常实例或其他程序占用时停止启动，并给出提示。
 
-Neo4j 不可用时，知识图谱构建和依赖查询功能不可用，但基础的文本索引和检索问答（LightRAG naive 模式）可以正常工作。
-
-### 3. 管线执行中断
-
-支持断点续跑。例如 kg 阶段失败，修复问题后从该阶段继续：
+检查占用进程：
 
 ```powershell
-python run_pipeline.py --stage kg
-python run_pipeline.py --stage alignment
-python run_pipeline.py --stage module
-python run_pipeline.py --stage sync
+Get-NetTCPConnection -LocalPort 8000 -State Listen
 ```
 
-### 4. 增量更新
-
-新增或修改大纲后，使用 `--incremental` 模式只处理变更文件：
+如果确认该 PID 是需要关闭的旧 zsttSystem 进程，可执行：
 
 ```powershell
-python run_pipeline.py --stage parsing --incremental
-python run_pipeline.py --stage sync
+Stop-Process -Id <PID>
 ```
 
-也可全量重新处理：
+然后重新运行 `start_all.bat`。
 
-```powershell
-python run_pipeline.py --stage parsing --force
+Hugging Face 的 unauthenticated request 提示只是模型下载限流警告，不会导致
+端口绑定失败。需要更高下载限额时可配置 `HF_TOKEN`。
+
+### ChromaDB 无法连接
+
+```bash
+docker compose ps
+docker compose logs chromadb
 ```
 
-增量模式通过 SHA256 文件哈希检测变更，manifest 存储在 `outputs/.file_manifest.json`。
+确认 `.env` 中 `CHROMA_MODE=http`、`CHROMA_HOST=127.0.0.1`、
+`CHROMA_PORT=8001`。
 
-## 建议的演示顺序
+### ChromaDB 中没有数据
 
-1. 激活虚拟环境
-2. 检查 `.env`
-3. 终端 1：`lightrag-server`
-4. 终端 2：`python run_pipeline.py --stage all`
-5. 终端 2：`uvicorn src.main:app --host 127.0.0.1 --port 8000`
-6. 浏览器打开 `http://127.0.0.1:8000/`，输入问题展示
+执行：
 
-## 注意事项
+```bash
+python run_pipeline.py --stage embed
+```
 
-- 不要提交 `.env` 到版本控制
-- 新增或修改大纲后，使用 `--incremental` 增量同步；用 `--force` 强制全量重跑
-- 修改代码后重启 uvicorn 新逻辑才会生效
-- LightRAG 依赖的 `.env` 变量（LLM_BINDING、EMBEDDING_BINDING 等）与 zsttSystem 共用一个 `.env` 文件
+然后访问 `/health`，确认 `chunk_count` 大于 0。
+
+### Neo4j 不可用
+
+```bash
+docker compose ps neo4j
+docker compose logs neo4j
+```
+
+确认 `.env` 中使用 `bolt://127.0.0.1:7687`，且 API 使用的密码与
+Docker Compose 初始化密码一致。首次创建 `neo4j_data` 后，修改
+`NEO4J_PASSWORD` 不会自动修改已有数据库密码；需要在 Neo4j 中修改密码，
+或明确删除本地开发卷后重新初始化。
+
+内容检索不依赖 Neo4j；数据库停止时，只有 dependency 查询和 hybrid 图
+路径会降级。
+
+### Embedding 模型无法下载
+
+首次构建需要下载 `.env` 中配置的 SentenceTransformer 模型。可提前缓存
+模型，或在测试环境设置：
+
+```env
+EMBEDDING_PROVIDER=hash
+```
+
+Hash 模式仅用于测试，不建议用于正式检索。
+
+## 许可证
+
+代码采用 [MIT License](LICENSE)。
+
+`data/` 下教学材料的版权和分发授权不由 MIT 软件许可证自动覆盖；公开
+发布或再分发这些材料前，应由数据提供方确认授权和隐私要求。
