@@ -18,7 +18,6 @@ services:
       - "127.0.0.1:7687:7687"
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -26,7 +25,7 @@ services:
         - CMD-SHELL
         - >-
           cypher-shell -a bolt://127.0.0.1:7687
-          -u neo4j -p "$$NEO4J_PASSWORD" "RETURN 1"
+          -u neo4j -p "$${NEO4J_AUTH#*/}" "RETURN 1"
           >/dev/null 2>&1
       interval: 10s
       timeout: 5s

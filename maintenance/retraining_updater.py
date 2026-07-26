@@ -18,7 +18,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CORRECTED_SAMPLES_PATH = PROJECT_ROOT / "outputs" / "corrected_samples.json"
 CHUNKS_PATHS = (
     PROJECT_ROOT / "outputs" / "chunks.json",
-    PROJECT_ROOT / "outputs" / "chunked_data.json",
 )
 VECTOR_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")

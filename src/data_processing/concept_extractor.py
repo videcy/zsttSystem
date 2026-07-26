@@ -1,10 +1,12 @@
 """Course-level concept extraction with persistent, hash-keyed cache."""
 from __future__ import annotations
-import hashlib, json
+
+import hashlib
+import json
 import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
 
 PROMPT_VERSION = "course-concepts-v1"
 
@@ -22,10 +24,13 @@ def _rule_concepts(items: list[dict]) -> list[str]:
     return result[:40]
 
 def extract_course_concepts(chunks: list[dict], cache_path: str | Path, model: str = "local", llm_client=None) -> list[dict]:
-    path = Path(cache_path); cache = {}
+    path = Path(cache_path)
+    cache = {}
     if path.exists():
-        try: cache = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError: cache = {}
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            cache = {}
     grouped = defaultdict(list)
     for c in chunks:
         code = c.get("metadata", {}).get("course_code") or c.get("course_code") or c.get("source_file", "unknown")
@@ -35,10 +40,15 @@ def extract_course_concepts(chunks: list[dict], cache_path: str | Path, model: s
         doc_hash = hashlib.sha256("".join(c.get("document_hash", "") for c in items).encode()).hexdigest()
         old = cache.get(code, {})
         if old.get("document_hash") == doc_hash and old.get("model") == model and old.get("prompt_version") == PROMPT_VERSION:
-            concepts.extend(old.get("concepts", [])); continue
+            concepts.extend(old.get("concepts", []))
+            continue
         values = _rule_concepts(items)
         rows = [{"concept_id": hashlib.sha256(f"{code}|{v}".encode()).hexdigest()[:20], "name": v, "course_code": code, "aliases": []} for v in values]
         cache[code] = {"document_hash": doc_hash, "model": model, "prompt_version": PROMPT_VERSION, "concepts": rows, "created_at": datetime.now(timezone.utc).isoformat()}
         concepts.extend(rows)
-        path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     return concepts

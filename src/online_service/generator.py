@@ -4,19 +4,183 @@ from __future__ import annotations
 
 import re
 from json import JSONDecodeError
+from pathlib import Path
 from typing import Any
 
 from src.config import config
+from src.online_service.persona import DEFAULT_PERSONA, PERSONA_PROFILES, Persona
 from src.utils.deepseek_client import generate_json, generate_text
 
 
-def generate_answer_once(query: str, evidence: str, llm_client: Any = None) -> str:
-    """Single-pass grounded answer generation used by the lightweight router."""
+def _source_name(value: Any) -> str:
+    normalized = str(value or "").replace("\\", "/").split("#", 1)[0]
+    return Path(normalized).name or "本地知识库"
+
+
+def _format_evidence_for_prompt(evidence_items: list[dict[str, Any]]) -> str:
+    blocks: list[str] = []
+    for index, item in enumerate(evidence_items[:10], 1):
+        blocks.append(
+            "\n".join(
+                [
+                    f"证据 {index}",
+                    f"课程：{item.get('course_name') or '未标注'}"
+                    f"（{item.get('course_code') or '无代码'}）",
+                    f"章节：{item.get('section') or '未标注'}",
+                    f"文件：{_source_name(item.get('source_file'))}",
+                    f"内容：{str(item.get('excerpt') or '').strip()}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def build_fallback_answer(
+    query: str,
+    evidence_items: list[dict[str, Any]],
+    persona: Persona = DEFAULT_PERSONA,
+) -> str:
+    """Build a readable summary without exposing raw retrieval payloads."""
+    profile = PERSONA_PROFILES[persona]
+    if not evidence_items:
+        if persona == "student":
+            return "根据当前知识库，未找到足够相关且可靠的学习资料来回答这个问题。"
+        if persona == "teacher":
+            return "根据当前知识库，未找到足够相关且可靠的教学证据来回答这个问题。"
+        return "根据当前知识库，未找到足够相关且可靠的资料来回答这个问题。"
+
+    course_name = next(
+        (
+            str(item.get("course_name") or "").strip()
+            for item in evidence_items
+            if str(item.get("course_name") or "").strip()
+        ),
+        "",
+    )
+    if course_name and re.search(r"学什么|主要学习|主要讲|讲什么|课程内容", query):
+        opening = f"根据课程大纲，{course_name}主要涉及以下内容："
+    elif course_name:
+        opening = f"根据现有课程资料，{course_name}的相关信息如下："
+    else:
+        opening = "根据现有资料，可确认以下信息："
+
+    def item_priority(item: dict[str, Any]) -> tuple[int, str]:
+        section = str(item.get("section") or "")
+        section_type = str(item.get("section_type") or "")
+        source_type = str(item.get("source_type") or "")
+        preferred_sections = profile["preferred_sections"]
+        if section_type in preferred_sections:
+            return preferred_sections.index(section_type), section
+        if "课程目标" in section:
+            return 0, section
+        if re.search(r"第一章|第1章|^1[ .、]", section):
+            return 1, section
+        if source_type == "training_plan":
+            return 2, section
+        if "教学进度表" in section:
+            return 3, section
+        return 4, section
+
+    ordered_items = sorted(evidence_items, key=item_priority)
+    bullets: list[str] = []
+    selected_items: list[dict[str, Any]] = []
+    seen_sections: set[str] = set()
+    for item in ordered_items:
+        excerpt = str(item.get("excerpt") or "").replace("\\n", "\n").strip()
+        section = str(item.get("section") or "课程资料").strip()
+        if section in seen_sections:
+            continue
+        passages = [
+            passage.strip()
+            for passage in re.split(r"(?<=[。！？；])|\n+", excerpt)
+            if passage.strip() and passage.strip() != section
+        ]
+        if not passages:
+            continue
+        if re.search(r"学什么|主要学习|主要讲|讲什么|课程内容", query):
+            summary = max(
+                enumerate(passages),
+                key=lambda value: (
+                    3 * ("掌握" in value[1])
+                    + 2 * ("学习" in value[1] or "包括" in value[1])
+                    + ("介绍" in value[1] or "内容" in value[1]),
+                    -value[0],
+                ),
+            )[1]
+        else:
+            summary = passages[0]
+        if len(summary) > 140:
+            summary = summary[:137].rstrip("，,；;：: ") + "……"
+        bullet = f"- {section}：{summary}"
+        if bullet not in bullets:
+            bullets.append(bullet)
+            selected_items.append(item)
+            seen_sections.add(section)
+        if len(bullets) == profile["fallback_limit"]:
+            break
+
+    sources: list[str] = []
+    for item in selected_items:
+        label = " · ".join(
+            part
+            for part in (
+                str(item.get("course_name") or "").strip(),
+                str(item.get("section") or "").strip(),
+                _source_name(item.get("source_file")),
+            )
+            if part
+        )
+        if label and label not in sources:
+            sources.append(label)
+        if len(sources) == 4:
+            break
+
+    lines = [
+        opening,
+        "",
+        profile["fallback_heading"],
+        *(bullets or ["- 暂无可提炼的具体内容。"]),
+    ]
+    if sources:
+        lines.extend(["", "资料来源：", *[f"- {source}" for source in sources]])
+    return "\n".join(lines)
+
+
+def generate_answer_once(
+    query: str,
+    evidence_items: list[dict[str, Any]],
+    llm_client: Any = None,
+    persona: Persona = DEFAULT_PERSONA,
+) -> str:
+    """Generate a grounded answer from structured evidence items."""
     if llm_client is None:
-        return evidence[:1200]
-    prompt = ("仅根据给定证据回答问题，不要补充证据之外的事实。\n"
-              f"问题：{query}\n证据：{evidence}")
-    return generate_text(llm_client, config.text_model, prompt, temperature=0.1, max_output_tokens=512) or evidence[:1200]
+        return build_fallback_answer(query, evidence_items, persona)
+    evidence = _format_evidence_for_prompt(evidence_items)
+    profile = PERSONA_PROFILES[persona]
+    prompt = (
+        "你是课程知识库问答助手。仅根据下面的证据回答，不得补充证据之外的事实。\n"
+        f"{profile['prompt']}\n"
+        "回答格式必须是：\n"
+        "1. 第一段直接回答问题；\n"
+        "2. 使用“核心内容：”列出简洁要点；\n"
+        "3. 使用“资料来源：”列出课程、章节和文件名。\n"
+        "不要输出 JSON、查询 ID、分数、chunk_id、内部字段或代码块。"
+        "证据不足时明确说明无法确认。\n"
+        f"问题：{query}\n\n"
+        f"{evidence}"
+    )
+    answer = generate_text(
+        llm_client,
+        config.text_model,
+        prompt,
+        temperature=0.1,
+        max_output_tokens=512,
+    )
+    return answer.strip() if answer and answer.strip() else build_fallback_answer(
+        query,
+        evidence_items,
+        persona,
+    )
 
 
 def _split_sentences(answer: str) -> list[str]:

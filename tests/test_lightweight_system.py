@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ import maintenance.retraining_updater as retraining_module
 import src.main as main_module
 from maintenance.retraining_updater import RetrainingUpdater
 from run_pipeline import build_stage_map
-from src.data_processing.chroma_index import ChromaVectorIndex
+from src.data_processing.chroma_index import ChromaVectorIndex, create_chroma_client
 from src.online_service.chroma_retriever import ChromaRetriever
 from src.online_service.query_router import QueryRouter, QueryType
 
@@ -23,13 +24,45 @@ class FakeRetriever:
     def __init__(self, hits: list[dict] | None = None) -> None:
         self.hits = hits or []
         self.connected = True
+        self.calls: list[dict] = []
 
-    def search(self, _query: str, _top_k: int = 5) -> list[dict]:
-        return self.hits
+    def search(self, _query: str, _top_k: int = 5, **kwargs) -> list[dict]:
+        self.calls.append(kwargs)
+        source_types = kwargs.get("source_types")
+        course_code = kwargs.get("course_code")
+        hits = [
+            hit
+            for hit in self.hits
+            if (
+                not course_code
+                or (hit.get("metadata") or {}).get("course_code") == course_code
+                or hit.get("course_code") == course_code
+            )
+            and (
+                not source_types
+                or (hit.get("metadata") or {}).get("source_type") in source_types
+                or hit.get("source_type") in source_types
+            )
+        ]
+        return hits[:_top_k]
 
     @property
     def count(self) -> int:
         return len(self.hits)
+
+
+def test_local_chroma_client_bypasses_system_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CHROMA_MODE", "http")
+    monkeypatch.setenv("CHROMA_HOST", "127.0.0.1")
+    monkeypatch.setenv("NO_PROXY", "example.test")
+
+    with patch("src.data_processing.chroma_index.chromadb.HttpClient") as client:
+        create_chroma_client()
+
+    assert os.environ["NO_PROXY"] == "example.test,127.0.0.1"
+    client.assert_called_once()
 
 
 def test_chroma_index_round_trip() -> None:
@@ -39,7 +72,10 @@ def test_chroma_index_round_trip() -> None:
             "chunk_id": "database",
             "text": "database index transaction",
             "source_file": "database.docx",
-            "metadata": {"course_code": "IM001"},
+            "metadata": {
+                "source_type": "syllabus",
+                "course_code": "IM001",
+            },
         },
         {
             "chunk_id": "archive",
@@ -65,6 +101,117 @@ def test_chroma_index_round_trip() -> None:
     assert summary["count"] == 2
     assert hits[0]["chunk_id"] == "database"
     assert hits[0]["score"] > 0
+
+
+def test_chroma_retriever_filters_by_course_and_source_type() -> None:
+    client = chromadb.EphemeralClient()
+    chunks = [
+        {
+            "chunk_id": "im399-objective",
+            "text": "管理运筹学课程目标包括线性规划和单纯形法",
+            "source_file": "im399.docx",
+            "metadata": {
+                "source_type": "syllabus",
+                "course_code": "IM399",
+                "section_type": "course_objectives",
+            },
+        },
+        {
+            "chunk_id": "im441-internship",
+            "text": "图书馆学专业实习课程安排",
+            "source_file": "im441.docx",
+            "metadata": {
+                "source_type": "syllabus",
+                "course_code": "IM441",
+            },
+        },
+    ]
+    ChromaVectorIndex(
+        "hash",
+        dimensions=32,
+        client=client,
+        collection_name="course_filter",
+    ).build(chunks)
+    retriever = ChromaRetriever(
+        "hash",
+        client=client,
+        collection_name="course_filter",
+    )
+
+    hits = retriever.search(
+        "管理运筹学主要学什么",
+        course_code="IM399",
+        source_types=("syllabus",),
+        preferred_section_types=("course_objectives",),
+    )
+
+    assert [hit["chunk_id"] for hit in hits] == ["im399-objective"]
+
+
+def test_content_query_uses_course_filtered_multisource_evidence() -> None:
+    retriever = FakeRetriever(
+        [
+            {
+                "chunk_id": "objective",
+                "text": "课程目标\n管理运筹学学习线性规划、整数规划和网络分析。",
+                "source_file": "IM399.docx",
+                "section": "课程目标",
+                "metadata": {
+                    "source_type": "syllabus",
+                    "course_code": "IM399",
+                    "course_name": "管理运筹学",
+                    "section_type": "course_objectives",
+                },
+            },
+            {
+                "chunk_id": "schedule",
+                "text": "教学进度 - 第一章 线性规划\n讲授数学模型与单纯形法。",
+                "source_file": "IM399.docx",
+                "section": "教学进度 - 第一章 线性规划",
+                "metadata": {
+                    "source_type": "syllabus",
+                    "course_code": "IM399",
+                    "course_name": "管理运筹学",
+                    "section_type": "teaching_schedule",
+                },
+            },
+            {
+                "chunk_id": "plan",
+                "text": "培养方案课程信息\n课程：管理运筹学（IM399）\n学分：3",
+                "source_file": "training_plans/plan.xlsx",
+                "section": "培养方案课程信息",
+                "metadata": {
+                    "source_type": "training_plan",
+                    "course_code": "IM399",
+                    "course_name": "管理运筹学",
+                },
+            },
+            {
+                "chunk_id": "internship",
+                "text": "专业实习内容",
+                "source_file": "IM441.docx",
+                "metadata": {
+                    "source_type": "syllabus",
+                    "course_code": "IM441",
+                },
+            },
+        ]
+    )
+    router = QueryRouter(vector_retriever=retriever)
+    router.courses = [
+        {"course_code": "IM399", "course_name": "管理运筹学"}
+    ]
+
+    result = asyncio.run(
+        router.route("管理运筹学主要学什么", "content-query")
+    )
+
+    assert result.query_type == "content"
+    assert "课程目标" in result.answer
+    assert "第一章 线性规划" in result.answer
+    assert "培养方案课程信息" in result.answer
+    assert "专业实习" not in result.answer
+    assert all(call["course_code"] == "IM399" for call in retriever.calls)
 
 
 def test_chroma_retriever_rejects_model_mismatch() -> None:
@@ -105,13 +252,102 @@ def test_query_router_classifies_and_handles_fact_queries() -> None:
     assert result.metadata["llm_used"] is False
 
 
+def test_catalog_query_uses_training_plan_memberships() -> None:
+    router = QueryRouter(vector_retriever=FakeRetriever())
+    router.courses = [
+        {
+            "course_code": "IM249",
+            "course_name": "高级程序设计",
+            "offerings": [
+                {
+                    "program_name": "信息管理学院2025级信息管理与信息系统专业培养方案",
+                    "program_type": "主修专业",
+                    "course_category": "专业必修课",
+                    "course_subcategory": "专业核心课",
+                    "semester": 3,
+                    "source_file": "信息管理与信息系统.xlsx",
+                }
+            ],
+        },
+        {
+            "course_code": "IM399",
+            "course_name": "管理运筹学",
+            "offerings": [
+                {
+                    "program_name": "信息管理学院2025级信息管理与信息系统专业培养方案",
+                    "program_type": "主修专业",
+                    "course_category": "专业必修课",
+                    "course_subcategory": "专业基础课",
+                    "semester": 4,
+                    "source_file": "信息管理与信息系统.xlsx",
+                }
+            ],
+        },
+    ]
+
+    result = asyncio.run(
+        router.route(
+            "信息管理与信息系统专业核心课程有哪些",
+            "catalog-query",
+        )
+    )
+
+    assert result.query_type == "catalog"
+    assert "高级程序设计（IM249）" in result.answer
+    assert "管理运筹学" not in result.answer
+    assert result.metadata["source_type"] == "training_plan"
+
+
+def test_demo_renders_answer_and_citations_without_raw_json() -> None:
+    template = (
+        Path(__file__).resolve().parents[1] / "src" / "templates" / "demo.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'lines.join("\\\\n")' not in template
+    assert "JSON.stringify(data.citations" not in template
+    assert 'result.textContent = data.answer' in template
+    assert 'id="citation-list"' in template
+    assert 'id="debug-details"' in template
+    assert 'src="/static/vendor/mermaid.min.js"' in template
+    assert "cdn.jsdelivr.net" not in template
+    assert 'securityLevel: "strict"' in template
+    assert 'id="dependency-panel"' in template
+    assert 'id="dependency-edge-list"' in template
+    assert 'id="learning-plan"' in template
+    assert "buildMermaidDefinition" in template
+    assert "renderDependencyInfo" in template
+    assert "data.nodes.length > 30" in template
+    assert "关系图渲染失败，请使用下方课程边列表。" in template
+    assert "[hidden]" in template
+
+    vendor_root = Path(__file__).resolve().parents[1] / "src" / "static" / "vendor"
+    assert (vendor_root / "mermaid.min.js").stat().st_size > 1_000_000
+    assert (vendor_root / "MERMAID-LICENSE").exists()
+
+
+def test_start_script_detects_an_existing_api_before_launching() -> None:
+    script = (
+        Path(__file__).resolve().parents[1] / "start_all.bat"
+    ).read_text(encoding="utf-8")
+
+    health_check = script.index("http://127.0.0.1:8000/health")
+    uvicorn_launch = script.index("start \"zsttSystem\"")
+    assert health_check < uvicorn_launch
+    assert "Get-NetTCPConnection -LocalPort 8000" in script
+    assert "API is already running" in script
+    assert "Port 8000 is already occupied" in script
+
+
 def test_hybrid_query_degrades_when_llm_fails() -> None:
     hits = [
         {
             "chunk_id": "chunk-1",
             "text": "可信课程证据",
             "source_file": "course.docx",
-            "metadata": {"course_code": "IM001"},
+            "metadata": {
+                "source_type": "syllabus",
+                "course_code": "IM001",
+            },
         }
     ]
     router = QueryRouter(vector_retriever=FakeRetriever(hits))
@@ -124,7 +360,9 @@ def test_hybrid_query_degrades_when_llm_fails() -> None:
             router.route("比较数据库与档案管理的差异", "query-2", llm_client=object())
         )
 
-    assert result.answer.startswith("可信课程证据")
+    assert "核心内容：" in result.answer
+    assert "可信课程证据" in result.answer
+    assert "chunk_id" not in result.answer
     assert result.metadata["status"] == "degraded"
     assert result.metadata["error_code"] == "LLM_UNAVAILABLE"
 
@@ -204,7 +442,6 @@ def test_retraining_updates_chunks_and_rebuilds_index(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chunks_path = tmp_path / "chunks.json"
-    chunked_path = tmp_path / "chunked_data.json"
     original = [
         {
             "chunk_id": "chunk-1",
@@ -212,14 +449,13 @@ def test_retraining_updates_chunks_and_rebuilds_index(
             "metadata": {"course_code": "IM001"},
         }
     ]
-    for path in (chunks_path, chunked_path):
-        path.write_text(json.dumps(original), encoding="utf-8")
+    chunks_path.write_text(json.dumps(original), encoding="utf-8")
 
     build_calls: list[list[dict]] = []
     monkeypatch.setattr(
         retraining_module,
         "CHUNKS_PATHS",
-        (chunks_path, chunked_path),
+        (chunks_path,),
     )
     monkeypatch.setattr(retraining_module, "VECTOR_OUTPUT_DIR", tmp_path)
     monkeypatch.setattr(
@@ -240,10 +476,9 @@ def test_retraining_updates_chunks_and_rebuilds_index(
         ]
     )
 
-    for path in (chunks_path, chunked_path):
-        updated = json.loads(path.read_text(encoding="utf-8"))
-        assert updated[0]["text"] == "new"
-        assert updated[0]["metadata"]["reviewed"] is True
+    updated = json.loads(chunks_path.read_text(encoding="utf-8"))
+    assert updated[0]["text"] == "new"
+    assert updated[0]["metadata"]["reviewed"] is True
     assert len(build_calls) == 1
 
 
