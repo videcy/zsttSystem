@@ -18,11 +18,12 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
 from pydantic import BaseModel
@@ -32,6 +33,10 @@ from src.online_service.feedback_handler import (
     append_jsonl_record,
     build_feedback_log_record,
     build_query_log_record,
+)
+from src.online_service.course_dependency_service import (
+    CourseDependencyNotFoundError,
+    get_course_dependency_subgraph,
 )
 from src.online_service.query_router import QueryRouter
 from src.online_service.chroma_retriever import ChromaRetriever
@@ -54,6 +59,25 @@ NEO4J_PASSWORD = config.neo4j_password
 
 class QueryRequest(BaseModel):
     query: str
+    persona: Literal["student", "teacher", "visitor"] = "student"
+
+
+class CitationResponse(BaseModel):
+    source_file: str | None = None
+    course_code: str | None = None
+    course_name: str | None = None
+    section: str | None = None
+
+
+class QueryResponse(BaseModel):
+    query_id: str
+    answer: str
+    citations: list[CitationResponse]
+    query_type: str
+    status: str
+    metadata: dict[str, Any]
+    graph_paths: list[dict[str, Any]] | None = None
+    dependency_info: dict[str, Any] | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -106,6 +130,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan, title="zsttSystem v2.0 RAG-KG API")
+app.mount(
+    "/static",
+    StaticFiles(directory=PROJECT_ROOT / "src" / "static"),
+    name="static",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +154,12 @@ async def demo_home() -> str:
 async def healthcheck() -> dict[str, Any]:
     """Health check – reports backend availability."""
     retriever = getattr(app.state, "vector_retriever", None)
+    neo4j_driver = getattr(app.state, "neo4j_driver", None)
     chroma_connected = bool(retriever and retriever.connected)
     chunk_count = retriever.count if retriever else 0
     return {
         "status": "ok" if chroma_connected and chunk_count > 0 else "degraded",
-        "neo4j": "connected" if app.state.neo4j_driver else "unavailable",
+        "neo4j": "connected" if neo4j_driver else "unavailable",
         "chroma": "connected" if chroma_connected else "unavailable",
         "vector_index": "loaded" if chunk_count > 0 else "empty",
         "embedding_model": "loaded" if chunk_count > 0 else "unavailable",
@@ -137,7 +167,11 @@ async def healthcheck() -> dict[str, Any]:
     }
 
 
-@app.post("/query")
+@app.post(
+    "/query",
+    response_model=QueryResponse,
+    response_model_exclude_none=True,
+)
 async def process_query(
     request: QueryRequest, fastapi_request: Request
 ) -> dict[str, Any]:
@@ -163,6 +197,7 @@ async def process_query(
         query_id,
         neo4j_driver=neo4j_driver,
         llm_client=llm_client,
+        persona=request.persona,
     )
 
     # Build response
@@ -196,6 +231,39 @@ async def course_info(course_code: str) -> dict[str, Any]:
 @app.get("/courses/{course_code}/graph")
 async def course_graph(course_code: str) -> dict[str, Any]:
     return await asyncio.to_thread(_build_course_graph, course_code)
+
+
+@app.get("/courses/{course_code}/dependencies")
+async def course_dependencies(
+    course_code: str,
+    fastapi_request: Request,
+    depth: int = Query(2, ge=1, le=3),
+    max_nodes: int = Query(30, ge=1, le=30),
+    program_name: str | None = Query(None, min_length=1, max_length=200),
+) -> dict[str, Any]:
+    """Return a bounded hard-prerequisite neighborhood for one course."""
+    neo4j_driver = fastapi_request.app.state.neo4j_driver
+    if neo4j_driver is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Neo4j is unavailable",
+        )
+    try:
+        return await asyncio.to_thread(
+            get_course_dependency_subgraph,
+            neo4j_driver,
+            course_code,
+            depth=depth,
+            max_nodes=max_nodes,
+            program_name=program_name,
+        )
+    except CourseDependencyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="course not found") from exc
+    except (Neo4jError, ServiceUnavailable, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="course dependency graph is unavailable",
+        ) from exc
 
 
 @app.get("/dependency")
@@ -367,6 +435,9 @@ async def _log_query(
             linked_entities=[],
             citations=citations,
             status="fallback" if "error" in metadata else "ok",
+            persona=metadata.get("persona", "student"),
+            persona_mode=metadata.get("persona_mode", "retrieval"),
+            persona_profile_version=metadata.get("persona_profile_version", "v1"),
         ),
     )
 

@@ -32,6 +32,9 @@
                 padding: 0;
                 box-sizing: border-box;
             }
+            [hidden] {
+                display: none !important;
+            }
             body {
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
                 min-height: 100vh;
@@ -185,6 +188,21 @@
                 color: var(--text-secondary);
                 margin-bottom: 12px;
                 animation: fadeInUp 0.6s ease-out 0.4s both;
+            }
+            .persona-select {
+                width: 100%;
+                margin-bottom: 20px;
+                border: 2px solid var(--border);
+                border-radius: 12px;
+                padding: 11px 14px;
+                color: var(--text-primary);
+                background: white;
+                font: inherit;
+            }
+            .persona-select:focus {
+                outline: none;
+                border-color: var(--primary);
+                box-shadow: 0 0 0 4px var(--primary-light);
             }
             textarea {
                 width: 100%;
@@ -366,6 +384,135 @@
                 border-color: var(--primary);
                 box-shadow: 0 0 20px rgba(79, 70, 229, 0.1);
             }
+            .citations {
+                margin-top: 20px;
+            }
+            .citations-title {
+                margin-bottom: 10px;
+                color: var(--text-secondary);
+                font-size: 14px;
+                font-weight: 600;
+            }
+            .citation-list {
+                display: grid;
+                gap: 10px;
+            }
+            .citation-card {
+                padding: 12px 14px;
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                background: var(--primary-light);
+            }
+            .citation-name {
+                color: var(--text);
+                font-weight: 600;
+            }
+            .citation-meta {
+                margin-top: 4px;
+                color: var(--text-secondary);
+                font-size: 13px;
+                overflow-wrap: anywhere;
+            }
+            .dependency-panel {
+                margin-top: 22px;
+                padding: 18px;
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                background: rgba(255, 255, 255, 0.78);
+            }
+            .dependency-title {
+                color: var(--text);
+                font-size: 15px;
+                font-weight: 700;
+            }
+            .dependency-controls {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 12px;
+                align-items: center;
+                margin: 14px 0;
+                color: var(--text-secondary);
+                font-size: 13px;
+            }
+            .dependency-controls label {
+                display: inline-flex;
+                gap: 6px;
+                align-items: center;
+            }
+            .dependency-controls select {
+                padding: 6px 9px;
+                border: 1px solid var(--border);
+                border-radius: 8px;
+                background: white;
+                color: var(--text);
+            }
+            .dependency-notice,
+            .plan-warning {
+                margin: 10px 0;
+                padding: 10px 12px;
+                border-radius: 10px;
+                background: #fff7ed;
+                color: #9a3412;
+                font-size: 13px;
+            }
+            .dependency-graph {
+                min-height: 90px;
+                overflow: auto;
+                padding: 12px;
+                border-radius: 12px;
+                background: white;
+                text-align: center;
+            }
+            .dependency-graph svg {
+                max-width: 100%;
+                height: auto;
+            }
+            .learning-plan {
+                margin-top: 16px;
+            }
+            .plan-title {
+                margin-bottom: 8px;
+                color: var(--text-secondary);
+                font-size: 14px;
+                font-weight: 700;
+            }
+            .plan-layers {
+                display: grid;
+                gap: 8px;
+            }
+            .plan-layer {
+                padding: 10px 12px;
+                border-left: 3px solid var(--primary);
+                border-radius: 8px;
+                background: var(--primary-light);
+                color: var(--text);
+                font-size: 13px;
+            }
+            .dependency-edges {
+                margin-top: 14px;
+                color: var(--text-muted);
+                font-size: 12px;
+            }
+            .dependency-edge-list {
+                margin: 8px 0 0;
+                padding-left: 20px;
+            }
+            .dependency-edge-list li {
+                margin: 5px 0;
+            }
+            .debug-details {
+                margin-top: 16px;
+                color: var(--text-muted);
+                font-size: 12px;
+            }
+            .debug-details summary {
+                cursor: pointer;
+                user-select: none;
+            }
+            .debug-content {
+                margin-top: 8px;
+                white-space: pre-wrap;
+            }
             @keyframes gradientShift {
                 0%, 100% { background-position: 0% 50%; }
                 50% { background-position: 100% 50%; }
@@ -423,6 +570,14 @@
             </div>
             <div class="panel">
                 <div class="input-group">
+                    <label for="persona">我是</label>
+                    <select id="persona" class="persona-select">
+                        <option value="student" selected>学生</option>
+                        <option value="teacher">教师</option>
+                        <option value="visitor">访客</option>
+                    </select>
+                </div>
+                <div class="input-group">
                     <label for="query">输入您的问题</label>
                     <textarea id="query" placeholder="例如：专业的核心课程有哪些？"></textarea>
                 </div>
@@ -433,19 +588,353 @@
                 <div class="result-container">
                     <div class="result-header">回答结果</div>
                     <div class="result empty" id="result">答案将显示在这里...</div>
+                    <section class="citations" id="citations" hidden>
+                        <div class="citations-title">参考来源</div>
+                        <div class="citation-list" id="citation-list"></div>
+                    </section>
+                    <section class="dependency-panel" id="dependency-panel" hidden>
+                        <div class="dependency-title">课程先修关系与选课路径</div>
+                        <div class="dependency-controls">
+                            <label>
+                                邻域深度
+                                <select id="dependency-depth">
+                                    <option value="1">1 跳</option>
+                                    <option value="2" selected>2 跳</option>
+                                    <option value="3">3 跳</option>
+                                </select>
+                            </label>
+                            <label>
+                                <input type="checkbox" checked disabled>
+                                仅显示硬先修
+                            </label>
+                            <label id="program-control" hidden>
+                                培养方案
+                                <select id="dependency-program"></select>
+                            </label>
+                        </div>
+                        <div class="dependency-notice" id="dependency-notice" hidden></div>
+                        <div
+                            class="dependency-graph"
+                            id="dependency-graph"
+                            aria-label="课程先修关系图"
+                        ></div>
+                        <section class="learning-plan" id="learning-plan"></section>
+                        <details class="dependency-edges">
+                            <summary>查看课程边列表</summary>
+                            <ul
+                                class="dependency-edge-list"
+                                id="dependency-edge-list"
+                            ></ul>
+                        </details>
+                    </section>
+                    <details class="debug-details" id="debug-details" hidden>
+                        <summary>调试详情</summary>
+                        <div class="debug-content" id="debug-content"></div>
+                    </details>
                 </div>
             </div>
         </div>
+        <script src="/static/vendor/mermaid.min.js"></script>
         <script>
             const submit = document.getElementById("submit");
             const queryInput = document.getElementById("query");
+            const personaInput = document.getElementById("persona");
             const status = document.getElementById("status");
             const result = document.getElementById("result");
+            const citations = document.getElementById("citations");
+            const citationList = document.getElementById("citation-list");
+            const debugDetails = document.getElementById("debug-details");
+            const debugContent = document.getElementById("debug-content");
+            const dependencyPanel = document.getElementById("dependency-panel");
+            const dependencyDepth = document.getElementById("dependency-depth");
+            const dependencyNotice = document.getElementById("dependency-notice");
+            const dependencyGraph = document.getElementById("dependency-graph");
+            const dependencyEdgeList = document.getElementById("dependency-edge-list");
+            const learningPlan = document.getElementById("learning-plan");
+            const programControl = document.getElementById("program-control");
+            const dependencyProgram = document.getElementById("dependency-program");
+            let dependencyTarget = "";
+            let mermaidRenderCount = 0;
+
+            if (window.mermaid) {
+                window.mermaid.initialize({
+                    startOnLoad: false,
+                    securityLevel: "strict",
+                    theme: "neutral",
+                });
+            }
 
             function updateStatus(text, type) {
                 status.textContent = text;
                 status.className = `status-bar status-${type}`;
             }
+
+            function renderCitations(items) {
+                citationList.replaceChildren();
+                citations.hidden = !Array.isArray(items) || items.length === 0;
+                if (citations.hidden) {
+                    return;
+                }
+                items.forEach((item) => {
+                    const card = document.createElement("article");
+                    card.className = "citation-card";
+
+                    const name = document.createElement("div");
+                    name.className = "citation-name";
+                    name.textContent = [
+                        item.course_name,
+                        item.course_code ? `（${item.course_code}）` : "",
+                    ].join("") || "课程资料";
+
+                    const section = document.createElement("div");
+                    section.className = "citation-meta";
+                    section.textContent = item.section
+                        ? `章节：${item.section}`
+                        : "章节：未标注";
+
+                    const source = document.createElement("div");
+                    source.className = "citation-meta";
+                    source.textContent = item.source_file
+                        ? `来源：${item.source_file}`
+                        : "来源：本地知识库";
+
+                    card.append(name, section, source);
+                    citationList.append(card);
+                });
+            }
+
+            function renderDebug(data) {
+                debugDetails.hidden = false;
+                debugDetails.open = false;
+                debugContent.textContent = [
+                    `查询 ID：${data.query_id || "无"}`,
+                    `查询类型：${data.query_type || "未知"}`,
+                    `状态：${data.status || "ok"}`,
+                ].join("\n");
+            }
+
+            function mermaidNodeId(courseCode) {
+                const value = String(courseCode || "");
+                if (/^[A-Za-z][A-Za-z0-9_]*$/.test(value)) {
+                    return value;
+                }
+                let hash = 2166136261;
+                for (const character of value) {
+                    hash ^= character.codePointAt(0);
+                    hash = Math.imul(hash, 16777619);
+                }
+                return `C_${(hash >>> 0).toString(16)}`;
+            }
+
+            function escapeMermaidLabel(value) {
+                return String(value || "")
+                    .replaceAll("&", "&amp;")
+                    .replaceAll('"', "&quot;")
+                    .replaceAll("[", "&#91;")
+                    .replaceAll("]", "&#93;")
+                    .replaceAll("<", "&lt;")
+                    .replaceAll(">", "&gt;")
+                    .replaceAll("\n", " ");
+            }
+
+            function buildMermaidDefinition(data) {
+                const lines = ["graph LR"];
+                for (const node of data.nodes || []) {
+                    const id = mermaidNodeId(node.course_code || node.id);
+                    const code = node.course_code || node.id || "";
+                    const label = escapeMermaidLabel(
+                        `${node.label || code}（${code}）`,
+                    );
+                    lines.push(`    ${id}["${label}"]`);
+                }
+                for (const edge of data.edges || []) {
+                    const source = mermaidNodeId(edge.source);
+                    const target = mermaidNodeId(edge.target);
+                    lines.push(`    ${source} -->|先修| ${target}`);
+                }
+                return lines.join("\n");
+            }
+
+            function renderEdgeList(data) {
+                dependencyEdgeList.replaceChildren();
+                const labels = new Map(
+                    (data.nodes || []).map((node) => [
+                        node.course_code || node.id,
+                        node.label || node.course_code || node.id,
+                    ]),
+                );
+                for (const edge of data.edges || []) {
+                    const item = document.createElement("li");
+                    item.textContent = [
+                        `${labels.get(edge.source) || edge.source}（${edge.source}）`,
+                        " → ",
+                        `${labels.get(edge.target) || edge.target}（${edge.target}）`,
+                        edge.source_file ? `；来源：${edge.source_file}` : "",
+                    ].join("");
+                    dependencyEdgeList.append(item);
+                }
+                if (!dependencyEdgeList.children.length) {
+                    const item = document.createElement("li");
+                    item.textContent = "未找到明确的硬先修边。";
+                    dependencyEdgeList.append(item);
+                }
+            }
+
+            function renderLearningPlan(plan) {
+                learningPlan.replaceChildren();
+                if (!plan) {
+                    return;
+                }
+                const title = document.createElement("div");
+                title.className = "plan-title";
+                title.textContent = "建议学习层级（不等同于学校真实学期）";
+                learningPlan.append(title);
+
+                for (const warningText of plan.warnings || []) {
+                    const warning = document.createElement("div");
+                    warning.className = "plan-warning";
+                    warning.textContent = warningText;
+                    learningPlan.append(warning);
+                }
+                if (plan.status === "cycle_detected" && plan.cycle?.length) {
+                    const cycle = document.createElement("div");
+                    cycle.className = "plan-warning";
+                    cycle.textContent = `检测到环：${plan.cycle.join(" → ")}`;
+                    learningPlan.append(cycle);
+                    return;
+                }
+                if (!Array.isArray(plan.layers) || !plan.layers.length) {
+                    return;
+                }
+                const layers = document.createElement("div");
+                layers.className = "plan-layers";
+                for (const layer of plan.layers) {
+                    const card = document.createElement("div");
+                    card.className = "plan-layer";
+                    const courses = (layer.courses || []).map((course) => {
+                        const semester = course.official_semester == null
+                            ? "开课学期未标注"
+                            : `官方第 ${course.official_semester} 学期`;
+                        return (
+                            `${course.label}（${course.course_code}，`
+                            + `${semester}）`
+                        );
+                    });
+                    card.textContent = (
+                        `学习层级 ${layer.stage}：${courses.join("；")}`
+                    );
+                    layers.append(card);
+                }
+                learningPlan.append(layers);
+            }
+
+            function renderProgramOptions(plan) {
+                const programs = plan?.available_programs || [];
+                programControl.hidden = programs.length <= 1;
+                dependencyProgram.replaceChildren();
+                if (programControl.hidden) {
+                    return;
+                }
+                const prompt = document.createElement("option");
+                prompt.value = "";
+                prompt.textContent = "请选择培养方案";
+                dependencyProgram.append(prompt);
+                for (const program of programs) {
+                    const option = document.createElement("option");
+                    option.value = program;
+                    option.textContent = program;
+                    option.selected = program === plan.program_name;
+                    dependencyProgram.append(option);
+                }
+            }
+
+            async function renderDependencyInfo(data) {
+                const valid = (
+                    data
+                    && data.target_course
+                    && Array.isArray(data.nodes)
+                    && Array.isArray(data.edges)
+                );
+                dependencyPanel.hidden = !valid;
+                if (!valid) {
+                    dependencyTarget = "";
+                    return;
+                }
+                dependencyTarget = data.target_course;
+                dependencyDepth.value = String(data.depth || 2);
+                dependencyNotice.hidden = true;
+                if (data.truncated) {
+                    dependencyNotice.textContent = (
+                        `子图共有 ${data.total_nodes} 个节点，`
+                        + `当前仅显示 ${data.nodes.length} 个。`
+                    );
+                    dependencyNotice.hidden = false;
+                }
+                renderEdgeList(data);
+                renderProgramOptions(data.plan);
+                renderLearningPlan(data.plan);
+                dependencyGraph.replaceChildren();
+                if (data.nodes.length > 30) {
+                    dependencyGraph.textContent = (
+                        "节点超过 30 个，已停止图形渲染。"
+                    );
+                    return;
+                }
+                if (!window.mermaid) {
+                    dependencyGraph.textContent = (
+                        "图形组件未加载，请使用下方课程边列表。"
+                    );
+                    return;
+                }
+                try {
+                    const definition = buildMermaidDefinition(data);
+                    const renderId = (
+                        `course-dependency-${++mermaidRenderCount}`
+                    );
+                    const { svg } = await window.mermaid.render(
+                        renderId,
+                        definition,
+                    );
+                    dependencyGraph.innerHTML = svg;
+                } catch (_error) {
+                    dependencyGraph.textContent = (
+                        "关系图渲染失败，请使用下方课程边列表。"
+                    );
+                }
+            }
+
+            async function refreshDependencyInfo() {
+                if (!dependencyTarget) {
+                    return;
+                }
+                const parameters = new URLSearchParams({
+                    depth: dependencyDepth.value,
+                    max_nodes: "30",
+                });
+                if (dependencyProgram.value) {
+                    parameters.set("program_name", dependencyProgram.value);
+                }
+                try {
+                    const response = await fetch(
+                        `/courses/${encodeURIComponent(dependencyTarget)}`
+                        + `/dependencies?${parameters}`,
+                    );
+                    const data = await response.json();
+                    if (!response.ok) {
+                        throw new Error(data.detail || "依赖子图请求失败");
+                    }
+                    await renderDependencyInfo(data);
+                } catch (error) {
+                    dependencyNotice.textContent = String(error);
+                    dependencyNotice.hidden = false;
+                }
+            }
+
+            dependencyDepth.addEventListener("change", refreshDependencyInfo);
+            dependencyProgram.addEventListener(
+                "change",
+                refreshDependencyInfo,
+            );
 
             submit.addEventListener("click", async () => {
                 const query = queryInput.value.trim();
@@ -461,39 +950,38 @@
                 updateStatus("正在查询...", "querying");
                 result.textContent = "正在思考中，请稍候...";
                 result.classList.remove("empty");
+                citations.hidden = true;
+                debugDetails.hidden = true;
+                dependencyPanel.hidden = true;
 
                 try {
                     const response = await fetch("/query", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ query })
+                        body: JSON.stringify({
+                            query,
+                            persona: personaInput.value,
+                        })
                     });
                     const data = await response.json();
                     if (!response.ok) {
                         throw new Error(data.detail || "请求失败");
                     }
 
-                    const lines = [
-                        `状态: ${data.status || "正常"}`,
-                        `查询ID: ${data.query_id || ""}`,
-                        "",
-                        "答案:",
-                        data.answer || "",
-                    ];
-
-                    if (Array.isArray(data.linked_entities) && data.linked_entities.length) {
-                        lines.push("", "关联实体:", data.linked_entities.join(", "));
-                    }
-
-                    if (Array.isArray(data.citations) && data.citations.length) {
-                        lines.push("", "引用:", JSON.stringify(data.citations, null, 2));
-                    }
-
-                    result.textContent = lines.join("\\n");
-                    updateStatus("查询完成", "done");
+                    result.textContent = data.answer || "当前没有可展示的答案。";
+                    renderCitations(data.citations);
+                    await renderDependencyInfo(data.dependency_info);
+                    renderDebug(data);
+                    updateStatus(
+                        data.status === "degraded" ? "查询完成（服务降级）" : "查询完成",
+                        "done",
+                    );
                 } catch (error) {
                     updateStatus("查询失败", "failed");
                     result.textContent = "错误: " + String(error);
+                    citations.hidden = true;
+                    debugDetails.hidden = true;
+                    dependencyPanel.hidden = true;
                 } finally {
                     submit.disabled = false;
                     submit.classList.remove("btn-loading");

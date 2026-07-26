@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -12,6 +13,18 @@ import numpy as np
 from chromadb.config import Settings
 
 from src.config import config
+
+
+def _bypass_proxy_for_loopback(host: str) -> None:
+    """Keep local Chroma traffic out of system HTTP proxies."""
+    normalized_host = host.strip().strip("[]").lower()
+    if normalized_host not in {"127.0.0.1", "localhost", "::1"}:
+        return
+    existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy", "")
+    entries = [entry.strip() for entry in existing.split(",") if entry.strip()]
+    if normalized_host not in {entry.lower() for entry in entries}:
+        entries.append(normalized_host)
+    os.environ["NO_PROXY"] = ",".join(entries)
 
 
 def _hash_embedding(text: str, dimensions: int = 384) -> np.ndarray:
@@ -37,7 +50,12 @@ class TextEncoder:
                 from sentence_transformers import SentenceTransformer
 
                 self._model = SentenceTransformer(model_name)
-                self.dimensions = self._model.get_sentence_embedding_dimension()
+                if hasattr(self._model, "get_embedding_dimension"):
+                    self.dimensions = self._model.get_embedding_dimension()
+                else:
+                    self.dimensions = (
+                        self._model.get_sentence_embedding_dimension()
+                    )
             except Exception as exc:
                 raise RuntimeError(
                     f"embedding model unavailable: {model_name}"
@@ -61,6 +79,7 @@ def create_chroma_client():
     """Create the configured local persistent or HTTP Chroma client."""
     settings = Settings(anonymized_telemetry=False)
     if config.chroma_mode == "http":
+        _bypass_proxy_for_loopback(config.chroma_host)
         return chromadb.HttpClient(
             host=config.chroma_host,
             port=config.chroma_port,
@@ -97,6 +116,20 @@ def _chroma_metadata(chunk: dict[str, Any]) -> dict[str, str | int | float | boo
         "course_code": domain_metadata.get("course_code")
         or chunk.get("course_code"),
         "course_name": domain_metadata.get("course_name"),
+        "source_type": domain_metadata.get("source_type"),
+        "program_name": domain_metadata.get("program_name"),
+        "program_type": domain_metadata.get("program_type"),
+        "course_category": domain_metadata.get("course_category"),
+        "course_subcategory": domain_metadata.get("course_subcategory"),
+        "credits": domain_metadata.get("credits"),
+        "hours": domain_metadata.get("hours"),
+        "semester": domain_metadata.get("semester"),
+        "instructor": domain_metadata.get("instructor"),
+        "section_type": domain_metadata.get("section_type"),
+        "source_year": domain_metadata.get("source_year"),
+        "parent_document": domain_metadata.get("parent_document"),
+        "parent_section": domain_metadata.get("parent_section"),
+        "chunk_part": domain_metadata.get("chunk_part"),
         "section": chunk.get("section")
         or domain_metadata.get("syllabus_section"),
         "source_file": chunk.get("source_file"),

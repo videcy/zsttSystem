@@ -132,10 +132,6 @@ class Config:
         return _path(os.getenv("SYLLABUS_DIR", "data/syllabi"))
 
     @property
-    def chunked_output_path(self) -> Path:
-        return _path(os.getenv("CHUNKED_OUTPUT_PATH", "outputs/chunked_data.json"))
-
-    @property
     def courses_output_path(self) -> Path:
         return _path(os.getenv("COURSES_OUTPUT_PATH", "outputs/courses.json"))
 
@@ -150,10 +146,6 @@ class Config:
     @property
     def graph_manifest_path(self) -> Path:
         return _path(os.getenv("GRAPH_MANIFEST_PATH", "outputs/graph_manifest.json"))
-
-    @property
-    def kg_output_path(self) -> Path:
-        return _path(os.getenv("KG_OUTPUT_PATH", "outputs/kg_extracted_data.json"))
 
     @property
     def concept_registry_path(self) -> Path:
