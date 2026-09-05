@@ -8,6 +8,18 @@ services:
       ANONYMIZED_TELEMETRY: "FALSE"
     volumes:
       - chroma_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen(
+          'http://127.0.0.1:8000/api/v2/heartbeat', timeout=4).status == 200
+          else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
     restart: unless-stopped
 
   neo4j:
@@ -33,6 +45,53 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # The API itself. Service names replace the loopback addresses used by a
+  # host-side .env, so the container talks to the compose network.
+  api:
+    build: .
+    container_name: zstt_api
+    env_file: .env
+    environment:
+      CHROMA_MODE: http
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      NEO4J_URI: bolt://neo4j:7687
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+      - ./outputs:/app/outputs
+      - model_cache:/models
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot offline pipeline:
+  #   docker compose --profile pipeline run --rm pipeline
+  pipeline:
+    build: .
+    profiles: ["pipeline"]
+    env_file: .env
+    environment:
+      CHROMA_MODE: http
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: "8000"
+      NEO4J_URI: bolt://neo4j:7687
+    volumes:
+      - ./data:/app/data:ro
+      - ./outputs:/app/outputs
+      - model_cache:/models
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    command: ["python", "run_pipeline.py", "all"]
+
 volumes:
   chroma_data:
   neo4j_data:
+  model_cache:

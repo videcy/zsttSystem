@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -14,6 +15,9 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 from src.config import config
+
+
+logger = logging.getLogger(__name__)
 
 
 def create_deepseek_client() -> OpenAI:
@@ -108,22 +112,40 @@ def generate_text(
     *,
     temperature: float = 0.1,
     max_output_tokens: int = 512,
+    json_mode: bool = False,
 ) -> str:
     """Generate plain text with DeepSeek chat completions."""
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_tokens=max_output_tokens,
-    )
-    content = response.choices[0].message.content
+    request: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_output_tokens,
+    }
+    if json_mode:
+        request["response_format"] = {"type": "json_object"}
+        # DeepSeek enables thinking by default for current chat models. JSON
+        # extraction needs the final answer in ``content`` rather than an
+        # optional reasoning-only response, so disable thinking explicitly.
+        request["extra_body"] = {"thinking": {"type": "disabled"}}
+    response = client.chat.completions.create(**request)
+    choice = response.choices[0]
+    content = choice.message.content
     if isinstance(content, list):
-        return "".join(
+        result = "".join(
             item.get("text", "")
             for item in content
             if isinstance(item, dict)
         ).strip()
-    return str(content or "").strip()
+    else:
+        result = str(content or "").strip()
+    if json_mode and not result:
+        logger.warning(
+            "[deepseek_client] empty JSON content "
+            "(finish_reason=%s, has_reasoning_content=%s)",
+            getattr(choice, "finish_reason", None),
+            bool(getattr(choice.message, "reasoning_content", None)),
+        )
+    return result
 
 
 def generate_json(
@@ -135,14 +157,16 @@ def generate_json(
     max_output_tokens: int = 800,
 ) -> dict[str, Any]:
     """Generate JSON by prompting the model and extracting the object."""
-    text = generate_text(
+    value = generate_json_value(
         client,
         model,
         prompt,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
     )
-    return extract_json_object(text)
+    if not isinstance(value, dict):
+        raise ValueError("Model output does not contain a JSON object.")
+    return value
 
 
 def generate_json_value(
@@ -154,14 +178,37 @@ def generate_json_value(
     max_output_tokens: int = 800,
 ) -> Any:
     """Generate JSON by prompting the model and extracting the first JSON value."""
-    text = generate_text(
-        client,
-        model,
-        prompt,
-        temperature=temperature,
-        max_output_tokens=max_output_tokens,
-    )
-    return extract_json_value(text)
+    last_error: ValueError | None = None
+    for attempt in range(2):
+        retry_instruction = (
+            "\n上一次响应为空或不是合法 JSON。请只返回一个合法 JSON 对象。"
+            if attempt
+            else ""
+        )
+        text = generate_text(
+            client,
+            model,
+            prompt + retry_instruction,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            json_mode=True,
+        )
+        try:
+            return extract_json_value(text)
+        except ValueError as exc:
+            last_error = exc
+            logger.warning(
+                "[deepseek_client] invalid JSON response "
+                "(attempt=%d, content_length=%d)",
+                attempt + 1,
+                len(text),
+            )
+    if last_error is not None:
+        raise ValueError(
+            "DeepSeek returned empty or invalid JSON after two JSON-mode "
+            "attempts (thinking disabled)."
+        ) from last_error
+    raise ValueError("Model output does not contain valid JSON.")
 
 
 @lru_cache(maxsize=1)
@@ -214,6 +261,7 @@ def embed_texts(
     *,
     batch_size: int = 64,
     max_chars: int | None = None,
+    allow_hash_fallback: bool = True,
 ) -> list[list[float]]:
     """Create embeddings with a configurable backend.
 
@@ -238,8 +286,13 @@ def embed_texts(
         sanitized.append(value)
 
     provider = config.embedding_provider
+    if provider == "hash":
+        return _simple_embed_texts(
+            sanitized,
+            dimensions=config.simple_embedding_dimensions,
+        )
     if provider == "local":
-        local_model_name = config.local_embedding_model
+        local_model_name = model or config.local_embedding_model
         try:
             encoder = _load_local_embedding_model(local_model_name)
             matrix = encoder.encode(
@@ -251,6 +304,10 @@ def embed_texts(
             )
             return [row.tolist() for row in matrix]
         except Exception as exc:
+            if not allow_hash_fallback:
+                raise RuntimeError(
+                    f"local embedding model unavailable: {local_model_name}"
+                ) from exc
             fallback_dimensions = config.simple_embedding_dimensions
             print(
                 "[embedding] Failed to load local sentence-transformers model "
@@ -258,6 +315,11 @@ def embed_texts(
                 f"Reason: {exc}"
             )
             return _simple_embed_texts(sanitized, dimensions=fallback_dimensions)
+
+    if provider != "api":
+        raise ValueError(
+            "EMBEDDING_PROVIDER must be one of: local, hash, api."
+        )
 
     api_key = config.embedding_api_key
     if not api_key:
