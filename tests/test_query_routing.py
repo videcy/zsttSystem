@@ -197,3 +197,85 @@ def test_fact_fallback_stays_permissive_without_a_lexical_score() -> None:
     result = asyncio.run(_fact_router(None).route("《保护理论》有几学分？", "q-8"))
 
     assert "当代保护理论" in result.answer
+
+
+class _VerificationRouter(_StubRouter):
+    """Stub whose handlers carry NLI metadata like the real ones do."""
+
+    def __init__(self, per_intent: dict[QueryType, dict[str, Any]]) -> None:
+        super().__init__()
+        self.per_intent = per_intent
+
+    async def _handle_single_intent(  # type: ignore[override]
+        self,
+        query_type: QueryType,
+        query: str,
+        **_kwargs: Any,
+    ) -> RouteResult:
+        self.calls.append(query_type.value)
+        return RouteResult(
+            answer=self.answers[query_type],
+            citations=[],
+            query_type=query_type.value,
+            metadata=dict(self.per_intent.get(query_type, {})),
+        )
+
+
+def test_merged_answer_lifts_verification_metadata_to_the_top_level() -> None:
+    router = _VerificationRouter(
+        {
+            QueryType.DEPENDENCY: {
+                "nli_status": "passed",
+                "nli_verified": True,
+                "nli_attempts": 1,
+                "nli_details": [{"sentence": "先修", "label": "Entailment"}],
+                "status": "ok",
+            },
+            QueryType.FACT: {
+                "nli_status": "pruned",
+                "nli_verified": True,
+                "nli_attempts": 2,
+                "nli_details": [{"sentence": "学分", "label": "Neutral"}],
+                "status": "ok",
+            },
+        }
+    )
+
+    result = asyncio.run(router.route("管理运筹学几学分，有哪些先修课？", "q-9"))
+
+    # main._log_query and the active-learning sampler read these keys from the
+    # top level; nesting them per section would drop merged answers out of the
+    # review queue entirely.
+    assert result.metadata["nli_status"] == "pruned"
+    assert result.metadata["nli_attempts"] == 3
+    assert len(result.metadata["nli_details"]) == 2
+    assert result.metadata["nli_verified"] is True
+    assert result.metadata["status"] == "ok"
+
+
+def test_merged_answer_reports_the_worst_section_status() -> None:
+    router = _VerificationRouter(
+        {
+            QueryType.DEPENDENCY: {"status": "degraded", "error_code": "NO_NEO4J"},
+            QueryType.FACT: {"status": "ok", "nli_status": "passed"},
+        }
+    )
+
+    result = asyncio.run(router.route("管理运筹学几学分，有哪些先修课？", "q-10"))
+
+    assert result.metadata["status"] == "ok"
+    assert result.metadata["partial_status"] == ["degraded"]
+
+
+def test_merged_answer_stays_degraded_when_every_section_failed() -> None:
+    router = _VerificationRouter(
+        {
+            QueryType.DEPENDENCY: {"status": "degraded", "error_code": "NO_NEO4J"},
+            QueryType.FACT: {"status": "refused"},
+        }
+    )
+
+    result = asyncio.run(router.route("管理运筹学几学分，有哪些先修课？", "q-11"))
+
+    assert result.metadata["status"] == "degraded"
+    assert "partial_status" not in result.metadata
