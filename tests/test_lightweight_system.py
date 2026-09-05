@@ -18,6 +18,7 @@ from run_pipeline import build_stage_map
 from src.data_processing.chroma_index import ChromaVectorIndex, create_chroma_client
 from src.online_service.chroma_retriever import ChromaRetriever
 from src.online_service.query_router import QueryRouter, QueryType
+from src.utils.deepseek_client import embed_texts
 
 
 class FakeRetriever:
@@ -101,6 +102,70 @@ def test_chroma_index_round_trip() -> None:
     assert summary["count"] == 2
     assert hits[0]["chunk_id"] == "database"
     assert hits[0]["score"] > 0
+
+
+def test_chroma_indexes_embedding_text_but_returns_original_text() -> None:
+    client = chromadb.EphemeralClient()
+    chunks = [
+        {
+            "chunk_id": "enriched",
+            "text": "原始课程片段",
+            "embedding_text": "稀有概念xyz",
+        },
+        {
+            "chunk_id": "plain",
+            "text": "稀有概念xyz",
+            "embedding_text": "完全不同的检索词",
+        },
+    ]
+    ChromaVectorIndex(
+        "hash",
+        dimensions=256,
+        client=client,
+        collection_name="embedding_text_test",
+    ).build(chunks)
+    retriever = ChromaRetriever(
+        "hash",
+        client=client,
+        collection_name="embedding_text_test",
+    )
+
+    hit = retriever.search("稀有概念xyz", top_k=1)[0]
+
+    assert hit["chunk_id"] == "enriched"
+    assert hit["text"] == "原始课程片段"
+
+
+def test_shared_embedding_helper_supports_explicit_hash_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "hash")
+    monkeypatch.setenv("SIMPLE_EMBEDDING_DIMENSIONS", "16")
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+
+    embeddings = embed_texts(None, "unused", ["线性规划", "整数规划"])
+
+    assert len(embeddings) == 2
+    assert all(len(vector) == 16 for vector in embeddings)
+
+
+def test_research_embedding_mode_does_not_silently_fall_back_to_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    with (
+        patch(
+            "src.utils.deepseek_client._load_local_embedding_model",
+            side_effect=OSError("model unavailable"),
+        ),
+        pytest.raises(RuntimeError, match="local embedding model unavailable"),
+    ):
+        embed_texts(
+            None,
+            "research-model",
+            ["线性规划"],
+            allow_hash_fallback=False,
+        )
 
 
 def test_chroma_retriever_filters_by_course_and_source_type() -> None:
@@ -424,6 +489,10 @@ def test_course_graph_returns_course_specific_nodes(
         "CONCEPT_CACHE_PATH",
         str(tmp_path / "concept_cache.json"),
     )
+    monkeypatch.setenv(
+        "CONCEPT_REGISTRY_PATH",
+        str(tmp_path / "missing_registry.json"),
+    )
 
     payload = main_module._build_course_graph("im001")
 
@@ -530,3 +599,60 @@ def test_api_lifespan_reports_degraded_backends(monkeypatch: pytest.MonkeyPatch)
     assert response.json()["chroma"] == "connected"
     assert response.json()["vector_index"] == "loaded"
     assert unavailable_driver.closed is True
+
+
+def test_api_lifespan_starts_without_a_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnavailableDriver:
+        def verify_connectivity(self) -> None:
+            raise ServiceUnavailable("offline")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        main_module,
+        "create_deepseek_client",
+        lambda: (_ for _ in ()).throw(ValueError("missing key")),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "ChromaRetriever",
+        lambda *_args, **_kwargs: FakeRetriever(),
+    )
+    monkeypatch.setattr(
+        main_module.GraphDatabase,
+        "driver",
+        lambda *_args, **_kwargs: UnavailableDriver(),
+    )
+
+    async def run_lifespan() -> None:
+        async with main_module.lifespan(main_module.app):
+            assert main_module.app.state.llm_client is None
+
+    asyncio.run(run_lifespan())
+
+
+def test_query_log_marks_error_metadata_as_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[dict] = []
+    monkeypatch.setattr(
+        main_module,
+        "append_jsonl_record",
+        lambda _path, record: records.append(record),
+    )
+
+    asyncio.run(
+        main_module._log_query(
+            "query-id",
+            "问题",
+            "回答",
+            [],
+            {"error_code": "DEPENDENCY_QUERY_FAILED"},
+            "dependency",
+        )
+    )
+
+    assert records[0]["status"] == "fallback"

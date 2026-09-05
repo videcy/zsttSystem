@@ -179,7 +179,11 @@ class ChromaVectorIndex:
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start : start + batch_size]
             documents = [str(chunk.get("text", "")) for chunk in batch]
-            embeddings = self.encoder.encode(documents)
+            embedding_inputs = [
+                str(chunk.get("embedding_text") or document)
+                for chunk, document in zip(batch, documents)
+            ]
+            embeddings = self.encoder.encode(embedding_inputs)
             collection.upsert(
                 ids=[_chunk_id(chunk) for chunk in batch],
                 embeddings=embeddings,

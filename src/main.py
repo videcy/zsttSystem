@@ -15,18 +15,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.config import config
 from src.online_service.feedback_handler import (
@@ -58,7 +61,8 @@ NEO4J_PASSWORD = config.neo4j_password
 # ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
-    query: str
+    # /query reaches the LLM, so an unbounded field is an open cost amplifier.
+    query: str = Field(min_length=1, max_length=config.api_max_query_chars)
     persona: Literal["student", "teacher", "visitor"] = "student"
 
 
@@ -96,10 +100,22 @@ async def lifespan(app: FastAPI):
     FEEDBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     # LLM client (DeepSeek) – used for HyDE, dependency reasoning, NLI
-    llm_client = create_deepseek_client()
+    try:
+        llm_client = create_deepseek_client()
+    except ValueError:
+        llm_client = None
+        print(
+            "[lifespan] WARNING: DEEPSEEK_API_KEY is not configured – "
+            "generation and NLI will use deterministic fallbacks."
+        )
 
     # Query router
-    vector_retriever = ChromaRetriever(config.local_embedding_model)
+    retrieval_model = (
+        config.local_embedding_model
+        if config.embedding_provider == "local"
+        else "hash"
+    )
+    vector_retriever = ChromaRetriever(retrieval_model)
     router = QueryRouter(vector_retriever)
 
     # Neo4j driver
@@ -110,7 +126,9 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(candidate.verify_connectivity)
         neo4j_driver = candidate
         print("[lifespan] Neo4j connection established.")
-    except (AuthError, ServiceUnavailable, Neo4jError):
+    # OSError covers DNS and socket failures, which reach here as-is and would
+    # otherwise abort startup instead of degrading.
+    except (AuthError, ServiceUnavailable, Neo4jError, OSError):
         if candidate is not None:
             candidate.close()
         print("[lifespan] WARNING: Neo4j is not available – "
@@ -135,6 +153,50 @@ app.mount(
     StaticFiles(directory=PROJECT_ROOT / "src" / "static"),
     name="static",
 )
+
+if config.api_cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.api_cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+RATE_LIMITED_PATHS = ("/query", "/dependency")
+_REQUEST_TIMES: dict[str, deque[float]] = defaultdict(deque)
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    """Per-client sliding window over the endpoints that reach the LLM.
+
+    In-process and single-worker by design: it exists to stop a demo laptop
+    from being drained by a loop, not to survive a distributed attack.
+    """
+    limit = config.api_rate_limit_per_minute
+    if limit <= 0 or not request.url.path.startswith(RATE_LIMITED_PATHS):
+        return await call_next(request)
+
+    client_id = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    window = _REQUEST_TIMES[client_id]
+    while window and now - window[0] > 60.0:
+        window.popleft()
+    if len(window) >= limit:
+        retry_after = max(1, int(60.0 - (now - window[0])))
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)},
+        )
+    window.append(now)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +270,11 @@ async def process_query(
         "query_type": result.query_type,
         "metadata": result.metadata,
     }
-    response["status"] = result.metadata.get("status", "ok")
+    response["status"] = result.metadata.get("status") or (
+        "fallback"
+        if result.metadata.get("error") or result.metadata.get("error_code")
+        else "ok"
+    )
     if result.dependency_info and "graph_paths" not in response:
         response["graph_paths"] = result.dependency_info.get("paths", [])
     if result.dependency_info:
@@ -268,7 +334,12 @@ async def course_dependencies(
 
 @app.get("/dependency")
 async def dependency_query(
-    query: str, fastapi_request: Request
+    fastapi_request: Request,
+    query: str = Query(
+        ...,
+        min_length=1,
+        max_length=config.api_max_query_chars,
+    ),
 ) -> dict[str, Any]:
     """Dedicated dependency reasoning endpoint (Neo4j-native)."""
     if not query.strip():
@@ -330,11 +401,22 @@ def _find_course(course_code: str) -> dict[str, Any]:
 def _build_course_graph(course_code: str) -> dict[str, Any]:
     course = _find_course(course_code)
     canonical_code = str(course["course_code"])
+    concept_path = (
+        config.concept_registry_path
+        if config.concept_registry_path.exists()
+        else config.concept_cache_path.with_name("concepts.json")
+    )
     concepts = [
         concept
-        for concept in _load_json(config.concept_cache_path.with_name("concepts.json"), [])
-        if str(concept.get("course_code", "")).casefold()
-        == canonical_code.casefold()
+        for concept in _load_json(concept_path, [])
+        if canonical_code.casefold()
+        in {
+            str(code).casefold()
+            for code in (
+                concept.get("source_course_codes")
+                or [concept.get("course_code", "")]
+            )
+        }
     ]
     chunks = [
         chunk
@@ -371,10 +453,18 @@ def _build_course_graph(course_code: str) -> dict[str, Any]:
             }
         )
     for concept in concepts:
-        concept_id = str(concept.get("concept_id", ""))
+        concept_id = str(concept.get("id") or concept.get("concept_id", ""))
         if not concept_id:
             continue
-        nodes.append({"id": concept_id, "label": "Concept", **concept})
+        nodes.append(
+            {
+                **concept,
+                "id": concept_id,
+                "label": "Concept",
+                "concept_id": concept_id,
+                "name": concept.get("canonical_name") or concept.get("name", ""),
+            }
+        )
         edges.append(
             {
                 "source": canonical_code,
@@ -422,6 +512,11 @@ async def _log_query(
     query_type: str,
 ) -> None:
     import asyncio
+    status = metadata.get("status") or (
+        "fallback"
+        if metadata.get("error") or metadata.get("error_code")
+        else "ok"
+    )
     await asyncio.to_thread(
         append_jsonl_record,
         QUERY_LOG_PATH,
@@ -434,7 +529,7 @@ async def _log_query(
             verification=metadata.get("nli_details", []),
             linked_entities=[],
             citations=citations,
-            status="fallback" if "error" in metadata else "ok",
+            status=str(status),
             persona=metadata.get("persona", "student"),
             persona_mode=metadata.get("persona_mode", "retrieval"),
             persona_profile_version=metadata.get("persona_profile_version", "v1"),

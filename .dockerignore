@@ -12,3 +12,8 @@ __pycache__
 outputs/*.jsonl
 vector_store
 tests
+eval/reports
+chroma_data
+data
+docs
+*.md

@@ -21,6 +21,13 @@ logs/
 *.log
 lightrag.log
 outputs/*.npy
+outputs/lexical_stats.json
+outputs/collection_alias.json
+
+# 评测产物：报告不入库，数据集入库
+eval/reports/*
+!eval/reports/.gitkeep
+eval/datasets/concept_gold.template.json
 
 # 临时文件
 .claude/
