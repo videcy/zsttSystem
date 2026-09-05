@@ -24,10 +24,13 @@ outputs/*.npy
 outputs/lexical_stats.json
 outputs/collection_alias.json
 
-# 评测产物：报告不入库，数据集入库
+# 评测产物
+# 报告不入库。评测集也不入库：它由培养方案派生，含任课教师姓名等个人信息，
+# 而本仓库是公开的（P2-3 数据授权问题解决前保持忽略）。种子集是确定性生成的，
+# 用 `python eval/build_seed_dataset.py` 一条命令即可复现。
 eval/reports/*
 !eval/reports/.gitkeep
-eval/datasets/concept_gold.template.json
+eval/datasets/*.json
 
 # 临时文件
 .claude/
