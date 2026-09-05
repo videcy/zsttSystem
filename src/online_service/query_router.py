@@ -33,8 +33,6 @@ class QueryType(Enum):
     CONTENT = "content"
     CATALOG = "catalog"
     HYBRID = "hybrid"
-    SIMPLE = "fact"
-    COMPLEX = "hybrid"
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +54,9 @@ _FACT_PATTERNS: list[str] = [
     r"(几学分|多少学时|哪个老师|谁教)",
     r"(必修|选修|任选|公选|通识)",
     r"(期末考试|期中|平时成绩|考核|评分).{0,4}(方式|办法|比例|占比)",
+    # Natural phrasings of the semester field: routing evaluation showed that
+    # ``开课学期`` alone missed every question a student actually types.
+    r"(第几学期|什么学期|哪个学期|哪一学期|几年级).{0,3}(开|上|学|修|开课)?",
 ]
 
 _CATALOG_PATTERNS: list[str] = [
@@ -63,10 +64,92 @@ _CATALOG_PATTERNS: list[str] = [
     r"(专业|主修|辅修).{0,8}(核心课|核心课程|基础课|必修课|选修课|课程)",
 ]
 
+_CONTENT_PATTERNS: list[str] = [
+    r"(主要讲|主要学习|学什么|讲什么|内容|介绍|包括)",
+]
+
+# Ordered by precedence.  A query that matches several groups is answered by
+# the earliest one here, which keeps single-intent behaviour identical to the
+# original short-circuit chain; the remaining matches survive as secondary
+# labels so that ``route`` can merge them instead of dropping them.
+# CATALOG precedes FACT: a program-scoped question ("信管专业要修哪些专业必修
+# 课") also matches the 必修/选修 fact pattern, and answering it from a single
+# course record instead of the plan was the largest routing error in the
+# baseline confusion matrix.  A course-scoped question carries no program cue,
+# so it is unaffected.
+_INTENT_PATTERNS: tuple[tuple[QueryType, list[str]], ...] = (
+    (QueryType.DEPENDENCY, _DEPENDENCY_PATTERNS),
+    (QueryType.CATALOG, _CATALOG_PATTERNS),
+    (QueryType.FACT, _FACT_PATTERNS),
+    (QueryType.CONTENT, _CONTENT_PATTERNS),
+)
+
+# Below this confidence a single-label prediction is treated as unreliable and
+# falls through to the hybrid path, which retrieves more broadly.
+LOW_CONFIDENCE_THRESHOLD = 0.34
+
+# Intent pairs worth answering jointly.  ``content`` is deliberately excluded
+# from merging with ``fact``: the content handler already surfaces the basic
+# information block, so merging duplicates evidence without adding facts.
+_MERGEABLE_INTENTS: frozenset[frozenset[QueryType]] = frozenset(
+    {
+        frozenset({QueryType.FACT, QueryType.DEPENDENCY}),
+        frozenset({QueryType.CONTENT, QueryType.DEPENDENCY}),
+        frozenset({QueryType.CATALOG, QueryType.DEPENDENCY}),
+    }
+)
+
+# How much verification backing each NLI outcome carries, worst last.  A
+# merged answer reports the highest severity among its sections.
+_NLI_STATUS_SEVERITY: dict[str, int] = {
+    "passed": 0,
+    "rewritten": 1,
+    "pruned": 2,
+    "skipped": 3,
+    "unavailable": 4,
+    "refused": 5,
+}
+
+_INTENT_HEADINGS: dict[QueryType, str] = {
+    QueryType.FACT: "课程基本信息",
+    QueryType.DEPENDENCY: "先修关系",
+    QueryType.CONTENT: "课程内容",
+    QueryType.CATALOG: "培养方案课程",
+}
+
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class IntentPrediction:
+    """Multi-label intent decision with an evidence-share confidence.
+
+    ``confidence`` is the share of matched patterns owned by ``primary``: a
+    query matching only fact patterns scores 1.0, while ``管理运筹学几学分，
+    有哪些先修课？`` splits its evidence between ``fact`` and ``dependency``
+    and scores below :data:`LOW_CONFIDENCE_THRESHOLD`.  The value is logged so
+    that the routing confusion matrix in ``eval/`` can be sliced by it.
+    """
+
+    primary: QueryType
+    labels: tuple[QueryType, ...]
+    confidence: float
+    scores: dict[str, int]
+
+    @property
+    def is_multi_intent(self) -> bool:
+        return len(self.labels) > 1
+
+    def as_metadata(self) -> dict[str, Any]:
+        return {
+            "intent_primary": self.primary.value,
+            "intent_labels": [label.value for label in self.labels],
+            "intent_confidence": round(self.confidence, 4),
+            "intent_scores": dict(self.scores),
+        }
+
 
 @dataclass
 class RouteResult:
@@ -101,25 +184,43 @@ class QueryRouter:
     # Intent classification
     # ------------------------------------------------------------------
     @staticmethod
-    def classify(query: str) -> QueryType:
-        """Classify a user query into one of three intent types."""
+    def classify_intent(query: str) -> IntentPrediction:
+        """Score every intent group and return a multi-label prediction.
+
+        The regex chain stays as the high-precision, explainable front end;
+        what changes is that a query is allowed to carry more than one intent
+        and to report how confident the winning one is.
+        """
         textual = query.strip().lower()
+        scores: dict[str, int] = {}
+        matched: list[QueryType] = []
+        for query_type, patterns in _INTENT_PATTERNS:
+            hits = sum(1 for pattern in patterns if re.search(pattern, textual))
+            if hits:
+                scores[query_type.value] = hits
+                matched.append(query_type)
 
-        for pattern in _DEPENDENCY_PATTERNS:
-            if re.search(pattern, textual):
-                return QueryType.DEPENDENCY
+        total = sum(scores.values())
+        if not matched:
+            return IntentPrediction(
+                primary=QueryType.HYBRID,
+                labels=(QueryType.HYBRID,),
+                confidence=0.0,
+                scores=scores,
+            )
+        primary = matched[0]
+        confidence = scores[primary.value] / total if total else 0.0
+        return IntentPrediction(
+            primary=primary,
+            labels=tuple(matched),
+            confidence=confidence,
+            scores=scores,
+        )
 
-        for pattern in _FACT_PATTERNS:
-            if re.search(pattern, textual):
-                return QueryType.FACT
-
-        for pattern in _CATALOG_PATTERNS:
-            if re.search(pattern, textual):
-                return QueryType.CATALOG
-
-        if re.search(r"(主要讲|主要学习|学什么|讲什么|内容|介绍|包括)", textual):
-            return QueryType.CONTENT
-        return QueryType.HYBRID
+    @classmethod
+    def classify(cls, query: str) -> QueryType:
+        """Legacy single-label entry point: the winning intent only."""
+        return cls.classify_intent(query).primary
 
     # ------------------------------------------------------------------
     # Main dispatch
@@ -142,37 +243,198 @@ class QueryRouter:
         Returns a ``RouteResult`` with the final answer, citations, and
         metadata indicating which backends were used.
         """
-        query_type = self.classify(query)
+        intent = self.classify_intent(query)
+        merge_labels = self._mergeable_labels(intent)
 
-        # ---- Path 1: Dependency reasoning (zsttSystem-native) ----
-        if query_type == QueryType.DEPENDENCY:
-            result = await self._handle_dependency(query, neo4j_driver, llm_client)
-        elif query_type == QueryType.FACT:
-            # ---- Path 2: ChromaDB retrieval ----
-            result = await self._handle_fact(query)
-        elif query_type == QueryType.CONTENT:
-            result = await self._handle_content(
+        if merge_labels:
+            result = await self._handle_multi_intent(
                 query,
-                llm_client,
+                merge_labels,
                 neo4j_driver=neo4j_driver,
+                llm_client=llm_client,
                 persona=persona,
             )
-        elif query_type == QueryType.CATALOG:
-            result = self._handle_catalog(query)
         else:
-            # ---- Path 3: ChromaDB + Neo4j + grounded generation ----
-            result = await self._handle_hybrid(
+            # Several incompatible intents matched and none dominates: the
+            # specialised handlers would each answer half the question, so
+            # retrieve broadly instead.
+            fallback = (
+                intent.is_multi_intent
+                and intent.confidence < LOW_CONFIDENCE_THRESHOLD
+            )
+            result = await self._handle_single_intent(
+                QueryType.HYBRID if fallback else intent.primary,
                 query,
-                llm_client,
                 neo4j_driver=neo4j_driver,
+                llm_client=llm_client,
                 persona=persona,
             )
+            if fallback:
+                result.metadata["low_confidence_fallback"] = True
         result.metadata.update(
             persona=persona,
             persona_mode=PERSONA_MODE,
             persona_profile_version=PERSONA_PROFILE_VERSION,
+            **intent.as_metadata(),
         )
         return result
+
+    @staticmethod
+    def _mergeable_labels(intent: IntentPrediction) -> tuple[QueryType, ...]:
+        """Return the intents to answer jointly, or ``()`` for a single path.
+
+        Only the two strongest labels are merged: answering three intents in
+        one response costs a second LLM call for evidence a user rarely asked
+        for, and the citation list stops being readable.
+        """
+        if not intent.is_multi_intent:
+            return ()
+        pair = intent.labels[:2]
+        if frozenset(pair) not in _MERGEABLE_INTENTS:
+            return ()
+        return pair
+
+    async def _handle_single_intent(
+        self,
+        query_type: QueryType,
+        query: str,
+        *,
+        neo4j_driver: Any,
+        llm_client: Any,
+        persona: Persona,
+    ) -> RouteResult:
+        # ---- Path 1: Dependency reasoning (zsttSystem-native) ----
+        if query_type == QueryType.DEPENDENCY:
+            return await self._handle_dependency(query, neo4j_driver, llm_client)
+        if query_type == QueryType.FACT:
+            # ---- Path 2: ChromaDB retrieval ----
+            return await self._handle_fact(query)
+        if query_type == QueryType.CONTENT:
+            return await self._handle_content(
+                query,
+                llm_client,
+                neo4j_driver=neo4j_driver,
+                persona=persona,
+            )
+        if query_type == QueryType.CATALOG:
+            return self._handle_catalog(query)
+        # ---- Path 3: ChromaDB + Neo4j + grounded generation ----
+        return await self._handle_hybrid(
+            query,
+            llm_client,
+            neo4j_driver=neo4j_driver,
+            persona=persona,
+        )
+
+    async def _handle_multi_intent(
+        self,
+        query: str,
+        labels: tuple[QueryType, ...],
+        *,
+        neo4j_driver: Any,
+        llm_client: Any,
+        persona: Persona,
+    ) -> RouteResult:
+        """Answer a query that carries two intents, one section per intent.
+
+        Each sub-answer keeps its own citations, and a section whose handler
+        declined is kept as its own refusal rather than dropped: the user
+        asked two things, and silently answering one of them would hide that
+        the other has no evidence.
+
+        Per-section metadata is nested under ``<intent>_metadata``, but the
+        verification keys are also aggregated to the top level, because that
+        is where ``main._log_query`` and the active-learning sampler look for
+        them.  The merged answer inherits the *weakest* section's NLI status:
+        it is only as verified as its least supported half.
+        """
+        sections: list[str] = []
+        citations: list[dict[str, Any]] = []
+        seen_citations: set[str] = set()
+        metadata: dict[str, Any] = {}
+        dependency_info: dict[str, Any] | None = None
+        answered: list[str] = []
+        part_metadata: list[dict[str, Any]] = []
+
+        for label in labels:
+            part = await self._handle_single_intent(
+                label,
+                query,
+                neo4j_driver=neo4j_driver,
+                llm_client=llm_client,
+                persona=persona,
+            )
+            answer = (part.answer or "").strip()
+            if not answer:
+                continue
+            answered.append(label.value)
+            heading = _INTENT_HEADINGS.get(label, label.value)
+            sections.append(f"【{heading}】\n{answer}")
+            for citation in part.citations:
+                identity = json.dumps(citation, ensure_ascii=False, sort_keys=True)
+                if identity not in seen_citations:
+                    seen_citations.add(identity)
+                    citations.append(citation)
+            metadata[f"{label.value}_metadata"] = part.metadata
+            part_metadata.append(part.metadata)
+            if part.dependency_info and dependency_info is None:
+                dependency_info = part.dependency_info
+
+        if not sections:
+            return await self._handle_hybrid(
+                query,
+                llm_client,
+                neo4j_driver=neo4j_driver,
+                persona=persona,
+            )
+
+        metadata["answered_intents"] = answered
+        metadata.update(self._merged_verification(part_metadata))
+        return RouteResult(
+            answer="\n\n".join(sections),
+            citations=citations,
+            query_type="+".join(answered),
+            metadata=metadata,
+            dependency_info=dependency_info,
+        )
+
+    @staticmethod
+    def _merged_verification(parts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Roll each section's verification and status up to the top level."""
+        merged: dict[str, Any] = {}
+        statuses = [
+            str(part["nli_status"]) for part in parts if part.get("nli_status")
+        ]
+        if statuses:
+            merged["nli_status"] = max(
+                statuses,
+                key=lambda status: _NLI_STATUS_SEVERITY.get(status, 0),
+            )
+            merged["nli_attempts"] = sum(
+                int(part.get("nli_attempts") or 0) for part in parts
+            )
+            details: list[Any] = []
+            for part in parts:
+                details.extend(part.get("nli_details") or [])
+            merged["nli_details"] = details
+            verified = [
+                part["nli_verified"]
+                for part in parts
+                if part.get("nli_verified") is not None
+            ]
+            merged["nli_verified"] = all(verified) if verified else None
+
+        # A section that degraded or refused must not be hidden behind an
+        # overall "ok": the response status reports the worst section.
+        degraded = [
+            str(part["status"])
+            for part in parts
+            if part.get("status") and str(part["status"]) != "ok"
+        ]
+        merged["status"] = degraded[0] if len(degraded) == len(parts) else "ok"
+        if degraded and len(degraded) < len(parts):
+            merged["partial_status"] = degraded
+        return merged
 
     # ------------------------------------------------------------------
     # Path handlers
@@ -225,6 +487,23 @@ class QueryRouter:
         hits = await asyncio.to_thread(self.vector_retriever.search, query, 5)
         if not hits:
             return RouteResult("本地知识库暂无可用证据。", query_type="fact", metadata={"status": "degraded", "error_code": "VECTOR_INDEX_UNAVAILABLE"})
+        # The course could not be linked, so the answer rests entirely on the
+        # top chunk.  Without a single discriminative term in common, that
+        # chunk is unrelated -- returning it as a fact was how questions about
+        # courses that do not exist got answered with someone else's textbook
+        # list.
+        lexical_score = hits[0].get("lexical_score")
+        if lexical_score is not None and float(lexical_score) <= 0.0:
+            return RouteResult(
+                "根据当前知识库，未找到足够相关且可靠的资料来回答这个问题。",
+                query_type="fact",
+                metadata={
+                    "status": "refused",
+                    "error_code": "FACT_NO_RELEVANT_EVIDENCE",
+                    "vector_hits": len(hits),
+                    "llm_used": False,
+                },
+            )
         return RouteResult(hits[0].get("text", "")[:500], self._vector_citations(hits), "fact", {"vector_hits": len(hits), "graph_nodes": 0, "llm_used": False})
 
     def _link_course(self, query: str) -> dict[str, Any] | None:
@@ -293,19 +572,23 @@ class QueryRouter:
             "section": "培养方案课程信息",
         }
 
-    def _handle_catalog(self, query: str) -> RouteResult:
-        program_keyword = self._program_keyword(query)
-        category_keyword = (
-            "核心"
-            if "核心" in query
-            else "基础"
-            if "基础" in query
-            else "必修"
-            if "必修" in query
-            else "选修"
-            if "选修" in query
-            else ""
-        )
+    # Only some plans label a "专业核心课" subcategory.  Where that label is
+    # absent the question still has an answer, so the filter widens one step at
+    # a time: labelled core courses, then the required major courses, then the
+    # whole plan (the micro-minor plans file everything under "辅修课程").  A
+    # plan that does label its core courses is unaffected.
+    _CATEGORY_FALLBACKS: dict[str, tuple[tuple[str, ...], ...]] = {
+        "核心": (("专业必修",), ()),
+        "基础": (("专业必修",), ()),
+    }
+
+    def _catalog_matches(
+        self,
+        query: str,
+        program_keyword: str,
+        accepted_categories: tuple[str, ...],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Offerings of one program whose category matches the question."""
         matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for course in self.courses:
             for offering in course.get("offerings") or []:
@@ -323,10 +606,33 @@ class QueryRouter:
                     query,
                 ):
                     continue
-                if category_keyword and category_keyword not in category:
+                if accepted_categories and not any(
+                    token in category for token in accepted_categories
+                ):
                     continue
                 matches.append((course, offering))
                 break
+        return matches
+
+    def _handle_catalog(self, query: str) -> RouteResult:
+        program_keyword = self._program_keyword(query)
+        category_keyword = (
+            "核心"
+            if "核心" in query
+            else "基础"
+            if "基础" in query
+            else "必修"
+            if "必修" in query
+            else "选修"
+            if "选修" in query
+            else ""
+        )
+        accepted_categories = (category_keyword,) if category_keyword else ()
+        matches = self._catalog_matches(query, program_keyword, accepted_categories)
+        for fallback in self._CATEGORY_FALLBACKS.get(category_keyword, ()):
+            if matches:
+                break
+            matches = self._catalog_matches(query, program_keyword, fallback)
 
         if not matches:
             return RouteResult(
@@ -555,20 +861,34 @@ class QueryRouter:
         evidence_items = self._build_evidence_items(query, hits, graph_paths)
         from src.online_service.generator import (
             build_fallback_answer,
-            generate_answer_once,
+            generate_answer_with_verification,
+            select_generation_evidence,
         )
+        evidence_items = select_generation_evidence(evidence_items)
 
+        metadata = {
+            "vector_hits": len(hits),
+            "graph_nodes": len(graph_paths),
+            "llm_used": llm_client is not None,
+        }
         try:
-            answer = await asyncio.to_thread(
-                generate_answer_once,
+            answer, verification_metadata = await asyncio.to_thread(
+                generate_answer_with_verification,
                 query,
                 evidence_items,
                 llm_client,
                 persona,
             )
+            metadata.update(verification_metadata)
         except Exception:
             answer = build_fallback_answer(query, evidence_items, persona)
-        return RouteResult(answer, self._vector_citations(hits), "content", {"vector_hits": len(hits), "graph_nodes": len(graph_paths), "llm_used": llm_client is not None})
+            metadata.update(status="degraded", error_code="LLM_UNAVAILABLE")
+        citations = (
+            []
+            if metadata.get("nli_status") in {"refused", "unavailable"}
+            else self._evidence_citations(evidence_items)
+        )
+        return RouteResult(answer, citations, "content", metadata)
 
     async def _handle_hybrid(
         self,
@@ -596,30 +916,38 @@ class QueryRouter:
         evidence_items = self._build_evidence_items(query, hits, graph_paths)
         from src.online_service.generator import (
             build_fallback_answer,
-            generate_answer_once,
+            generate_answer_with_verification,
+            select_generation_evidence,
         )
+        evidence_items = select_generation_evidence(evidence_items)
         metadata = {
             "vector_hits": len(hits),
             "graph_nodes": len(graph_paths),
             "llm_used": llm_client is not None,
         }
         try:
-            answer = await asyncio.to_thread(
-                generate_answer_once,
+            answer, verification_metadata = await asyncio.to_thread(
+                generate_answer_with_verification,
                 query,
                 evidence_items,
                 llm_client,
                 persona,
             )
+            metadata.update(verification_metadata)
         except Exception:
             answer = build_fallback_answer(query, evidence_items, persona)
             metadata.update(
                 status="degraded",
                 error_code="LLM_UNAVAILABLE",
             )
+        citations = (
+            []
+            if metadata.get("nli_status") in {"refused", "unavailable"}
+            else self._evidence_citations(evidence_items)
+        )
         return RouteResult(
             answer,
-            self._vector_citations(hits),
+            citations,
             "hybrid",
             metadata,
             {"paths": graph_paths},
@@ -641,6 +969,28 @@ class QueryRouter:
                 or hit.get("course_name"),
                 "section": hit.get("section")
                 or metadata.get("syllabus_section"),
+            }
+            identity = tuple(citation.values())
+            if identity not in seen:
+                citations.append(citation)
+                seen.add(identity)
+        return citations
+
+    @staticmethod
+    def _evidence_citations(
+        evidence_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Project the exact vector/graph evidence supplied to generation."""
+        citations: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for item in evidence_items:
+            source_file = str(item.get("source_file") or "").replace("\\", "/")
+            citation = {
+                "source_file": source_file.rsplit("/", 1)[-1].split("#", 1)[0]
+                or None,
+                "course_code": item.get("course_code"),
+                "course_name": item.get("course_name"),
+                "section": item.get("section"),
             }
             identity = tuple(citation.values())
             if identity not in seen:
@@ -742,7 +1092,11 @@ class QueryRouter:
             return RouteResult(
                 answer="课程依赖查询需要 Neo4j 图数据库支持，当前服务未连接 Neo4j。",
                 query_type="dependency",
-                metadata={"backend": "zsttSystem_Neo4j", "status": "neo4j_unavailable"},
+                metadata={
+                    "backend": "zsttSystem_Neo4j",
+                    "status": "degraded",
+                    "error_code": "NEO4J_UNAVAILABLE",
+                },
             )
 
         try:
@@ -754,21 +1108,43 @@ class QueryRouter:
             return RouteResult(
                 answer="课程依赖查询暂时不可用，请稍后重试。",
                 query_type="dependency",
-                metadata={"backend": "zsttSystem_Neo4j", "error": str(exc)},
+                metadata={
+                    "backend": "zsttSystem_Neo4j",
+                    "status": "degraded",
+                    "error_code": "DEPENDENCY_QUERY_FAILED",
+                    "error": str(exc),
+                },
             )
 
         if dep_result is None:
             return RouteResult(
                 answer="未找到与该问题相关的课程依赖关系。",
                 query_type="dependency",
-                metadata={"backend": "zsttSystem_Neo4j"},
+                metadata={
+                    "backend": "zsttSystem_Neo4j",
+                    "status": "degraded",
+                    "error_code": "DEPENDENCY_NOT_FOUND",
+                },
             )
 
+        nli_metadata = {
+            key: dep_result[key]
+            for key in (
+                "nli_verified",
+                "nli_status",
+                "nli_details",
+                "nli_attempts",
+                "nli_verification_target",
+                "status",
+                "error_code",
+            )
+            if key in dep_result
+        }
         return RouteResult(
             answer=dep_result.get("explanation", ""),
             query_type="dependency",
             dependency_info=dep_result,
-            metadata={"backend": "zsttSystem_Neo4j"},
+            metadata={"backend": "zsttSystem_Neo4j", **nli_metadata},
         )
 
 # ---------------------------------------------------------------------------
@@ -778,7 +1154,7 @@ class QueryRouter:
 def _query_graph_paths(neo4j_driver: Any, query: str) -> list[dict[str, Any]]:
     """Fetch nearby graph paths without blocking the async event loop."""
     cypher = """
-    MATCH p=(c:Course)-[*1..2]-(n)
+    MATCH p=(c:ZSTT_Course)-[*1..2]-(n)
     WHERE toLower($query) CONTAINS toLower(c.course_name)
        OR toLower($query) CONTAINS toLower(c.course_code)
     RETURN [x IN nodes(p) |

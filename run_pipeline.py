@@ -20,8 +20,13 @@ from neo4j.exceptions import Neo4jError, ServiceUnavailable, AuthError
 from src.config import config
 from src.data_processing.parser_chunker import SyllabusChunker
 from src.data_processing.chroma_index import build_index
-from src.data_processing.concept_extractor import extract_course_concepts
-from src.data_processing.graph_builder import build_graph_records, write_neo4j
+from src.data_processing.lexical_stats import write_lexical_stats
+from src.data_processing.concept_normalizer import ConceptNormalizer
+from src.data_processing.graph_builder import (
+    CONCEPT_DEPENDENCY_TYPES,
+    build_graph_records,
+    write_neo4j,
+)
 from src.utils.file_manifest import FileManifest
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -37,6 +42,12 @@ NEO4J_USER = config.neo4j_user
 NEO4J_PASSWORD = config.neo4j_password
 
 PipelineStep = Callable[[], None]
+
+CONCEPT_SECTION_TYPES = {
+    "course_objectives",
+    "teaching_content",
+    "teaching_schedule",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -127,16 +138,90 @@ def _incremental_parse(chunker: SyllabusChunker) -> None:
     manifest.save()
 
 
-def run_concept_stage() -> None:
+def run_concept_stage() -> bool:
     chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
-    syllabus_chunks = [
+    concept_chunks = [
         chunk
         for chunk in chunks
-        if (chunk.get("metadata") or {}).get("source_type") != "training_plan"
+        if (chunk.get("metadata") or {}).get("source_type") == "syllabus"
+        and (chunk.get("metadata") or {}).get("section_type")
+        in CONCEPT_SECTION_TYPES
     ]
-    concepts = extract_course_concepts(syllabus_chunks, OUTPUT_DIR / "concept_cache.json", config.text_model)
-    (OUTPUT_DIR / "concepts.json").write_text(json.dumps(concepts, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[concept] {len(concepts)} course-level concepts")
+    if not concept_chunks:
+        registry: list[dict] = []
+        enriched_chunks: list[dict] = []
+        for path in (
+            config.concept_registry_path,
+            config.concept_alias_path,
+            config.concept_candidate_edge_path,
+            config.concept_verified_edge_path,
+        ):
+            empty: list | dict = {} if path == config.concept_alias_path else []
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(empty, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+    else:
+        normalizer = ConceptNormalizer()
+        if getattr(normalizer, "api_client", object()) is None:
+            print(
+                "[concept] skipped: DEEPSEEK_API_KEY is required for verified "
+                "concept extraction; existing concept artifacts were preserved"
+            )
+            return False
+        normalizer.allow_rule_fallback = False
+        normalizer.require_complete_llm_validation = True
+        normalizer.allow_embedding_fallback = False
+        try:
+            enriched_chunks, registry, _aliases = normalizer.preprocess_chunks(
+                concept_chunks,
+                registry_output_path=config.concept_registry_path,
+                alias_output_path=config.concept_alias_path,
+                candidate_output_path=config.concept_candidate_edge_path,
+                verified_output_path=config.concept_verified_edge_path,
+                extraction_cache_path=config.concept_extraction_cache_path,
+                validation_cache_path=config.concept_validation_cache_path,
+            )
+        except RuntimeError as exc:
+            print(f"[concept] skipped: {exc}")
+            return False
+
+    enriched_by_id = {
+        str(chunk.get("chunk_id")): chunk
+        for chunk in enriched_chunks
+        if chunk.get("chunk_id")
+    }
+    merged_chunks = [
+        enriched_by_id.get(str(chunk.get("chunk_id")), chunk)
+        for chunk in chunks
+    ]
+    CHUNKS_OUTPUT_PATH.write_text(
+        json.dumps(merged_chunks, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # Keep a compatibility projection for the course graph endpoint and older
+    # local artifacts while the canonical registry remains the source of truth.
+    concepts = [
+        {
+            **concept,
+            "concept_id": concept["id"],
+            "name": concept["canonical_name"],
+            "course_code": course_code,
+        }
+        for concept in registry
+        for course_code in (concept.get("source_course_codes") or [""])
+    ]
+    (OUTPUT_DIR / "concepts.json").write_text(
+        json.dumps(concepts, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        f"[concept] {len(registry)} canonical concepts from "
+        f"{len(concept_chunks)} teaching chunks"
+    )
+    return True
 
 def run_embed_stage() -> None:
     chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
@@ -153,6 +238,12 @@ def run_embed_stage() -> None:
     print(
         f"[embed] ChromaDB collection {summary['collection']} "
         f"contains {summary['count']} chunks"
+    )
+    stats = write_lexical_stats(chunks, config.lexical_stats_path)
+    print(
+        f"[embed] lexical stats: {stats['document_count']} documents, "
+        f"{stats['vocabulary_size']} terms "
+        f"(kept df>={stats['min_document_frequency']})"
     )
 
 def run_parse_stage(incremental: bool = False, force: bool = False) -> None:
@@ -243,12 +334,44 @@ def run_parse_stage(incremental: bool = False, force: bool = False) -> None:
         encoding="utf-8",
     )
 
-def run_graph_stage() -> None:
+def run_graph_stage(*, concept_stage_succeeded: bool | None = None) -> None:
     """Write a deterministic graph manifest; Neo4j writing remains optional."""
+    if concept_stage_succeeded is False:
+        print(
+            "[graph] skipped: the concept stage did not produce a current, "
+            "verified snapshot"
+        )
+        return
+    required_concept_artifacts = (
+        config.concept_registry_path,
+        config.concept_verified_edge_path,
+    )
+    missing_artifacts = [
+        path.name for path in required_concept_artifacts if not path.exists()
+    ]
+    if missing_artifacts:
+        print(
+            "[graph] skipped: authoritative concept artifacts are missing: "
+            + ", ".join(missing_artifacts)
+        )
+        return
     chunks = json.loads(CHUNKS_OUTPUT_PATH.read_text(encoding="utf-8"))
-    concepts = json.loads((OUTPUT_DIR / "concepts.json").read_text(encoding="utf-8")) if (OUTPUT_DIR / "concepts.json").exists() else []
+    concept_path = config.concept_registry_path
+    concepts = json.loads(concept_path.read_text(encoding="utf-8")) if concept_path.exists() else []
+    concept_dependencies = (
+        json.loads(config.concept_verified_edge_path.read_text(encoding="utf-8"))
+        if config.concept_verified_edge_path.exists()
+        else []
+    )
     courses = json.loads((OUTPUT_DIR / "courses.json").read_text(encoding="utf-8")) if (OUTPUT_DIR / "courses.json").exists() else []
-    graph = build_graph_records(courses, concepts, chunks)
+    graph = build_graph_records(
+        courses,
+        concepts,
+        chunks,
+        concept_dependencies=concept_dependencies,
+        verified_min_confidence=config.concept_verified_min_confidence,
+        include_chunk_nodes=config.graph_include_chunk_nodes,
+    )
     neo4j_status = "unavailable"
     build_id = None
     try:
@@ -266,7 +389,10 @@ def run_graph_stage() -> None:
                 graph,
                 courses,
                 concepts,
-                chunks,
+                # Chunk text is served from Chroma; mirroring it into Neo4j
+                # duplicates the whole corpus for nodes no query reads.
+                chunks if config.graph_include_chunk_nodes else [],
+                reset_existing=config.reset_concept_subgraph,
             )
             build_id = write_summary["build_id"]
             neo4j_status = "written"
@@ -274,8 +400,53 @@ def run_graph_stage() -> None:
             driver.close()
     except (Neo4jError, ServiceUnavailable, AuthError, OSError) as exc:
         print(f"[graph] Neo4j unavailable: {exc}")
-    manifest = {"build_id": build_id, "courses": sorted({c.get("course_code") for c in courses}), "concepts": [c["concept_id"] for c in concepts], "nodes": len(graph["nodes"]), "edges": len(graph["edges"]), "neo4j": neo4j_status, "updated_at": __import__('datetime').datetime.now().isoformat()}
-    (OUTPUT_DIR / "graph_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest = {
+        "build_id": build_id,
+        "courses": sorted(
+            {
+                str(c.get("course_code"))
+                for c in courses
+                if c.get("course_code")
+            }
+        ),
+        "concepts": [
+            concept_id
+            for concept in concepts
+            if (
+                concept_id := concept.get("id")
+                or concept.get("concept_id")
+            )
+        ],
+        "concept_dependencies": sum(
+            1
+            for edge in graph["edges"]
+            if edge.get("type") in CONCEPT_DEPENDENCY_TYPES
+        ),
+        "nodes": len(graph["nodes"]),
+        "edges": len(graph["edges"]),
+        "neo4j": neo4j_status,
+        "concept_extraction_model": config.text_model,
+        "concept_normalization_model": (
+            "hash"
+            if config.embedding_provider == "hash"
+            else config.concept_normalization_model
+        ),
+        "concept_retrieval_model": (
+            "hash"
+            if config.embedding_provider == "hash"
+            else config.concept_retrieval_model
+        ),
+        "embedding_provider": config.embedding_provider,
+        "concept_llm_vote_count": config.concept_llm_vote_count,
+        "concept_max_verification_candidates": (
+            config.concept_max_verification_candidates
+        ),
+        "concept_min_extraction_coverage": config.concept_min_extraction_coverage,
+        "verified_min_confidence": config.concept_verified_min_confidence,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    config.graph_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    config.graph_manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[graph] manifest written ({len(manifest['courses'])} courses)")
 
 def run_baseline_stage() -> None:
@@ -310,12 +481,33 @@ def build_stage_map(incremental: bool = False, force: bool = False) -> dict[str,
     When *incremental* is True, the parsing stage acts as a patch rather
     than a full re-parse.
     """
+    all_stage_state: dict[str, bool | None] = {"concept_succeeded": None}
+
+    def run_all_concept_stage() -> None:
+        all_stage_state["concept_succeeded"] = run_concept_stage()
+
+    def run_all_graph_stage() -> None:
+        run_graph_stage(
+            concept_stage_succeeded=all_stage_state["concept_succeeded"]
+        )
+
+    def run_all_embed_stage() -> None:
+        if all_stage_state["concept_succeeded"] is False:
+            print(
+                "[embed] concept enrichment unavailable; building a base index "
+                "from the current raw chunks"
+            )
+        run_embed_stage()
+
     return {
         "parse": [lambda: run_parse_stage(incremental=incremental, force=force)],
         "baseline": [run_baseline_stage],
         "concept": [run_concept_stage],
         "all": [
-            lambda: run_parse_stage(incremental=incremental, force=force), run_concept_stage, run_graph_stage, run_embed_stage,
+            lambda: run_parse_stage(incremental=incremental, force=force),
+            run_all_concept_stage,
+            run_all_graph_stage,
+            run_all_embed_stage,
         ],
         "graph": [run_graph_stage],
         "embed": [run_embed_stage],

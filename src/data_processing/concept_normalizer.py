@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -21,6 +22,28 @@ from src.config import config
 
 logger = logging.getLogger(__name__)
 
+EXTRACTION_PROMPT_VERSION = "teaching-concepts-v4"
+DEPENDENCY_PROMPT_VERSION = "concept-dependency-v2"
+
+_CONCEPT_NOISE = {
+    "中山大学",
+    "信息管理学院",
+    "课程名称",
+    "课程编码",
+    "课程代码",
+    "课程类别",
+    "课程负责人",
+    "课程目标",
+    "教学大纲",
+    "本科课程教学大纲",
+    "开课单位",
+    "授课年级",
+    "面向专业",
+    "编写日期",
+    "学分",
+    "学时",
+}
+
 
 class ConceptNormalizer:
     """Use LLMs and embeddings to canonicalize and validate concept dependencies."""
@@ -37,6 +60,30 @@ class ConceptNormalizer:
         "concept",
     }
     ALLOWED_BLOOM_LEVELS = {"understand", "apply", "analyze"}
+    TYPE_ALIASES = {
+        "算法": "algorithm",
+        "定理": "theorem",
+        "算子": "operator",
+        "方法": "method",
+        "模型": "model",
+        "框架": "framework",
+        "数据结构": "data_structure",
+        "data structure": "data_structure",
+        "data-structure": "data_structure",
+        "范式": "paradigm",
+        "概念": "concept",
+    }
+    BLOOM_ALIASES = {
+        "理解": "understand",
+        "理解层次": "understand",
+        "comprehension": "understand",
+        "应用": "apply",
+        "应用层次": "apply",
+        "application": "apply",
+        "分析": "analyze",
+        "分析层次": "analyze",
+        "analysis": "analyze",
+    }
     BLOOM_ORDER = {"understand": 0, "apply": 1, "analyze": 2}
     ALLOWED_RELATION_TYPES = {
         "FOUNDATION_OF",
@@ -55,6 +102,9 @@ class ConceptNormalizer:
         similarity_threshold: float | None = None,
         wikipedia_enabled: bool | None = None,
         candidate_top_k: int | None = None,
+        candidate_min_confidence: float | None = None,
+        max_verification_candidates: int | None = None,
+        min_extraction_coverage: float | None = None,
         course_order_bonus: float | None = None,
         cross_discipline_decay: float | None = None,
         score_weight_vector: float | None = None,
@@ -63,6 +113,9 @@ class ConceptNormalizer:
         llm_vote_count: int | None = None,
         llm_vote_temperature: float | None = None,
         api_concurrency: int | None = None,
+        allow_rule_fallback: bool = True,
+        require_complete_llm_validation: bool = False,
+        allow_embedding_fallback: bool = True,
     ) -> None:
         self.llm_model_name = llm_model_name or config.text_model
         self.embedding_model_name = embedding_model_name or config.concept_normalization_model
@@ -79,6 +132,24 @@ class ConceptNormalizer:
         self.candidate_top_k = (
             candidate_top_k if candidate_top_k is not None else config.concept_top_k
         )
+        self.candidate_min_confidence = (
+            candidate_min_confidence
+            if candidate_min_confidence is not None
+            else config.concept_candidate_min_confidence
+        )
+        self.max_verification_candidates = max(
+            0,
+            max_verification_candidates
+            if max_verification_candidates is not None
+            else config.concept_max_verification_candidates,
+        )
+        self.min_extraction_coverage = (
+            min_extraction_coverage
+            if min_extraction_coverage is not None
+            else config.concept_min_extraction_coverage
+        )
+        if not 0.0 <= self.min_extraction_coverage <= 1.0:
+            raise ValueError("min_extraction_coverage must be between 0 and 1")
         self.course_order_bonus = (
             course_order_bonus if course_order_bonus is not None
             else config.concept_course_order_bonus
@@ -99,10 +170,14 @@ class ConceptNormalizer:
             score_weight_rule if score_weight_rule is not None
             else config.concept_score_weight_rule
         )
-        self.score_weight_external = config.concept_score_weight_external
-        self.llm_vote_count = (
-            llm_vote_count if llm_vote_count is not None else config.concept_llm_vote_count
+        configured_vote_count = (
+            llm_vote_count
+            if llm_vote_count is not None
+            else config.concept_llm_vote_count
         )
+        self.llm_vote_count = max(1, int(configured_vote_count))
+        if self.llm_vote_count % 2 == 0:
+            self.llm_vote_count += 1
         self.llm_vote_temperature = (
             llm_vote_temperature if llm_vote_temperature is not None
             else config.concept_llm_vote_temperature
@@ -111,8 +186,17 @@ class ConceptNormalizer:
             1,
             api_concurrency if api_concurrency is not None else config.concept_api_concurrency,
         )
+        self.allow_rule_fallback = allow_rule_fallback
+        self.require_complete_llm_validation = require_complete_llm_validation
+        self.allow_embedding_fallback = allow_embedding_fallback
         self._normalize_score_weights()
-        self.api_client = create_deepseek_client()
+        try:
+            self.api_client = create_deepseek_client()
+        except ValueError:
+            # The project supports an offline mode. Concept extraction may use
+            # deterministic rules there, but relation verification must remain
+            # fail-closed and never promote a heuristic guess to a hard edge.
+            self.api_client = None
         self.embedding_client = self.api_client
         self._wiki_cache: dict[str, str] = {}
 
@@ -122,14 +206,12 @@ class ConceptNormalizer:
             self.score_weight_vector
             + self.score_weight_structure
             + self.score_weight_rule
-            + self.score_weight_external
         )
         if total <= 0:
             return
         self.score_weight_vector /= total
         self.score_weight_structure /= total
         self.score_weight_rule /= total
-        self.score_weight_external /= total
 
     def preprocess_chunks(
         self,
@@ -140,26 +222,66 @@ class ConceptNormalizer:
         enriched_chunks_output_path: str | Path | None = None,
         candidate_output_path: str | Path | None = None,
         verified_output_path: str | Path | None = None,
+        extraction_cache_path: str | Path | None = None,
+        validation_cache_path: str | Path | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, list[str]]]:
         """Extract concepts and write canonical, candidate, and verified artifacts."""
         if not chunks:
             return [], [], {}
 
-        def extract_chunk(chunk: dict[str, Any]) -> list[dict[str, str]]:
+        extraction_cache = self._load_extraction_cache(extraction_cache_path)
+
+        def extract_chunk(chunk: dict[str, Any]) -> tuple[str, list[dict[str, str]]]:
             metadata = chunk.get("metadata", {})
             chunk_text = str(chunk.get("text", "")).strip()
-            return self.extract_core_concepts(
-                chunk_text,
-                metadata if isinstance(metadata, dict) else {},
+            normalized_metadata = metadata if isinstance(metadata, dict) else {}
+            cache_key = self._extraction_cache_key(chunk_text, normalized_metadata)
+            cached = extraction_cache.get(cache_key)
+            cached_is_verified_llm_output = (
+                isinstance(cached, list)
+                and bool(cached)
+                and all(
+                    isinstance(item, dict)
+                    and item.get("extraction_source") == "llm"
+                    for item in cached
+                )
             )
+            if isinstance(cached, list) and (
+                self.api_client is None or cached_is_verified_llm_output
+            ):
+                return cache_key, cached
+            concepts = self.extract_core_concepts(
+                chunk_text,
+                normalized_metadata,
+            )
+            return cache_key, concepts
 
         with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
             # executor.map preserves input order, keeping generated artifacts deterministic.
-            extracted_by_chunk = list(executor.map(extract_chunk, chunks))
+            extracted_rows = list(executor.map(extract_chunk, chunks))
+
+        extracted_by_chunk: list[list[dict[str, str]]] = []
+        for cache_key, concepts in extracted_rows:
+            extraction_cache[cache_key] = concepts
+            extracted_by_chunk.append(concepts)
+        if extraction_cache_path is not None:
+            self._write_json(extraction_cache_path, extraction_cache)
 
         all_concepts: list[dict[str, str]] = []
         for concepts in extracted_by_chunk:
             all_concepts.extend(concepts)
+        extraction_coverage = sum(bool(items) for items in extracted_by_chunk) / len(
+            extracted_by_chunk
+        )
+        if not self.allow_rule_fallback and (
+            not all_concepts
+            or extraction_coverage < self.min_extraction_coverage
+        ):
+            raise RuntimeError(
+                "concept extraction coverage was too low "
+                f"({extraction_coverage:.1%} < {self.min_extraction_coverage:.1%}); "
+                "existing artifacts must be preserved"
+            )
 
         alias_table, canonical_registry = self._canonicalize_concepts(all_concepts)
         concept_lookup = {concept["canonical_name"]: concept for concept in canonical_registry}
@@ -171,7 +293,11 @@ class ConceptNormalizer:
             )
 
         candidate_links = self.build_candidate_links(canonical_registry)
-        verified_edges = self.verify_candidate_links(candidate_links, canonical_registry)
+        verified_edges = self.verify_candidate_links(
+            candidate_links,
+            canonical_registry,
+            validation_cache_path=validation_cache_path,
+        )
 
         if registry_output_path is not None:
             self._write_json(registry_output_path, canonical_registry)
@@ -201,8 +327,10 @@ class ConceptNormalizer:
             "提取该模块中的所有核心概念，并判断每个概念的类型"
             "(algorithm/theorem/operator/method/model/framework/data_structure/paradigm/concept)、"
             "Bloom层级(understand/apply/analyze)、所属学科。"
-            "结果输出JSON数组："
-            "[{name, type, bloom_level, discipline, source_course, source_chapter}]。\n"
+            "结果输出 JSON 对象："
+            '{"concepts": [{"name": "...", "type": "concept", '
+            '"bloom_level": "understand", "discipline": "...", '
+            '"source_course": "...", "source_chapter": "..."}]}。\n'
             "约束：\n"
             "1. 只保留文本中明确出现或能直接对应的核心概念，不要输出课程名、教师名、教材名。\n"
             "2. type 只能是 algorithm、theorem、operator、method、model、framework、data_structure、paradigm、concept 之一。\n"
@@ -210,7 +338,7 @@ class ConceptNormalizer:
             "4. discipline 用简洁中文或英文学科名。\n"
             "5. source_course 填该概念所在课程名；source_chapter 填该概念所在章节名。\n"
             "6. 优先使用给定模块元数据中的 course_name 和 syllabus_section 作为 source 字段。\n"
-            "7. 只输出 JSON 数组，不要额外解释。\n"
+            "7. 顶层必须是只含 concepts 字段的 JSON 对象，不要额外解释。\n"
             f"模块元数据: {json.dumps(metadata, ensure_ascii=False)}\n"
             f"模块文本:\n{normalized_text}"
         )
@@ -220,16 +348,31 @@ class ConceptNormalizer:
                 self.llm_model_name,
                 prompt,
                 temperature=0.0,
-                max_output_tokens=1000,
+                max_output_tokens=1600,
             )
         except Exception as exc:
-            logger.warning(
-                "[concept_normalizer] LLM concept extraction failed, using fallback: %s", exc
+            action = (
+                "using fallback"
+                if self.allow_rule_fallback
+                else "aborting authoritative run"
             )
-            return self._fallback_extract_core_concepts(normalized_text, metadata)
+            logger.warning(
+                "[concept_normalizer] LLM concept extraction failed, %s: %s",
+                action,
+                exc,
+            )
+            return self._fallback_or_raise(normalized_text, metadata, exc)
 
+        if isinstance(response, dict):
+            response = response.get("concepts")
         if not isinstance(response, list):
-            return self._fallback_extract_core_concepts(normalized_text, metadata)
+            return self._fallback_or_raise(
+                normalized_text,
+                metadata,
+                ValueError(
+                    "concept extractor did not return a JSON object with a concepts array"
+                ),
+            )
 
         normalized_concepts: list[dict[str, str]] = []
         for item in response:
@@ -237,9 +380,67 @@ class ConceptNormalizer:
                 continue
             normalized = self._normalize_extracted_concept(item, metadata)
             if normalized is not None:
+                normalized["extraction_source"] = "llm"
                 normalized_concepts.append(normalized)
 
-        return normalized_concepts or self._fallback_extract_core_concepts(normalized_text, metadata)
+        if response and not normalized_concepts:
+            rejection_counts = self._concept_rejection_counts(response, metadata)
+            # A well-formed response containing only template/course-name noise
+            # is a legitimate empty extraction for this chunk. The aggregate
+            # coverage gate later decides whether enough chunks were useful.
+            if (
+                set(rejection_counts) == {"noise_name"}
+                and rejection_counts["noise_name"] == len(response)
+            ):
+                return []
+            rejection_summary = self._format_rejection_counts(rejection_counts)
+            return self._fallback_or_raise(
+                normalized_text,
+                metadata,
+                ValueError(
+                    "concept extractor returned no schema-valid entries "
+                    f"(rejections: {rejection_summary})"
+                ),
+            )
+        return normalized_concepts
+
+    def _fallback_or_raise(
+        self,
+        chunk_text: str,
+        metadata: dict[str, Any],
+        error: Exception,
+    ) -> list[dict[str, str]]:
+        if not self.allow_rule_fallback:
+            cause = self._safe_extraction_error_summary(error)
+            raise RuntimeError(
+                "verified concept extraction was unavailable "
+                f"(cause: {cause}); existing artifacts must be preserved"
+            ) from error
+        return self._fallback_extract_core_concepts(chunk_text, metadata)
+
+    @staticmethod
+    def _safe_extraction_error_summary(error: Exception) -> str:
+        """Describe extraction failures without exposing prompts or credentials."""
+        error_type = type(error).__name__
+        details: list[str] = []
+
+        status_code = getattr(error, "status_code", None)
+        if isinstance(status_code, int):
+            details.append(f"HTTP {status_code}")
+
+        # These messages originate inside this module/client and never contain
+        # course text. Third-party exception messages are deliberately omitted.
+        message = str(error).strip()
+        safe_prefixes = (
+            "DeepSeek returned empty or invalid JSON",
+            "Model output does not contain",
+            "concept extractor did not return",
+            "concept extractor returned no schema-valid entries",
+        )
+        if any(message.startswith(prefix) for prefix in safe_prefixes):
+            details.append(message)
+
+        return ": ".join([error_type, *details])
 
     def build_candidate_links(self, canonical_registry: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Build and merge cross-course source concept candidates."""
@@ -252,6 +453,7 @@ class ConceptNormalizer:
             self.retrieval_model_name,
             descriptions,
             batch_size=min(32, max(1, len(descriptions))),
+            allow_hash_fallback=self.allow_embedding_fallback,
         )
         pair_candidates = self._build_pair_candidates(canonical_registry, embeddings)
         merged_candidates = self._merge_candidate_pairs(pair_candidates)
@@ -264,22 +466,64 @@ class ConceptNormalizer:
         self,
         candidate_links: list[dict[str, Any]],
         canonical_registry: list[dict[str, Any]],
+        *,
+        validation_cache_path: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         """Validate merged candidate links with LLM self-consistency voting."""
         if not candidate_links:
             return []
 
         concept_lookup = {item["id"]: item for item in canonical_registry}
-        def verify_candidate(candidate: dict[str, Any]) -> dict[str, Any] | None:
+        validation_cache = self._load_validation_cache(validation_cache_path)
+        cached_results: list[tuple[str, dict[str, Any]]] = []
+        uncached_candidates: list[dict[str, Any]] = []
+        for candidate in candidate_links:
+            source = concept_lookup.get(candidate.get("source_id"))
+            target = concept_lookup.get(candidate.get("target_id"))
+            if source is None or target is None:
+                continue
+            cache_key = self._validation_cache_key(candidate, source, target)
+            cached = validation_cache.get(cache_key)
+            if (
+                isinstance(cached, dict)
+                and cached.get("verification_source") == "llm"
+                and cached.get("source_id") == candidate.get("source_id")
+                and cached.get("target_id") == candidate.get("target_id")
+            ):
+                cached_results.append((cache_key, cached))
+            else:
+                uncached_candidates.append(candidate)
+        selected_candidates = uncached_candidates[
+            : self.max_verification_candidates
+        ]
+
+        def verify_candidate(
+            candidate: dict[str, Any],
+        ) -> tuple[str, dict[str, Any] | None]:
             source = concept_lookup.get(candidate["source_id"])
             target = concept_lookup.get(candidate["target_id"])
             if source is None or target is None:
-                return None
-            return self._llm_verify_candidate(candidate, source, target)
+                return "", None
+            cache_key = self._validation_cache_key(candidate, source, target)
+            return cache_key, self._llm_verify_candidate(candidate, source, target)
 
         with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
-            verified_results = executor.map(verify_candidate, candidate_links)
-            verified_edges = [edge for edge in verified_results if edge is not None]
+            verified_results = [
+                *cached_results,
+                *executor.map(verify_candidate, selected_candidates),
+            ]
+
+        verified_edges: list[dict[str, Any]] = []
+        for cache_key, edge in verified_results:
+            if edge is None:
+                continue
+            verified_edges.append(edge)
+            # A transient provider failure must not become a durable validation
+            # result. Only complete LLM votes are safe to reuse.
+            if edge.get("verification_source") == "llm":
+                validation_cache[cache_key] = edge
+        if validation_cache_path is not None:
+            self._write_json(validation_cache_path, validation_cache)
 
         verified_edges.sort(
             key=lambda item: (-item["confidence"], item["target_id"], item["source_id"])
@@ -346,6 +590,8 @@ class ConceptNormalizer:
             + self.score_weight_rule * rule_signal
         )
         initial_confidence = self._clamp01(raw_score * domain_factor)
+        if initial_confidence < self.candidate_min_confidence:
+            return None
 
         evidence = [
             {
@@ -395,7 +641,6 @@ class ConceptNormalizer:
                 "w1_vector": round(self.score_weight_vector, 6),
                 "w2_structure": round(self.score_weight_structure, 6),
                 "w3_rule": round(self.score_weight_rule, 6),
-                "w4_external": round(self.score_weight_external, 6),
             },
             "domain_decay_factor": round(domain_factor, 6),
             "fusion_score": round(raw_score, 6),
@@ -451,27 +696,47 @@ class ConceptNormalizer:
         """Run self-consistency LLM validation on one merged candidate pair."""
         votes: list[dict[str, Any]] = []
         for _ in range(self.llm_vote_count):
+            if self.api_client is None:
+                if self.require_complete_llm_validation:
+                    raise RuntimeError("concept dependency validator is unavailable")
+                votes.append(self._fallback_dependency_vote(candidate))
+                continue
             try:
                 vote = self._call_dependency_validator(candidate, source, target)
             except Exception as exc:
+                if self.require_complete_llm_validation:
+                    raise RuntimeError(
+                        "concept dependency validation was incomplete; existing "
+                        "artifacts must be preserved"
+                    ) from exc
                 logger.warning(
                     "[concept_normalizer] LLM dependency vote failed, using fallback: %s", exc
                 )
                 vote = self._fallback_dependency_vote(candidate)
             votes.append(vote)
 
-        requires_counter = Counter(bool(vote.get("requires", False)) for vote in votes)
+        requires_counter = Counter(vote.get("requires") is True for vote in votes)
         requires = requires_counter.most_common(1)[0][0]
         relation_votes = [
             str(vote.get("relation_type", "NO_RELATION")).strip()
             for vote in votes
-            if vote.get("relation_type")
+            if vote.get("requires") is True
+            and vote.get("relation_type")
+            and str(vote.get("relation_type")).strip() != "NO_RELATION"
         ]
         relation_type = Counter(relation_votes).most_common(1)[0][0] if relation_votes else "NO_RELATION"
         if relation_type not in self.ALLOWED_RELATION_TYPES:
             relation_type = "NO_RELATION"
-        average_confidence = sum(self._safe_float(vote.get("confidence", 0.0)) for vote in votes) / max(len(votes), 1)
-        reason = self._choose_majority_reason(votes)
+        supporting_votes = [vote for vote in votes if vote.get("requires") is True]
+        if requires and relation_type == "NO_RELATION":
+            requires = False
+        confidence_votes = supporting_votes if requires else votes
+        average_confidence = sum(
+            self._safe_float(vote.get("confidence", 0.0)) for vote in confidence_votes
+        ) / max(len(confidence_votes), 1)
+        reason = self._choose_majority_reason(
+            supporting_votes if requires else votes
+        )
 
         return {
             "source_id": candidate["source_id"],
@@ -484,6 +749,11 @@ class ConceptNormalizer:
             "fusion_score": candidate["fusion_score"],
             "evidence": candidate["evidence"],
             "llm_votes": votes,
+            "verification_source": (
+                "llm"
+                if all(vote.get("verification_source") == "llm" for vote in votes)
+                else "fallback"
+            ),
         }
 
     def _call_dependency_validator(
@@ -523,7 +793,9 @@ class ConceptNormalizer:
         )
         if not isinstance(raw, dict):
             raise ValueError("Dependency validator did not return a JSON object.")
-        return self._normalize_dependency_vote(raw, candidate)
+        normalized = self._normalize_dependency_vote(raw, candidate)
+        normalized["verification_source"] = "llm"
+        return normalized
 
     def _normalize_dependency_vote(
         self,
@@ -534,7 +806,7 @@ class ConceptNormalizer:
         relation_type = str(vote.get("relation_type", "NO_RELATION")).strip().upper()
         if relation_type not in self.ALLOWED_RELATION_TYPES:
             relation_type = "NO_RELATION"
-        requires = bool(vote.get("requires", False))
+        requires = vote.get("requires") is True
         confidence = self._clamp01(self._safe_float(vote.get("confidence", candidate["initial_confidence"])))
         reason = str(vote.get("reason", "")).strip() or "No reason provided."
         dimensions = vote.get("dimensions", {})
@@ -542,11 +814,11 @@ class ConceptNormalizer:
             dimensions = {}
 
         normalized_dimensions = {
-            "definition_dependency": bool(dimensions.get("definition_dependency", False)),
-            "derivation_dependency": bool(dimensions.get("derivation_dependency", False)),
-            "substitutable": bool(dimensions.get("substitutable", False)),
-            "bloom_compatible": bool(dimensions.get("bloom_compatible", True)),
-            "teaching_practice": bool(dimensions.get("teaching_practice", False)),
+            "definition_dependency": dimensions.get("definition_dependency") is True,
+            "derivation_dependency": dimensions.get("derivation_dependency") is True,
+            "substitutable": dimensions.get("substitutable") is True,
+            "bloom_compatible": dimensions.get("bloom_compatible", True) is True,
+            "teaching_practice": dimensions.get("teaching_practice") is True,
         }
         if not requires:
             relation_type = "NO_RELATION"
@@ -560,13 +832,12 @@ class ConceptNormalizer:
         }
 
     def _fallback_dependency_vote(self, candidate: dict[str, Any]) -> dict[str, Any]:
-        """Fallback validator when the LLM is unavailable."""
-        requires = candidate["initial_confidence"] >= 0.45
+        """Fail closed when the dependency validator is unavailable."""
         return {
-            "requires": requires,
-            "relation_type": "CONCEPTUAL_BASIS" if requires else "NO_RELATION",
-            "confidence": round(candidate["initial_confidence"], 6),
-            "reason": "Fallback decision based on fused candidate score.",
+            "requires": False,
+            "relation_type": "NO_RELATION",
+            "confidence": 0.0,
+            "reason": "Dependency validator unavailable; candidate kept unverified.",
             "dimensions": {
                 "definition_dependency": False,
                 "derivation_dependency": False,
@@ -574,6 +845,7 @@ class ConceptNormalizer:
                 "bloom_compatible": True,
                 "teaching_practice": False,
             },
+            "verification_source": "fallback",
         }
 
     def _choose_majority_reason(self, votes: list[dict[str, Any]]) -> str:
@@ -586,7 +858,7 @@ class ConceptNormalizer:
 
     def _structure_signal(self, source: dict[str, Any], target: dict[str, Any]) -> float:
         """Normalize the course ordering prior to [0, 1]."""
-        return 1.0 if self._course_order_bonus_for_pair(source, target) > 0 else 0.0
+        return self._clamp01(self._course_order_bonus_for_pair(source, target))
 
     def _rule_signal(self, source: dict[str, Any], target: dict[str, Any]) -> float:
         """Combine rule-based signals into a normalized score."""
@@ -676,7 +948,7 @@ class ConceptNormalizer:
         for pattern, concept_type in type_keywords:
             for match in re.findall(pattern, chunk_text, flags=re.IGNORECASE):
                 name = str(match).strip("《》“”\"'` ")
-                if not name:
+                if not name or self._is_noise_concept(name, metadata):
                     continue
                 normalized_key = self._normalize_alias_key(name)
                 if normalized_key in seen_names:
@@ -691,6 +963,7 @@ class ConceptNormalizer:
                         "source_course": source_course,
                         "source_chapter": source_chapter,
                         "source_course_code": source_course_code,
+                        "extraction_source": "rule",
                     }
                 )
 
@@ -702,15 +975,45 @@ class ConceptNormalizer:
         metadata: dict[str, Any],
     ) -> dict[str, str] | None:
         """Validate and normalize a raw LLM concept entry."""
-        name = self._cleanup_term(concept.get("name", ""))
-        concept_type = str(concept.get("type", "")).strip().lower()
-        bloom_level = str(concept.get("bloom_level", "")).strip().lower()
-        discipline = self._cleanup_term(concept.get("discipline", ""))
-        source_course = self._cleanup_term(concept.get("source_course", "")) or self._default_source_course(metadata)
-        source_chapter = self._cleanup_term(concept.get("source_chapter", "")) or self._default_source_chapter(metadata)
+        name = self._cleanup_term(
+            self._first_present(concept, "name", "concept_name", "概念名称")
+        )
+        concept_type = self._normalize_enum(
+            self._first_present(concept, "type", "concept_type", "概念类型"),
+            self.TYPE_ALIASES,
+        )
+        bloom_level = self._normalize_enum(
+            self._first_present(
+                concept,
+                "bloom_level",
+                "bloom",
+                "Bloom层级",
+                "认知层级",
+            ),
+            self.BLOOM_ALIASES,
+        )
+        # Preserve a valid concept when the model invents a non-empty subtype.
+        # ``concept`` is the ontology's explicit catch-all; coercing to a more
+        # specific category would overstate what the response established.
+        if concept_type and concept_type not in self.ALLOWED_TYPES:
+            concept_type = "concept"
+        discipline = self._cleanup_term(
+            self._first_present(concept, "discipline", "domain", "学科")
+        )
+        source_course = self._default_source_course(metadata) or self._cleanup_term(
+            concept.get("source_course", "")
+        )
+        source_chapter = self._default_source_chapter(metadata) or self._cleanup_term(
+            concept.get("source_chapter", "")
+        )
         source_course_code = self._default_source_course_code(metadata)
 
-        if not name or concept_type not in self.ALLOWED_TYPES or bloom_level not in self.ALLOWED_BLOOM_LEVELS:
+        if (
+            not name
+            or self._is_noise_concept(name, metadata)
+            or not concept_type
+            or bloom_level not in self.ALLOWED_BLOOM_LEVELS
+        ):
             return None
         if not discipline:
             discipline = "unknown"
@@ -724,6 +1027,61 @@ class ConceptNormalizer:
             "source_chapter": source_chapter,
             "source_course_code": source_course_code,
         }
+
+    def _concept_rejection_counts(
+        self,
+        concepts: list[Any],
+        metadata: dict[str, Any],
+    ) -> Counter[str]:
+        """Count schema rejection reasons without logging generated content."""
+        reasons: Counter[str] = Counter()
+        for concept in concepts:
+            if not isinstance(concept, dict):
+                reasons["not_object"] += 1
+                continue
+            name = self._cleanup_term(
+                self._first_present(concept, "name", "concept_name", "概念名称")
+            )
+            concept_type = self._normalize_enum(
+                self._first_present(concept, "type", "concept_type", "概念类型"),
+                self.TYPE_ALIASES,
+            )
+            bloom_level = self._normalize_enum(
+                self._first_present(
+                    concept,
+                    "bloom_level",
+                    "bloom",
+                    "Bloom层级",
+                    "认知层级",
+                ),
+                self.BLOOM_ALIASES,
+            )
+            if not name:
+                reasons["missing_name"] += 1
+            elif self._is_noise_concept(name, metadata):
+                reasons["noise_name"] += 1
+            if not concept_type:
+                reasons["missing_type"] += 1
+            if bloom_level not in self.ALLOWED_BLOOM_LEVELS:
+                reasons["invalid_bloom_level"] += 1
+        return reasons
+
+    @staticmethod
+    def _format_rejection_counts(reasons: Counter[str]) -> str:
+        return ", ".join(f"{key}={value}" for key, value in sorted(reasons.items()))
+
+    @staticmethod
+    def _first_present(concept: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = concept.get(key)
+            if value is not None and str(value).strip():
+                return value
+        return ""
+
+    @staticmethod
+    def _normalize_enum(value: Any, aliases: dict[str, str]) -> str:
+        normalized = str(value or "").strip().lower()
+        return aliases.get(normalized, normalized)
 
     def _canonicalize_concepts(
         self,
@@ -745,7 +1103,7 @@ class ConceptNormalizer:
         alias_table: dict[str, list[str]] = {}
         canonical_registry: list[dict[str, Any]] = []
 
-        for index, group in enumerate(groups, start=1):
+        for group in groups:
             aliases = sorted(group, key=lambda item: (len(item), item.lower()))
             wiki_candidates = [self._lookup_wikipedia_title(alias) for alias in aliases]
             canonical_name = self._choose_canonical_name(aliases, wiki_candidates)
@@ -754,9 +1112,13 @@ class ConceptNormalizer:
                 member_concepts.extend(concept_occurrences[alias])
 
             alias_table[canonical_name] = aliases
+            concept_key = self._normalize_alias_key(canonical_name)
+            concept_id = "concept_" + hashlib.sha256(
+                concept_key.encode("utf-8")
+            ).hexdigest()[:16]
             canonical_registry.append(
                 {
-                    "id": f"concept_{index:05d}",
+                    "id": concept_id,
                     "canonical_name": canonical_name,
                     "aliases": aliases,
                     "type": self._majority_value(member_concepts, "type", default="algorithm"),
@@ -765,11 +1127,88 @@ class ConceptNormalizer:
                     "source_courses": self._unique_values(member_concepts, "source_course"),
                     "source_chapters": self._unique_values(member_concepts, "source_chapter"),
                     "source_course_codes": self._unique_values(member_concepts, "source_course_code"),
+                    "source_occurrences": self._unique_source_occurrences(member_concepts),
+                    "extraction_sources": self._unique_values(member_concepts, "extraction_source"),
                 }
             )
 
-        canonical_registry.sort(key=lambda item: item["id"])
+        canonical_registry.sort(key=lambda item: (item["canonical_name"].casefold(), item["id"]))
         return alias_table, canonical_registry
+
+    def _load_extraction_cache(
+        self,
+        extraction_cache_path: str | Path | None,
+    ) -> dict[str, list[dict[str, str]]]:
+        if extraction_cache_path is None:
+            return {}
+        path = Path(extraction_cache_path)
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _load_validation_cache(
+        self,
+        validation_cache_path: str | Path | None,
+    ) -> dict[str, dict[str, Any]]:
+        if validation_cache_path is None:
+            return {}
+        path = Path(validation_cache_path)
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _validation_cache_key(
+        self,
+        candidate: dict[str, Any],
+        source: dict[str, Any] | None = None,
+        target: dict[str, Any] | None = None,
+    ) -> str:
+        payload = {
+            "prompt_version": DEPENDENCY_PROMPT_VERSION,
+            "model": self.llm_model_name,
+            "vote_count": self.llm_vote_count,
+            "vote_temperature": self.llm_vote_temperature,
+            "source_id": candidate.get("source_id"),
+            "target_id": candidate.get("target_id"),
+            "fusion_score": candidate.get("fusion_score"),
+            "initial_confidence": candidate.get("initial_confidence"),
+            "evidence": candidate.get("evidence", []),
+            "source": source or {},
+            "target": target or {},
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _extraction_cache_key(
+        self,
+        chunk_text: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        payload = {
+            "prompt_version": EXTRACTION_PROMPT_VERSION,
+            "model": self.llm_model_name,
+            "mode": "llm" if self.api_client is not None else "fallback",
+            "text": chunk_text,
+            "course_code": metadata.get("course_code", ""),
+            "course_name": metadata.get("course_name", ""),
+            "section": metadata.get("syllabus_section", ""),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _is_noise_concept(self, name: str, metadata: dict[str, Any]) -> bool:
+        normalized = self._normalize_alias_key(name)
+        course_name = self._normalize_alias_key(metadata.get("course_name", ""))
+        noise = {self._normalize_alias_key(item) for item in _CONCEPT_NOISE}
+        return normalized in noise or bool(course_name and normalized == course_name)
 
     def _cluster_names(self, names: list[str]) -> list[list[str]]:
         """Group names using exact normalization and embedding similarity."""
@@ -802,6 +1241,7 @@ class ConceptNormalizer:
             self.embedding_model_name,
             names,
             batch_size=min(32, max(1, len(names))),
+            allow_hash_fallback=self.allow_embedding_fallback,
         )
         if embeddings:
             # Vectorised cosine similarity via numpy: embeddings are already L2-normalised
@@ -941,6 +1381,29 @@ class ConceptNormalizer:
             if value and value not in values:
                 values.append(value)
         return values
+
+    def _unique_source_occurrences(
+        self,
+        concepts: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """Keep course/chapter provenance paired instead of forming a cross product."""
+        occurrences: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for concept in concepts:
+            occurrence = {
+                "course": str(concept.get("source_course", "")).strip(),
+                "course_code": str(concept.get("source_course_code", "")).strip(),
+                "chapter": str(concept.get("source_chapter", "")).strip(),
+            }
+            key = (
+                occurrence["course"],
+                occurrence["course_code"],
+                occurrence["chapter"],
+            )
+            if any(key) and key not in seen:
+                occurrences.append(occurrence)
+                seen.add(key)
+        return occurrences
 
     def _merge_string_lists(self, items: list[dict[str, Any]], key: str) -> list[str]:
         """Merge list[str] fields from multiple candidate rows."""

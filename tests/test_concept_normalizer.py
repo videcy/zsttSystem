@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.data_processing.concept_normalizer import ConceptNormalizer
-from src.utils.deepseek_client import extract_json_value
+from src.utils.deepseek_client import extract_json_value, generate_json_value
 
 
 class DeepSeekJsonValueTests(unittest.TestCase):
@@ -13,6 +14,46 @@ class DeepSeekJsonValueTests(unittest.TestCase):
         value = extract_json_value(payload)
         self.assertIsInstance(value, list)
         self.assertEqual(value[0]["name"], "gradient descent")
+
+    def test_generate_json_value_enables_json_mode_and_retries_invalid_output(self) -> None:
+        requests: list[dict] = []
+        contents = iter(["not json", '{"concepts": []}'])
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                requests.append(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=next(contents))
+                        )
+                    ]
+                )
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+
+        payload = generate_json_value(
+            client,
+            "deepseek-v4-flash",
+            "请输出 JSON 对象",
+        )
+
+        self.assertEqual(payload, {"concepts": []})
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(
+            all(
+                request["response_format"] == {"type": "json_object"}
+                for request in requests
+            )
+        )
+        self.assertTrue(
+            all(
+                request["extra_body"] == {"thinking": {"type": "disabled"}}
+                for request in requests
+            )
+        )
 
 
 class ConceptNormalizerTests(unittest.TestCase):
@@ -29,6 +70,7 @@ class ConceptNormalizerTests(unittest.TestCase):
         normalizer = ConceptNormalizer(
             wikipedia_enabled=False,
             candidate_top_k=4,
+            candidate_min_confidence=0.0,
             course_order_bonus=0.3,
             cross_discipline_decay=0.85,
             score_weight_vector=0.2,
@@ -101,10 +143,10 @@ class ConceptNormalizerTests(unittest.TestCase):
             if item["source_id"] == "concept_00002" and item["target_id"] == "concept_00001"
         )
         self.assertAlmostEqual(bptree_to_index["score_components"]["S_vector"], 0.78, places=6)
-        self.assertAlmostEqual(bptree_to_index["score_components"]["S_structure"], 1.0, places=6)
+        self.assertAlmostEqual(bptree_to_index["score_components"]["S_structure"], 0.3, places=6)
         self.assertAlmostEqual(bptree_to_index["score_components"]["S_rule"], 1.0, places=6)
-        self.assertAlmostEqual(bptree_to_index["fusion_score"], 0.556, places=6)
-        self.assertAlmostEqual(bptree_to_index["initial_confidence"], 0.556, places=6)
+        self.assertAlmostEqual(bptree_to_index["fusion_score"], 0.693333, places=6)
+        self.assertAlmostEqual(bptree_to_index["initial_confidence"], 0.693333, places=6)
         self.assertTrue(any(e["type"] == "course_order" for e in bptree_to_index["evidence"]))
 
         cross_domain = next(
@@ -114,8 +156,8 @@ class ConceptNormalizerTests(unittest.TestCase):
         )
         self.assertAlmostEqual(cross_domain["score_components"]["S_vector"], 0.6, places=6)
         self.assertAlmostEqual(cross_domain["domain_decay_factor"], 0.85, places=6)
-        self.assertAlmostEqual(cross_domain["fusion_score"], 0.42, places=6)
-        self.assertAlmostEqual(cross_domain["initial_confidence"], 0.357, places=6)
+        self.assertAlmostEqual(cross_domain["fusion_score"], 0.466667, places=6)
+        self.assertAlmostEqual(cross_domain["initial_confidence"], 0.396667, places=6)
 
         self.assertFalse(
             any(
@@ -220,7 +262,7 @@ class ConceptNormalizerTests(unittest.TestCase):
         edge = verified[0]
         self.assertTrue(edge["requires"])
         self.assertEqual(edge["relation_type"], "FOUNDATION_OF")
-        self.assertAlmostEqual(edge["confidence"], 0.7, places=6)
+        self.assertAlmostEqual(edge["confidence"], 0.85, places=6)
         self.assertEqual(edge["reason"], "Vote A")
         self.assertEqual(len(edge["llm_votes"]), 3)
 
