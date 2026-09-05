@@ -99,6 +99,17 @@ _MERGEABLE_INTENTS: frozenset[frozenset[QueryType]] = frozenset(
     }
 )
 
+# How much verification backing each NLI outcome carries, worst last.  A
+# merged answer reports the highest severity among its sections.
+_NLI_STATUS_SEVERITY: dict[str, int] = {
+    "passed": 0,
+    "rewritten": 1,
+    "pruned": 2,
+    "skipped": 3,
+    "unavailable": 4,
+    "refused": 5,
+}
+
 _INTENT_HEADINGS: dict[QueryType, str] = {
     QueryType.FACT: "课程基本信息",
     QueryType.DEPENDENCY: "先修关系",
@@ -326,9 +337,16 @@ class QueryRouter:
     ) -> RouteResult:
         """Answer a query that carries two intents, one section per intent.
 
-        Each sub-answer keeps its own citations; a section whose handler
-        refused or found nothing is dropped rather than merged, so the caller
-        never sees ``未找到`` next to a real answer.
+        Each sub-answer keeps its own citations, and a section whose handler
+        declined is kept as its own refusal rather than dropped: the user
+        asked two things, and silently answering one of them would hide that
+        the other has no evidence.
+
+        Per-section metadata is nested under ``<intent>_metadata``, but the
+        verification keys are also aggregated to the top level, because that
+        is where ``main._log_query`` and the active-learning sampler look for
+        them.  The merged answer inherits the *weakest* section's NLI status:
+        it is only as verified as its least supported half.
         """
         sections: list[str] = []
         citations: list[dict[str, Any]] = []
@@ -336,6 +354,7 @@ class QueryRouter:
         metadata: dict[str, Any] = {}
         dependency_info: dict[str, Any] | None = None
         answered: list[str] = []
+        part_metadata: list[dict[str, Any]] = []
 
         for label in labels:
             part = await self._handle_single_intent(
@@ -357,6 +376,7 @@ class QueryRouter:
                     seen_citations.add(identity)
                     citations.append(citation)
             metadata[f"{label.value}_metadata"] = part.metadata
+            part_metadata.append(part.metadata)
             if part.dependency_info and dependency_info is None:
                 dependency_info = part.dependency_info
 
@@ -369,7 +389,7 @@ class QueryRouter:
             )
 
         metadata["answered_intents"] = answered
-        metadata["status"] = "ok"
+        metadata.update(self._merged_verification(part_metadata))
         return RouteResult(
             answer="\n\n".join(sections),
             citations=citations,
@@ -377,6 +397,44 @@ class QueryRouter:
             metadata=metadata,
             dependency_info=dependency_info,
         )
+
+    @staticmethod
+    def _merged_verification(parts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Roll each section's verification and status up to the top level."""
+        merged: dict[str, Any] = {}
+        statuses = [
+            str(part["nli_status"]) for part in parts if part.get("nli_status")
+        ]
+        if statuses:
+            merged["nli_status"] = max(
+                statuses,
+                key=lambda status: _NLI_STATUS_SEVERITY.get(status, 0),
+            )
+            merged["nli_attempts"] = sum(
+                int(part.get("nli_attempts") or 0) for part in parts
+            )
+            details: list[Any] = []
+            for part in parts:
+                details.extend(part.get("nli_details") or [])
+            merged["nli_details"] = details
+            verified = [
+                part["nli_verified"]
+                for part in parts
+                if part.get("nli_verified") is not None
+            ]
+            merged["nli_verified"] = all(verified) if verified else None
+
+        # A section that degraded or refused must not be hidden behind an
+        # overall "ok": the response status reports the worst section.
+        degraded = [
+            str(part["status"])
+            for part in parts
+            if part.get("status") and str(part["status"]) != "ok"
+        ]
+        merged["status"] = degraded[0] if len(degraded) == len(parts) else "ok"
+        if degraded and len(degraded) < len(parts):
+            merged["partial_status"] = degraded
+        return merged
 
     # ------------------------------------------------------------------
     # Path handlers
