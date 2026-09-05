@@ -12,8 +12,8 @@ class CourseDependencyNotFoundError(LookupError):
 
 _PATH_QUERIES = {
     depth: f"""
-        MATCH p=(center:Course {{course_code: $course_code}})
-            -[:PREREQUISITE_OF*1..{depth}]-(neighbor:Course)
+        MATCH p=(center:ZSTT_Course {{course_code: $course_code}})
+            -[:PREREQUISITE_OF*1..{depth}]-(neighbor:ZSTT_Course)
         RETURN
             [node IN nodes(p) | {{
                 course_code: node.course_code,
@@ -36,7 +36,7 @@ _PATH_QUERIES = {
 }
 
 _ALL_PREREQUISITES_QUERY = """
-    MATCH (source:Course)-[rel:PREREQUISITE_OF]->(target:Course)
+    MATCH (source:ZSTT_Course)-[rel:PREREQUISITE_OF]->(target:ZSTT_Course)
     RETURN
         source {
             .course_code,
@@ -463,7 +463,7 @@ def get_course_dependency_subgraph(
     with driver.session() as session:
         record = session.run(
             """
-            MATCH (course:Course {course_code: $course_code})
+            MATCH (course:ZSTT_Course {course_code: $course_code})
             RETURN course {
                 .course_code,
                 .course_name,

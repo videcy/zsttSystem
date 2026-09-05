@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from src.config import config
+from src.online_service.generator import verify_answer_with_nli
 from src.utils.deepseek_client import generate_json_value
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,19 @@ def build_dependency_answer(
         "explanation": explanation.get("explanation", ""),
         "mermaid": explanation.get("mermaid") or build_mermaid_graph(paths),
         "paths": paths,
+        "nli_verified": explanation.get("nli_verified"),
+        "nli_status": explanation.get("nli_status", "skipped"),
+        "nli_details": explanation.get("nli_details", []),
+        "nli_attempts": explanation.get("nli_attempts", 0),
+        "nli_verification_target": explanation.get(
+            "nli_verification_target",
+            "returned_answer",
+        ),
+        **{
+            key: explanation[key]
+            for key in ("status", "error_code")
+            if key in explanation
+        },
     }
 
 
@@ -98,7 +112,7 @@ def locate_target_concepts(
     for concept in entities.get("concepts", []):
         result = neo4j_session.run(
             """
-            MATCH (n:Knowledge_Point)
+            MATCH (n:ZSTT_Concept)
             WHERE n.concept_id IS NOT NULL
               AND n.source = 'concept_dependency'
               AND (
@@ -112,7 +126,8 @@ def locate_target_concepts(
                    n.bloom_level AS bloom_level,
                    n.source_courses AS source_courses,
                    n.source_course_codes AS source_course_codes,
-                   n.source_chapters AS source_chapters
+                   n.source_chapters AS source_chapters,
+                   n.source_occurrences AS source_occurrences
             LIMIT 30
             """,
             term=concept,
@@ -122,18 +137,23 @@ def locate_target_concepts(
     for course in entities.get("courses", []):
         result = neo4j_session.run(
             """
-            MATCH (n:Knowledge_Point)
+            MATCH (n:ZSTT_Concept)
             WHERE n.concept_id IS NOT NULL
               AND n.source = 'concept_dependency'
-              AND any(c IN coalesce(n.source_courses, [])
-                      WHERE c CONTAINS $course OR $course CONTAINS c)
+              AND (
+                any(c IN coalesce(n.source_courses, [])
+                    WHERE c CONTAINS $course OR $course CONTAINS c)
+                OR any(code IN coalesce(n.source_course_codes, [])
+                       WHERE toUpper(code) = toUpper($course))
+              )
             RETURN n.concept_id AS concept_id,
                    n.name AS name,
                    n.discipline AS discipline,
                    n.bloom_level AS bloom_level,
                    n.source_courses AS source_courses,
                    n.source_course_codes AS source_course_codes,
-                   n.source_chapters AS source_chapters
+                   n.source_chapters AS source_chapters,
+                   n.source_occurrences AS source_occurrences
             LIMIT 120
             """,
             course=course,
@@ -156,7 +176,7 @@ def retrieve_dependency_paths(
 
     relation_filter = "|".join(DEPENDENCY_RELATION_TYPES)
     query = f"""
-    MATCH p=(source:Knowledge_Point)-[rels:{relation_filter}*1..{max_depth}]->(target:Knowledge_Point)
+    MATCH p=(source:ZSTT_Concept)-[rels:{relation_filter}*1..{max_depth}]->(target:ZSTT_Concept)
     WHERE target.concept_id IN $target_ids
       AND source.concept_id IS NOT NULL
       AND target.source = 'concept_dependency'
@@ -169,7 +189,8 @@ def retrieve_dependency_paths(
         bloom_level: node.bloom_level,
         source_courses: node.source_courses,
         source_course_codes: node.source_course_codes,
-        source_chapters: node.source_chapters
+        source_chapters: node.source_chapters,
+        source_occurrences: node.source_occurrences
       }}] AS nodes,
       [rel IN relationships(p) | {{
         type: type(rel),
@@ -206,32 +227,50 @@ def aggregate_prerequisites(paths: list[dict[str, Any]]) -> list[dict[str, Any]]
         if len(nodes) < 2:
             continue
         source = nodes[0]
-        courses = _normalize_string_list(source.get("source_courses", [])) or ["未知课程"]
-        chapters = _normalize_string_list(source.get("source_chapters", [])) or ["未知章节"]
-        for course in courses:
-            for chapter in chapters:
-                key = (course, chapter)
-                item = grouped.setdefault(
-                    key,
-                    {
-                        "course": course,
-                        "chapter": chapter,
-                        "concepts": [],
-                        "max_confidence": 0.0,
-                    },
+        occurrences = _normalize_source_occurrences(
+            source.get("source_occurrences", [])
+        )
+        if occurrences:
+            course_chapter_pairs = [
+                (
+                    occurrence.get("course")
+                    or occurrence.get("course_code")
+                    or "未知课程",
+                    occurrence.get("chapter") or "未知章节",
                 )
-                concept = {
-                    "concept_id": source.get("concept_id", ""),
-                    "name": source.get("name", ""),
-                    "discipline": source.get("discipline", ""),
-                    "bloom_level": source.get("bloom_level", ""),
-                }
-                if concept not in item["concepts"]:
-                    item["concepts"].append(concept)
-                item["max_confidence"] = max(
-                    float(item["max_confidence"]),
-                    float(path.get("avg_confidence", 0.0)),
-                )
+                for occurrence in occurrences
+            ]
+        else:
+            courses = _normalize_string_list(source.get("source_courses", [])) or ["未知课程"]
+            chapters = _normalize_string_list(source.get("source_chapters", [])) or ["未知章节"]
+            course_chapter_pairs = [
+                (course, chapter)
+                for course in courses
+                for chapter in chapters
+            ]
+        for course, chapter in course_chapter_pairs:
+            key = (course, chapter)
+            item = grouped.setdefault(
+                key,
+                {
+                    "course": course,
+                    "chapter": chapter,
+                    "concepts": [],
+                    "max_confidence": 0.0,
+                },
+            )
+            concept = {
+                "concept_id": source.get("concept_id", ""),
+                "name": source.get("name", ""),
+                "discipline": source.get("discipline", ""),
+                "bloom_level": source.get("bloom_level", ""),
+            }
+            if concept not in item["concepts"]:
+                item["concepts"].append(concept)
+            item["max_confidence"] = max(
+                float(item["max_confidence"]),
+                float(path.get("avg_confidence", 0.0)),
+            )
 
     return sorted(
         grouped.values(),
@@ -244,40 +283,84 @@ def generate_dependency_explanation(
     paths: list[dict[str, Any]],
     prerequisites: list[dict[str, Any]],
     llm_client: Any,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Generate a grounded Chinese explanation and Mermaid graph from paths."""
     prompt = (
         f"用户问题：{question}\n"
         f"系统检索到的依赖路径：{json.dumps(_compact_paths_for_prompt(paths), ensure_ascii=False)}\n"
         f"先修知识聚合：{json.dumps(prerequisites, ensure_ascii=False)}\n"
         "请仅使用这些依赖关系，用通俗中文解释为什么必须先学这些先修知识。\n"
-        "输出 JSON 对象，包含字段：prerequisite_table, explanation, mermaid。\n"
-        "prerequisite_table 使用 Markdown 表格；explanation 不超过200字；"
-        "mermaid 必须是 graph TD 代码。不要输出 JSON 以外的内容。"
+        "只输出 JSON 对象 {\"explanation\": \"...\"}，explanation 不超过200字。"
+        "不要输出图、表格或 JSON 以外的内容。"
     )
-    try:
-        payload = generate_json_value(
-            llm_client,
-            config.text_model,
-            prompt,
-            temperature=0.1,
-            max_output_tokens=900,
-        )
-    except Exception as exc:
-        logger.warning(
-            "[dependency_explainer] LLM explanation generation failed, using fallback: %s", exc
-        )
-        payload = {}
+    payload: dict[str, Any] = {}
+    if llm_client is not None:
+        try:
+            generated = generate_json_value(
+                llm_client,
+                config.text_model,
+                prompt,
+                temperature=0.1,
+                max_output_tokens=300,
+            )
+            if isinstance(generated, dict):
+                payload = generated
+        except Exception as exc:
+            logger.warning(
+                "[dependency_explainer] LLM explanation generation failed, using fallback: %s", exc
+            )
 
-    if not isinstance(payload, dict):
-        payload = {}
+    explanation = str(payload.get("explanation", "")).strip()
+    nli_metadata: dict[str, Any] = {
+        "nli_verified": None,
+        "nli_status": "skipped",
+        "nli_details": [],
+        "nli_attempts": 0,
+        "nli_verification_target": "returned_answer",
+    }
+    if explanation and llm_client is not None and config.nli_verification_enabled:
+        context = json.dumps(
+            {
+                "paths": _compact_paths_for_prompt(paths),
+                "prerequisites": prerequisites,
+            },
+            ensure_ascii=False,
+        )
+        verified, details = verify_answer_with_nli(
+            explanation,
+            context,
+            llm_client,
+        )
+        verified = verified and bool(details) and all(
+            item.get("label") == "Entailment" for item in details
+        )
+        nli_metadata = {
+            "nli_verified": verified,
+            "nli_status": "passed" if verified else "fallback",
+            "nli_details": details,
+            "nli_attempts": 1,
+            "nli_verification_target": (
+                "returned_answer" if verified else "discarded_generated_answer"
+            ),
+            **(
+                {}
+                if verified
+                else {
+                    "status": "degraded",
+                    "error_code": "NLI_VERIFICATION_FAILED",
+                }
+            ),
+        }
+        if not verified:
+            explanation = ""
 
     return {
-        "prerequisite_table": str(payload.get("prerequisite_table", "")).strip()
-        or _build_prerequisite_table(prerequisites),
-        "explanation": str(payload.get("explanation", "")).strip()
-        or _fallback_explanation(prerequisites),
-        "mermaid": str(payload.get("mermaid", "")).strip() or build_mermaid_graph(paths),
+        # These structured views are deterministic projections of verified
+        # graph paths; the LLM is only allowed to phrase the explanation.
+        "prerequisite_table": _build_prerequisite_table(prerequisites),
+        "explanation": explanation or _fallback_explanation(prerequisites),
+        "mermaid": build_mermaid_graph(paths),
+        **nli_metadata,
     }
 
 
@@ -307,16 +390,24 @@ def build_mermaid_graph(paths: list[dict[str, Any]]) -> str:
 def _fallback_extract_query_entities(question: str) -> dict[str, list[str]]:
     """Heuristic entity extraction for quoted course names and dependency wording."""
     courses = re.findall(r"《([^》]+)》", question)
-    concepts: list[str] = []
-    if any(word in question for word in ("概念", "知识点", "算法", "定理", "算子")):
-        fragments = re.split(r"[，。？！?、\s]+", question)
-        concepts = [
-            fragment.strip("《》")
-            for fragment in fragments
-            if 2 <= len(fragment.strip("《》")) <= 30
-            and fragment.strip("《》") not in courses
-        ]
-    return {"courses": courses, "concepts": concepts}
+    stripped = re.sub(
+        r"为什么|为何|需要|依赖|哪些|什么|先修|前置|基础|知识点|知识|概念|"
+        r"如何|怎么|关系|关联|掌握|学习|才能|有什么|有哪些|课程",
+        " ",
+        question,
+    )
+    concepts = [
+        fragment.strip("《》")
+        for fragment in re.split(r"[，。？！?、\s]+", stripped)
+        if 2 <= len(fragment.strip("《》")) <= 30
+        and fragment.strip("《》") not in courses
+    ]
+    # The remaining phrase may be either a course or a concept. Searching both
+    # fields keeps dependency lookup useful when no entity-extraction LLM exists.
+    return {
+        "courses": _merge_unique(courses, concepts),
+        "concepts": concepts,
+    }
 
 
 def _append_unique_nodes(targets: list[dict[str, Any]], seen_ids: set[str], records: Any) -> None:
@@ -330,6 +421,9 @@ def _append_unique_nodes(targets: list[dict[str, Any]], seen_ids: set[str], reco
             "source_courses": list(record.get("source_courses") or []),
             "source_course_codes": list(record.get("source_course_codes") or []),
             "source_chapters": list(record.get("source_chapters") or []),
+            "source_occurrences": _normalize_source_occurrences(
+                record.get("source_occurrences")
+            ),
         }
         concept_id = str(node.get("concept_id") or "")
         if concept_id and concept_id not in seen_ids:
@@ -346,6 +440,36 @@ def _normalize_string_list(value: Any) -> list[str]:
     else:
         values = []
     return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _normalize_source_occurrences(value: Any) -> list[dict[str, str]]:
+    """Decode paired course/chapter provenance stored as a Neo4j JSON property."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    occurrences: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        occurrence = {
+            "course": str(item.get("course") or "").strip(),
+            "course_code": str(item.get("course_code") or "").strip(),
+            "chapter": str(item.get("chapter") or "").strip(),
+        }
+        key = (
+            occurrence["course"],
+            occurrence["course_code"],
+            occurrence["chapter"],
+        )
+        if any(key) and key not in seen:
+            occurrences.append(occurrence)
+            seen.add(key)
+    return occurrences
 
 
 def _merge_unique(left: list[str], right: list[str]) -> list[str]:

@@ -3,13 +3,34 @@
 from __future__ import annotations
 
 import re
-from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
 from src.config import config
 from src.online_service.persona import DEFAULT_PERSONA, PERSONA_PROFILES, Persona
 from src.utils.deepseek_client import generate_json, generate_text
+
+MAX_GENERATION_EVIDENCE_ITEMS = 10
+
+
+def select_generation_evidence(
+    evidence_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the single bounded evidence set used by generation and citations."""
+    selected = list(evidence_items[:MAX_GENERATION_EVIDENCE_ITEMS])
+    graph_evidence = next(
+        (
+            item
+            for item in evidence_items
+            if item.get("source_type") == "knowledge_graph"
+        ),
+        None,
+    )
+    if graph_evidence is not None and graph_evidence not in selected:
+        # Hybrid answers must actually expose at least one graph item to the
+        # generator and verifier when graph paths were retrieved.
+        selected[-1] = graph_evidence
+    return selected
 
 
 def _source_name(value: Any) -> str:
@@ -19,7 +40,7 @@ def _source_name(value: Any) -> str:
 
 def _format_evidence_for_prompt(evidence_items: list[dict[str, Any]]) -> str:
     blocks: list[str] = []
-    for index, item in enumerate(evidence_items[:10], 1):
+    for index, item in enumerate(select_generation_evidence(evidence_items), 1):
         blocks.append(
             "\n".join(
                 [
@@ -33,6 +54,62 @@ def _format_evidence_for_prompt(evidence_items: list[dict[str, Any]]) -> str:
             )
         )
     return "\n\n".join(blocks)
+
+
+_SOURCE_HEADING = re.compile(r"^资料来源\s*[：:]?\s*$")
+_SOURCE_BULLET = re.compile(r"^(?:[-*•]|\d+[.)、])\s+")
+
+
+def _evidence_source_labels(
+    evidence_items: list[dict[str, Any]],
+    *,
+    limit: int = MAX_GENERATION_EVIDENCE_ITEMS,
+) -> list[str]:
+    sources: list[str] = []
+    for item in evidence_items:
+        source = " · ".join(
+            value
+            for value in (
+                str(item.get("course_name") or "").strip(),
+                str(item.get("section") or "").strip(),
+                _source_name(item.get("source_file")),
+            )
+            if value
+        )
+        if source and source not in sources:
+            sources.append(source)
+        if len(sources) >= limit:
+            break
+    return sources
+
+
+def _attach_evidence_sources(
+    answer: str,
+    evidence_items: list[dict[str, Any]],
+) -> str:
+    """Replace model-authored source listings with deterministic evidence labels."""
+    body_lines: list[str] = []
+    in_source_listing = False
+    for line in str(answer or "").replace("\\n", "\n").splitlines():
+        normalized = line.strip()
+        if _SOURCE_HEADING.fullmatch(normalized):
+            in_source_listing = True
+            continue
+        if in_source_listing:
+            if not normalized or _SOURCE_BULLET.match(normalized):
+                continue
+            # Non-list content after the source block is retained and therefore
+            # remains subject to NLI instead of bypassing verification.
+            in_source_listing = False
+        body_lines.append(line)
+
+    body = "\n".join(body_lines).strip()
+    sources = _evidence_source_labels(evidence_items)
+    if sources:
+        return "\n".join(
+            [body, "", "资料来源：", *[f"- {source}" for source in sources]]
+        ).strip()
+    return body
 
 
 def build_fallback_answer(
@@ -184,17 +261,38 @@ def generate_answer_once(
 
 
 def _split_sentences(answer: str) -> list[str]:
-    """Split answer text into sentence-like units."""
-    parts = re.split(r"(?<=[。！？!?；;])\s*", answer)
-    return [part.strip() for part in parts if part.strip()]
+    """Extract factual claim units, excluding headings and source listings."""
+    claims: list[str] = []
+    in_source_listing = False
+    for line in answer.replace("\\n", "\n").splitlines():
+        normalized = line.strip()
+        if _SOURCE_HEADING.fullmatch(normalized):
+            in_source_listing = True
+            continue
+        if in_source_listing:
+            if not normalized or _SOURCE_BULLET.match(normalized):
+                continue
+            in_source_listing = False
+        normalized = re.sub(r"^(?:[-*•]|\d+[.)、])\s*", "", normalized)
+        if not normalized or normalized in {"核心内容：", "教学要点：", "课程概览："}:
+            continue
+        for part in re.split(r"(?<=[。！？!?；;])\s*", normalized):
+            claim = part.strip()
+            if claim and claim not in {"核心内容：", "教学要点：", "课程概览："}:
+                claims.append(claim)
+    return claims
 
 
-def _classify_verdict(entailment_ratio: float, contradiction_count: int, total: int) -> dict[str, Any]:
+def _classify_verdict(
+    entailment_ratio: float,
+    contradiction_count: int,
+    total: int,
+    threshold: float,
+) -> dict[str, Any]:
     """Classify the overall verification result with graded severity."""
     if total == 0:
         return {"verified": False, "level": "empty", "reason": "No sentences to verify."}
 
-    threshold = config.nli_entailment_threshold
     has_contradiction = contradiction_count > 0
 
     if entailment_ratio >= threshold and not has_contradiction:
@@ -243,7 +341,7 @@ def _run_single_nli(sentence: str, context: str, nli_client: Any, judge_model: s
             temperature=0.0,
             max_output_tokens=120,
         )
-    except (ValueError, JSONDecodeError):
+    except Exception:
         return {
             "sentence": sentence,
             "label": "Unknown",
@@ -251,8 +349,17 @@ def _run_single_nli(sentence: str, context: str, nli_client: Any, judge_model: s
             "is_unknown": True,
         }
 
-    label = str(result.get("label", "Neutral"))
-    score = float(result.get("score", 0.0))
+    raw_label = str(result.get("label", "Unknown")).strip().casefold()
+    labels = {
+        "entailment": "Entailment",
+        "neutral": "Neutral",
+        "contradiction": "Contradiction",
+    }
+    label = labels.get(raw_label, "Unknown")
+    try:
+        score = max(0.0, min(1.0, float(result.get("score", 0.0))))
+    except (TypeError, ValueError):
+        score = 0.0
     return {
         "sentence": sentence,
         "label": label,
@@ -267,7 +374,7 @@ def verify_answer_with_nli(
     nli_model: Any,
     *,
     threshold: float | None = None,
-) -> tuple[bool, list[dict[str, str]]]:
+) -> tuple[bool, list[dict[str, Any]]]:
     """Check whether answer sentences are supported by context.
 
     Uses proportion-based verification: an answer passes when
@@ -276,12 +383,14 @@ def verify_answer_with_nli(
     count as non-entailed.
     """
     threshold = threshold if threshold is not None else config.nli_entailment_threshold
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0 and 1")
     sentences = _split_sentences(answer)
     if not sentences:
         return False, []
 
     judge_model = config.judge_model
-    details: list[dict[str, str]] = []
+    details: list[dict[str, Any]] = []
     entailed_count = 0
     contradiction_count = 0
     total = 0
@@ -290,20 +399,173 @@ def verify_answer_with_nli(
         result = _run_single_nli(sentence, context, nli_model, judge_model)
         total += 1
         label = result["label"]
-        if "entail" in label.lower():
+        if label == "Entailment":
             entailed_count += 1
-        elif "contradict" in label.lower():
+        elif label == "Contradiction":
             contradiction_count += 1
 
         details.append({
             "sentence": sentence,
             "label": label,
-            "score": f"{result['score']:.4f}",
+            "score": round(float(result["score"]), 4),
         })
 
     entailment_ratio = entailed_count / total if total > 0 else 0.0
-    verdict = _classify_verdict(entailment_ratio, contradiction_count, total)
+    verdict = _classify_verdict(
+        entailment_ratio,
+        contradiction_count,
+        total,
+        threshold,
+    )
     return verdict["verified"], details
+
+
+def _rewrite_answer(
+    query: str,
+    answer: str,
+    evidence_items: list[dict[str, Any]],
+    details: list[dict[str, Any]],
+    llm_client: Any,
+    persona: Persona,
+) -> str:
+    unsupported = [
+        item["sentence"]
+        for item in details
+        if item.get("label") != "Entailment"
+    ]
+    profile = PERSONA_PROFILES[persona]
+    prompt = (
+        "你是课程知识库问答助手。上一版回答包含证据不足或冲突的句子。"
+        "请完全重写回答，只保留能由证据直接支持的事实；无法确认的内容不要猜测。\n"
+        f"{profile['prompt']}\n"
+        "回答仍需包含直接回答、核心内容和资料来源，但不得输出校验过程或JSON。\n"
+        f"问题：{query}\n"
+        f"上一版回答：{answer}\n"
+        f"未通过句子：{unsupported}\n\n"
+        f"{_format_evidence_for_prompt(evidence_items)}"
+    )
+    rewritten = generate_text(
+        llm_client,
+        config.text_model,
+        prompt,
+        temperature=0.0,
+        max_output_tokens=512,
+    )
+    if not rewritten or not rewritten.strip():
+        raise ValueError("answer rewrite returned empty content")
+    return rewritten.strip()
+
+
+def _retain_entailed_claims(
+    details: list[dict[str, Any]],
+    evidence_items: list[dict[str, Any]],
+    persona: Persona,
+) -> str | None:
+    if any(item.get("label") == "Contradiction" for item in details):
+        return None
+    claims = [
+        str(item.get("sentence", "")).strip()
+        for item in details
+        if item.get("label") == "Entailment" and str(item.get("sentence", "")).strip()
+    ]
+    if not claims:
+        return None
+    lines = [
+        "根据现有课程资料，可确认以下信息：",
+        "",
+        PERSONA_PROFILES[persona]["fallback_heading"],
+        *[f"- {claim}" for claim in claims],
+    ]
+    return _attach_evidence_sources("\n".join(lines), evidence_items)
+
+
+def generate_answer_with_verification(
+    query: str,
+    evidence_items: list[dict[str, Any]],
+    llm_client: Any = None,
+    persona: Persona = DEFAULT_PERSONA,
+) -> tuple[str, dict[str, Any]]:
+    """Generate, verify, rewrite, and if necessary prune or refuse an answer."""
+    evidence_items = select_generation_evidence(evidence_items)
+    answer = generate_answer_once(query, evidence_items, llm_client, persona)
+    if llm_client is not None:
+        answer = _attach_evidence_sources(answer, evidence_items)
+    if llm_client is None or not config.nli_verification_enabled:
+        return answer, {
+            "nli_verified": None,
+            "nli_status": "skipped",
+            "nli_details": [],
+            "nli_attempts": 0,
+            "nli_verification_target": "returned_answer",
+        }
+
+    context = _format_evidence_for_prompt(evidence_items)
+    max_retries = max(0, config.nli_max_retries)
+    details: list[dict[str, Any]] = []
+    for attempt in range(max_retries + 1):
+        verified, raw_details = verify_answer_with_nli(answer, context, llm_client)
+        details = [{**item, "attempt": attempt + 1} for item in raw_details]
+        all_claims_supported = bool(details) and all(
+            item.get("label") == "Entailment" for item in details
+        )
+        if verified and all_claims_supported:
+            return answer, {
+                "nli_verified": True,
+                "nli_status": "passed" if attempt == 0 else "rewritten",
+                "nli_details": details,
+                "nli_attempts": attempt + 1,
+                "nli_verification_target": "returned_answer",
+            }
+        if attempt < max_retries:
+            if details and all(item.get("label") == "Unknown" for item in details):
+                # Retry the judge once without asking the generator to rewrite
+                # content for which no usable verdict exists.
+                continue
+            try:
+                answer = _rewrite_answer(
+                    query,
+                    answer,
+                    evidence_items,
+                    details,
+                    llm_client,
+                    persona,
+                )
+                answer = _attach_evidence_sources(answer, evidence_items)
+            except Exception:
+                return get_fallback_response()["answer"], {
+                    "nli_verified": False,
+                    "nli_status": "unavailable",
+                    "nli_details": details,
+                    "nli_attempts": attempt + 1,
+                    "nli_verification_target": "discarded_generated_answer",
+                    "status": "fallback",
+                    "error_code": "NLI_REWRITE_FAILED",
+                }
+
+    retained = _retain_entailed_claims(details, evidence_items, persona)
+    if retained is not None:
+        return retained, {
+            "nli_verified": True,
+            "nli_status": "pruned",
+            "nli_details": details,
+            "nli_attempts": max_retries + 1,
+            "nli_verification_target": "retained_claims",
+            "status": "degraded",
+            "error_code": "NLI_UNSUPPORTED_CLAIMS_REMOVED",
+        }
+
+    unavailable = bool(details) and all(
+        item.get("label") == "Unknown" for item in details
+    )
+    return get_fallback_response()["answer"], {
+        "nli_verified": False,
+        "nli_status": "unavailable" if unavailable else "refused",
+        "nli_details": details,
+        "nli_attempts": max_retries + 1,
+        "nli_verification_target": "discarded_generated_answer",
+        "status": "fallback",
+        "error_code": "NLI_UNAVAILABLE" if unavailable else "NLI_VERIFICATION_FAILED",
+    }
 
 
 def get_fallback_response() -> dict[str, Any]:
