@@ -4,6 +4,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from src.online_service.query_router import QueryRouter
 
 
@@ -140,7 +142,10 @@ def test_quality_course_content() -> None:
     _assert_clean_answer(result.answer)
 
 
-def test_quality_training_plan_catalog() -> None:
+def test_quality_training_plan_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Program names are learned from the plans themselves; "信管" is campus
+    # slang that appears in no plan title, so it is deployment configuration.
+    monkeypatch.setenv("PROGRAM_ALIASES", "信管=信息管理与信息系统")
     router = QueryRouter(vector_retriever=RegressionRetriever())
     router.courses = [
         {

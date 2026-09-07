@@ -59,7 +59,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./data:/app/data:ro
+      - corpus_data:/app/data
       - ./outputs:/app/outputs
       - model_cache:/models
     depends_on:
@@ -81,7 +81,7 @@ services:
       CHROMA_PORT: "8000"
       NEO4J_URI: bolt://neo4j:7687
     volumes:
-      - ./data:/app/data:ro
+      - corpus_data:/app/data
       - ./outputs:/app/outputs
       - model_cache:/models
     depends_on:
@@ -95,3 +95,6 @@ volumes:
   chroma_data:
   neo4j_data:
   model_cache:
+  # The corpus is imported at runtime (POST /admin/data/import) rather than
+  # shipped with the image, so it lives in a volume, not the build context.
+  corpus_data:

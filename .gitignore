@@ -10,6 +10,12 @@ __pycache__/
 .env.local
 .env.production
 
+# 语料：教学大纲与培养方案不进仓库
+# 含任课教师姓名等个人信息，且属院系资产；用 /admin/data/import 接口导入，
+# 或直接放进 data/ 后跑一次 run_pipeline.py
+data/*
+!data/README.md
+
 # 运行时产物
 outputs/*.jsonl
 outputs/*.json

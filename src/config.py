@@ -191,6 +191,36 @@ class Config:
     def eval_report_dir(self) -> Path:
         return _path(os.getenv("EVAL_REPORT_DIR", "eval/reports"))
 
+    # -- Admin surface -------------------------------------------------------
+    @property
+    def admin_token(self) -> str:
+        """Bearer token for the data-import endpoints; empty disables them.
+
+        The import endpoints write files to disk and can start a reindex, so
+        an unset token means "off", never "open".
+        """
+        return os.getenv("ADMIN_TOKEN", "").strip()
+
+    @property
+    def import_max_bytes(self) -> int:
+        return max(1, int(os.getenv("IMPORT_MAX_BYTES", str(20 * 1024 * 1024))))
+
+    # -- Training plans ------------------------------------------------------
+    @property
+    def program_aliases(self) -> dict[str, str]:
+        """Colloquial program names, e.g. ``PROGRAM_ALIASES=信管=信息管理与信息系统``.
+
+        Program names themselves are derived from the parsed plans; only the
+        campus slang that never appears in a plan title needs configuring, and
+        it differs per school, so it does not belong in code.
+        """
+        pairs: dict[str, str] = {}
+        for item in os.getenv("PROGRAM_ALIASES", "").split(","):
+            alias, separator, target = item.partition("=")
+            if separator and alias.strip() and target.strip():
+                pairs[alias.strip()] = target.strip()
+        return pairs
+
     # -- Retrieval reranking -------------------------------------------------
     # Weights are read from the environment so that the grid search in
     # ``eval/tune_rerank.py`` can sweep them without editing code.  The

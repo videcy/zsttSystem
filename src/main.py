@@ -15,15 +15,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +43,7 @@ from src.online_service.course_dependency_service import (
     CourseDependencyNotFoundError,
     get_course_dependency_subgraph,
 )
+from src.online_service.data_import import ImportRejected, inventory, store_upload
 from src.online_service.query_router import QueryRouter
 from src.online_service.chroma_retriever import ChromaRetriever
 from src.utils.deepseek_client import create_deepseek_client
@@ -168,8 +171,12 @@ if config.api_cors_origins:
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-RATE_LIMITED_PATHS = ("/query", "/dependency")
+RATE_LIMITED_PATHS = ("/query", "/dependency", "/admin")
 _REQUEST_TIMES: dict[str, deque[float]] = defaultdict(deque)
+
+# One reindex at a time, tracked in-process; a restart forgets it, which is
+# the honest behaviour for a job whose output lives in Chroma anyway.
+_REINDEX_STATE: dict[str, Any] = {"status": "idle"}
 
 
 @app.middleware("http")
@@ -372,6 +379,158 @@ async def handle_feedback(feedback: FeedbackRequest) -> dict[str, Any]:
 
     await _log_feedback(query_id, feedback.is_helpful, feedback.comment)
     return {"status": "logged", "query_id": query_id}
+
+
+# ---------------------------------------------------------------------------
+# Data import (admin)
+# ---------------------------------------------------------------------------
+
+def _require_admin(request: Request) -> None:
+    """Gate the endpoints that write to disk or start a reindex.
+
+    No token configured means the whole admin surface is off.  Defaulting to
+    "open" would hand anyone who finds the host a file-upload endpoint.
+    """
+    token = config.admin_token
+    if not token:
+        raise HTTPException(
+            status_code=503,
+            detail="数据导入接口未启用：请先设置 ADMIN_TOKEN",
+        )
+    scheme, _, presented = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(
+        presented.strip(),
+        token,
+    ):
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+
+@app.get("/admin/data")
+async def list_data(fastapi_request: Request) -> dict[str, Any]:
+    """Report what the pipeline would parse right now."""
+    _require_admin(fastapi_request)
+    return await asyncio.to_thread(
+        inventory,
+        syllabus_dir=config.syllabus_dir,
+        training_plan_dir=config.training_plan_dir,
+    )
+
+
+@app.post("/admin/data/import")
+async def import_data(
+    fastapi_request: Request,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    """Store uploaded .docx syllabi and .xlsx training plans.
+
+    Rejections are per file and reported rather than raised, so a batch with
+    one bad file still imports the rest.
+    """
+    _require_admin(fastapi_request)
+    stored: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    for upload in files:
+        payload = await upload.read()
+        try:
+            record = await asyncio.to_thread(
+                store_upload,
+                upload.filename or "",
+                payload,
+                syllabus_dir=config.syllabus_dir,
+                training_plan_dir=config.training_plan_dir,
+                max_bytes=config.import_max_bytes,
+            )
+        except ImportRejected as exc:
+            rejected.append(
+                {"filename": upload.filename or "", "reason": str(exc)}
+            )
+            continue
+        stored.append(record.as_dict())
+
+    return {
+        "stored": stored,
+        "rejected": rejected,
+        "next": "POST /admin/data/reindex 使导入生效",
+    }
+
+
+@app.get("/admin/data/reindex")
+async def reindex_status(fastapi_request: Request) -> dict[str, Any]:
+    """Current state of the one reindex job this process tracks."""
+    _require_admin(fastapi_request)
+    return dict(_REINDEX_STATE)
+
+
+@app.post("/admin/data/reindex", status_code=202)
+async def start_reindex(
+    fastapi_request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict[str, Any]:
+    """Re-parse the data directory and rebuild the vector index.
+
+    Runs in the background: a full rebuild takes minutes and would otherwise
+    hold the request open past every sensible client timeout.
+    """
+    _require_admin(fastapi_request)
+    if _REINDEX_STATE.get("status") == "running":
+        raise HTTPException(status_code=409, detail="reindex already running")
+
+    _REINDEX_STATE.update(
+        status="running",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        finished_at=None,
+        detail="",
+        stages=[],
+    )
+    background_tasks.add_task(_run_reindex, fastapi_request.app)
+    return dict(_REINDEX_STATE)
+
+
+def _run_reindex(app: FastAPI) -> None:
+    """Parse + embed, then swap the freshly built index into the live app.
+
+    Rebuilding replaces the Chroma collection, which invalidates the handle
+    the running retriever holds -- without the swap the service would answer
+    from a deleted collection until someone restarted it.
+    """
+    # Imported here: the pipeline pulls in the parsing stack, which the API
+    # does not otherwise need at startup.
+    from run_pipeline import run_embed_stage, run_parse_stage
+
+    stages: list[str] = []
+    try:
+        run_parse_stage(incremental=True)
+        stages.append("parse")
+        run_embed_stage()
+        stages.append("embed")
+
+        retrieval_model = (
+            config.local_embedding_model
+            if config.embedding_provider == "local"
+            else "hash"
+        )
+        retriever = ChromaRetriever(retrieval_model)
+        router: QueryRouter = app.state.router
+        app.state.vector_retriever = retriever
+        router.vector_retriever = retriever
+        if config.courses_output_path.exists():
+            router.courses = json.loads(
+                config.courses_output_path.read_text(encoding="utf-8")
+            )
+        stages.append("reload")
+        _REINDEX_STATE.update(
+            status="succeeded",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            detail=f"索引重建完成，共 {retriever.count} 个片段",
+            stages=stages,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported through the status endpoint
+        _REINDEX_STATE.update(
+            status="failed",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            detail=f"{type(exc).__name__}: {exc}",
+            stages=stages,
+        )
 
 
 # ---------------------------------------------------------------------------

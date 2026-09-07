@@ -19,6 +19,7 @@ from typing import Any, Optional
 from src.config import config
 from src.online_service.chroma_retriever import ChromaRetriever
 from src.utils.lexical import term_set
+from src.online_service.program_index import ProgramIndex
 from src.online_service.persona import (
     DEFAULT_PERSONA,
     PERSONA_MODE,
@@ -169,6 +170,11 @@ class RouteResult:
 
 class QueryRouter:
     """Intent classifier + dispatcher for the zsttSystem query pipeline."""
+
+    # Class-level defaults so that a bare ``__new__`` router still resolves
+    # programs; the index is rebuilt whenever ``courses`` is replaced.
+    _program_index: ProgramIndex | None = None
+    _program_courses: Any = None
 
     def __init__(self, vector_retriever: ChromaRetriever | None = None):
         self.vector_retriever = vector_retriever or ChromaRetriever()
@@ -512,27 +518,20 @@ class QueryRouter:
         matches = [c for c in self.courses if str(c.get("course_code", "")).lower() in lowered or str(c.get("course_name", "")) in query]
         return max(matches, key=lambda c: len(str(c.get("course_name", "")))) if matches else None
 
-    @staticmethod
-    def _program_keyword(query: str) -> str:
-        if "信管" in query:
-            return "信息管理与信息系统"
-        for keyword in (
-            "信息管理与信息系统",
-            "图书情报与档案管理类",
-            "图书馆学",
-            "档案学",
-        ):
-            if keyword in query:
-                return keyword
-        return ""
+    @property
+    def program_index(self) -> ProgramIndex:
+        """Program vocabulary derived from the loaded catalogue.
 
-    @staticmethod
-    def _program_type_matches(program_type: str, query: str) -> bool:
-        if "辅修微专业" in query or "微专业" in query:
-            return program_type == "辅修微专业"
-        if "辅修" in query:
-            return program_type in {"辅修专业", "辅修微专业"}
-        return program_type in {"主修专业", "主修专业类"}
+        Rebuilt when ``courses`` is replaced, which the tests do after
+        constructing a router.
+        """
+        if self._program_index is None or self._program_courses is not self.courses:
+            self._program_index = ProgramIndex(
+                self.courses,
+                aliases=config.program_aliases,
+            )
+            self._program_courses = self.courses
+        return self._program_index
 
     def _select_offering(
         self,
@@ -542,20 +541,22 @@ class QueryRouter:
         offerings = list(course.get("offerings") or [])
         if not offerings:
             return None
-        program_keyword = self._program_keyword(query)
-        matches = [
+        index = self.program_index
+        program_keyword = index.match_keyword(query)
+        candidates = [
             offering
             for offering in offerings
-            if (
-                not program_keyword
-                or program_keyword in str(offering.get("program_name", ""))
-            )
-            and self._program_type_matches(
-                str(offering.get("program_type", "")),
-                query,
-            )
+            if not program_keyword
+            or program_keyword in str(offering.get("program_name", ""))
+        ] or offerings
+        program_type = index.match_type(query, candidates)
+        matches = [
+            offering
+            for offering in candidates
+            if not program_type
+            or str(offering.get("program_type", "")) == program_type
         ]
-        return (matches or offerings)[0]
+        return (matches or candidates)[0]
 
     @staticmethod
     def _catalog_citation(
@@ -585,8 +586,8 @@ class QueryRouter:
 
     def _catalog_matches(
         self,
-        query: str,
         program_keyword: str,
+        program_type: str,
         accepted_categories: tuple[str, ...],
     ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         """Offerings of one program whose category matches the question."""
@@ -602,9 +603,9 @@ class QueryRouter:
                 )
                 if program_keyword and program_keyword not in program_name:
                     continue
-                if not self._program_type_matches(
-                    str(offering.get("program_type", "")),
-                    query,
+                if (
+                    program_type
+                    and str(offering.get("program_type", "")) != program_type
                 ):
                     continue
                 if accepted_categories and not any(
@@ -616,7 +617,21 @@ class QueryRouter:
         return matches
 
     def _handle_catalog(self, query: str) -> RouteResult:
-        program_keyword = self._program_keyword(query)
+        index = self.program_index
+        program_keyword = index.match_keyword(query)
+        # Resolve the plan type once against every offering of that program:
+        # an unqualified question means the main plan, and the main plan is
+        # whichever type carries the most courses.
+        program_type = index.match_type(
+            query,
+            [
+                offering
+                for course in self.courses
+                for offering in course.get("offerings") or []
+                if not program_keyword
+                or program_keyword in str(offering.get("program_name", ""))
+            ],
+        )
         category_keyword = (
             "核心"
             if "核心" in query
@@ -629,11 +644,15 @@ class QueryRouter:
             else ""
         )
         accepted_categories = (category_keyword,) if category_keyword else ()
-        matches = self._catalog_matches(query, program_keyword, accepted_categories)
+        matches = self._catalog_matches(
+            program_keyword,
+            program_type,
+            accepted_categories,
+        )
         for fallback in self._CATEGORY_FALLBACKS.get(category_keyword, ()):
             if matches:
                 break
-            matches = self._catalog_matches(query, program_keyword, fallback)
+            matches = self._catalog_matches(program_keyword, program_type, fallback)
 
         if not matches:
             return RouteResult(

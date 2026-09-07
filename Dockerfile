@@ -24,7 +24,7 @@ COPY eval ./eval
 COPY run_pipeline.py ./
 
 RUN useradd --create-home --uid 10001 zstt \
-    && mkdir -p /app/outputs /models \
+    && mkdir -p /app/outputs /app/data/syllabi /app/data/training_plans /models \
     && chown -R zstt:zstt /app /models
 USER zstt
 

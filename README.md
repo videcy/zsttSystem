@@ -257,6 +257,34 @@ VECTOR_DB_PATH=chroma_data
 演示页使用项目内固定的 Mermaid 11.16.0 渲染课程依赖图，配置
 `securityLevel: "strict"`，不依赖公共 CDN。图形失败时仍保留课程边列表。
 
+## 导入语料
+
+`data/` 不再随仓库分发（含任课教师姓名等信息）。放语料有两种方式，详见
+[`data/README.md`](data/README.md)：直接拷进 `data/` 后跑流水线，或用导入接口。
+
+导入接口默认**关闭**，设置 `ADMIN_TOKEN` 后才启用，用 Bearer token 调用：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/admin/data` | 当前语料清单 |
+| POST | `/admin/data/import` | 上传 .docx / .xlsx（multipart，字段名 `files`） |
+| POST | `/admin/data/reindex` | 后台重新解析并重建向量索引，立即返回 202 |
+| GET | `/admin/data/reindex` | 查看重建进度 |
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/data/import -H "Authorization: Bearer $ADMIN_TOKEN" -F "files=@IM104档案学概论.docx"
+curl -X POST http://127.0.0.1:8000/admin/data/reindex -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+重建成功后会把新索引热替换进正在运行的服务，不需要重启。
+
+专业名与方案类型从解析结果里自动学习，代码中没有任何学校/专业名硬编码；
+只有口语缩写需要配置：
+
+```dotenv
+PROGRAM_ALIASES=信管=信息管理与信息系统
+```
+
 ## 查询路由
 
 - `fact`：优先匹配培养方案中的课程结构化信息，可在一个问题中同时回答
