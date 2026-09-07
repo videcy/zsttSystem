@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from src.data_processing.parser_chunker import SyllabusChunker
 from src.data_processing.graph_builder import build_graph_records, neo4j_properties
@@ -163,9 +164,18 @@ def test_nested_course_memberships_are_neo4j_compatible() -> None:
 
 
 def test_im399_syllabus_is_split_into_objectives_and_schedule_rows() -> None:
+    """Regression against a real syllabus, not a synthesised one.
+
+    The corpus is no longer part of the repository (see ``data/README.md``),
+    so a checkout without imported teaching materials skips this instead of
+    failing: the point of the test is what a genuine document looks like, and
+    fabricating one here would only re-test the fixture.
+    """
     project_root = Path(__file__).resolve().parents[1]
     syllabus_root = project_root / "data" / "syllabi"
-    syllabus_path = next(syllabus_root.rglob("IM399*.docx"))
+    syllabus_path = next(syllabus_root.rglob("IM399*.docx"), None)
+    if syllabus_path is None:
+        pytest.skip("data/syllabi 下没有 IM399 教学大纲，先导入语料再跑这条")
     chunker = SyllabusChunker()
     catalog = {
         "IM399": {
