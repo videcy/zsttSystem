@@ -397,6 +397,42 @@
                 display: grid;
                 gap: 10px;
             }
+            .feedback {
+                margin-top: 16px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                flex-wrap: wrap;
+            }
+            .feedback-title {
+                color: var(--text-secondary);
+                font-size: 14px;
+                font-weight: 600;
+            }
+            .feedback-btn {
+                padding: 6px 14px;
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                background: var(--primary-light);
+                color: var(--text);
+                font-size: 14px;
+                cursor: pointer;
+                transition: border-color 0.2s, transform 0.1s;
+            }
+            .feedback-btn:hover:not(:disabled) {
+                border-color: var(--primary);
+            }
+            .feedback-btn:active:not(:disabled) {
+                transform: translateY(1px);
+            }
+            .feedback-btn:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            .feedback-note {
+                color: var(--text-secondary);
+                font-size: 13px;
+            }
             .citation-card {
                 padding: 12px 14px;
                 border: 1px solid var(--border);
@@ -592,6 +628,12 @@
                         <div class="citations-title">参考来源</div>
                         <div class="citation-list" id="citation-list"></div>
                     </section>
+                    <section class="feedback" id="feedback" hidden>
+                        <span class="feedback-title">这个回答有用吗？</span>
+                        <button type="button" class="feedback-btn" id="feedback-yes">有用</button>
+                        <button type="button" class="feedback-btn" id="feedback-no">没用</button>
+                        <span class="feedback-note" id="feedback-note"></span>
+                    </section>
                     <section class="dependency-panel" id="dependency-panel" hidden>
                         <div class="dependency-title">课程先修关系与选课路径</div>
                         <div class="dependency-controls">
@@ -643,6 +685,10 @@
             const result = document.getElementById("result");
             const citations = document.getElementById("citations");
             const citationList = document.getElementById("citation-list");
+            const feedback = document.getElementById("feedback");
+            const feedbackYes = document.getElementById("feedback-yes");
+            const feedbackNo = document.getElementById("feedback-no");
+            const feedbackNote = document.getElementById("feedback-note");
             const debugDetails = document.getElementById("debug-details");
             const debugContent = document.getElementById("debug-content");
             const dependencyPanel = document.getElementById("dependency-panel");
@@ -936,6 +982,62 @@
                 refreshDependencyInfo,
             );
 
+            // 反馈闭环的入口：这里记下的 query_id 会被
+            // maintenance/active_learning_sampler.py 挑成待人工复核的样本。
+            let feedbackQueryId = null;
+
+            function hideFeedback() {
+                feedbackQueryId = null;
+                feedback.hidden = true;
+                feedbackNote.textContent = "";
+            }
+
+            function showFeedback(queryId) {
+                if (!queryId) {
+                    hideFeedback();
+                    return;
+                }
+                feedbackQueryId = queryId;
+                feedbackYes.disabled = false;
+                feedbackNo.disabled = false;
+                feedbackNote.textContent = "";
+                feedback.hidden = false;
+            }
+
+            async function sendFeedback(isHelpful) {
+                if (!feedbackQueryId) {
+                    return;
+                }
+                feedbackYes.disabled = true;
+                feedbackNo.disabled = true;
+                feedbackNote.textContent = "正在记录...";
+                try {
+                    const response = await fetch("/feedback", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            query_id: feedbackQueryId,
+                            is_helpful: isHelpful,
+                        })
+                    });
+                    if (!response.ok) {
+                        const data = await response.json();
+                        throw new Error(data.detail || "提交失败");
+                    }
+                    feedbackNote.textContent = isHelpful
+                        ? "已记录，谢谢反馈"
+                        : "已记录，这条问答会进入人工复核";
+                } catch (error) {
+                    // 失败时放开按钮：反馈丢了没人知道，比按钮卡住更糟。
+                    feedbackYes.disabled = false;
+                    feedbackNo.disabled = false;
+                    feedbackNote.textContent = "反馈提交失败：" + String(error);
+                }
+            }
+
+            feedbackYes.addEventListener("click", () => sendFeedback(true));
+            feedbackNo.addEventListener("click", () => sendFeedback(false));
+
             submit.addEventListener("click", async () => {
                 const query = queryInput.value.trim();
                 if (!query) {
@@ -950,6 +1052,7 @@
                 updateStatus("正在查询...", "querying");
                 result.textContent = "正在思考中，请稍候...";
                 result.classList.remove("empty");
+                hideFeedback();
                 citations.hidden = true;
                 debugDetails.hidden = true;
                 dependencyPanel.hidden = true;
@@ -969,6 +1072,7 @@
                     }
 
                     result.textContent = data.answer || "当前没有可展示的答案。";
+                    showFeedback(data.query_id);
                     renderCitations(data.citations);
                     await renderDependencyInfo(data.dependency_info);
                     renderDebug(data);
@@ -979,6 +1083,7 @@
                 } catch (error) {
                     updateStatus("查询失败", "failed");
                     result.textContent = "错误: " + String(error);
+                    hideFeedback();
                     citations.hidden = true;
                     debugDetails.hidden = true;
                     dependencyPanel.hidden = true;

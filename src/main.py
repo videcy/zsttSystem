@@ -171,7 +171,9 @@ if config.api_cors_origins:
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-RATE_LIMITED_PATHS = ("/query", "/dependency", "/admin")
+# /feedback appends a line per request and is now reachable from the demo
+# page by every visitor, so it is throttled alongside the LLM endpoints.
+RATE_LIMITED_PATHS = ("/query", "/dependency", "/admin", "/feedback")
 _REQUEST_TIMES: dict[str, deque[float]] = defaultdict(deque)
 
 # One reindex at a time, tracked in-process; a restart forgets it, which is

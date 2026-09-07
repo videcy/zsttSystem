@@ -274,3 +274,20 @@ def test_quality_page_never_renders_raw_payload() -> None:
     assert 'lines.join("\\\\n")' not in template
     assert "item.chunk_id" not in template
     assert "item.score" not in template
+
+
+def test_demo_page_exposes_the_feedback_loop() -> None:
+    """The feedback pipeline is only demonstrable if the page can trigger it."""
+    template = (
+        Path(__file__).resolve().parents[1] / "src" / "templates" / "demo.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="feedback-yes"' in template and 'id="feedback-no"' in template
+    assert 'fetch("/feedback"' in template
+    # The verdict must be tied to the answer it judges.
+    assert "query_id: feedbackQueryId" in template
+    assert "is_helpful: isHelpful" in template
+    # Hidden until an answer exists, and reset before each new query.
+    assert 'id="feedback" hidden' in template
+    assert "showFeedback(data.query_id)" in template
+    assert "hideFeedback()" in template

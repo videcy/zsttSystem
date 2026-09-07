@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -128,3 +129,26 @@ def test_course_graph_ignores_the_legacy_concepts_projection(
 
     assert [node["label"] for node in graph["nodes"]] == ["Course"]
     assert graph["summary"]["concepts_available"] is False
+
+
+def test_feedback_endpoint_records_the_verdict(
+    client: TestClient,
+    tmp_path,
+) -> None:
+    """The demo page's 有用/没用 buttons land in the review log."""
+    response = client.post(
+        "/feedback",
+        json={"query_id": "query-1", "is_helpful": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "logged", "query_id": "query-1"}
+    record = json.loads((tmp_path / "feedback.jsonl").read_text(encoding="utf-8"))
+    assert record["query_id"] == "query-1"
+    assert record["is_helpful"] is False
+
+
+def test_feedback_rejects_an_empty_query_id(client: TestClient) -> None:
+    response = client.post("/feedback", json={"query_id": "  ", "is_helpful": True})
+
+    assert response.status_code == 400
