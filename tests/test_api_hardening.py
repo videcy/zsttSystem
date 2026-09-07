@@ -88,3 +88,43 @@ def test_unlimited_paths_are_not_throttled(
     )
 
     assert all(client.get("/health").status_code == 200 for _ in range(5))
+
+
+def test_course_graph_ignores_the_legacy_concepts_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A stale outputs/concepts.json must not be served as a knowledge graph."""
+    from src.config import config
+
+    courses = tmp_path / "courses.json"
+    courses.write_text(
+        '[{"course_code": "IM121", "course_name": "信息管理学基础"}]',
+        encoding="utf-8",
+    )
+    chunks = tmp_path / "chunks.json"
+    chunks.write_text("[]", encoding="utf-8")
+    # The legacy projection sits next to the (absent) registry and holds the
+    # rule extractor's noise.
+    legacy = tmp_path / "concepts.json"
+    legacy.write_text(
+        '[{"id": "c1", "name": "中山大学", "course_code": "IM121"}]',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        type(config), "courses_output_path", property(lambda _s: courses)
+    )
+    monkeypatch.setattr(
+        type(config), "chunks_output_path", property(lambda _s: chunks)
+    )
+    monkeypatch.setattr(
+        type(config),
+        "concept_registry_path",
+        property(lambda _s: tmp_path / "concept_registry.json"),
+    )
+
+    graph = main_module._build_course_graph("IM121")
+
+    assert [node["label"] for node in graph["nodes"]] == ["Course"]
+    assert graph["summary"]["concepts_available"] is False

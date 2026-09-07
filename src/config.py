@@ -37,10 +37,6 @@ class Config:
         return os.getenv("TEXT_MODEL", "deepseek-v4-flash").strip()
 
     @property
-    def rerank_model(self) -> str:
-        return os.getenv("RERANK_MODEL", self.text_model).strip()
-
-    @property
     def judge_model(self) -> str:
         return os.getenv("JUDGE_MODEL", self.text_model).strip()
 
@@ -138,10 +134,6 @@ class Config:
     @property
     def chunks_output_path(self) -> Path:
         return _path(os.getenv("CHUNKS_OUTPUT_PATH", "outputs/chunks.json"))
-
-    @property
-    def concept_cache_path(self) -> Path:
-        return _path(os.getenv("CONCEPT_CACHE_PATH", "outputs/concept_cache.json"))
 
     @property
     def graph_manifest_path(self) -> Path:
@@ -335,14 +327,5 @@ class Config:
     @property
     def nli_max_retries(self) -> int:
         return int(os.getenv("NLI_MAX_RETRIES", "1"))
-
-    # -- OpenSearch / Alternate keys ----------------------------------------
-    @property
-    def openai_api_key(self) -> str:
-        return os.getenv("OPENAI_API_KEY", "").strip()
-
-    @property
-    def openai_base_url(self) -> str:
-        return os.getenv("OPENAI_BASE_URL", "").strip()
 
 config = Config()

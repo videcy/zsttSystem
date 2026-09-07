@@ -485,14 +485,9 @@ def test_course_graph_returns_course_specific_nodes(
     )
     monkeypatch.setenv("COURSES_OUTPUT_PATH", str(courses_path))
     monkeypatch.setenv("CHUNKS_OUTPUT_PATH", str(chunks_path))
-    monkeypatch.setenv(
-        "CONCEPT_CACHE_PATH",
-        str(tmp_path / "concept_cache.json"),
-    )
-    monkeypatch.setenv(
-        "CONCEPT_REGISTRY_PATH",
-        str(tmp_path / "missing_registry.json"),
-    )
+    # Concepts come from the verified registry only; the legacy
+    # outputs/concepts.json projection is no longer consulted.
+    monkeypatch.setenv("CONCEPT_REGISTRY_PATH", str(concepts_path))
 
     payload = main_module._build_course_graph("im001")
 
@@ -503,7 +498,11 @@ def test_course_graph_returns_course_specific_nodes(
         "concept-1",
         "chunk-1",
     }
-    assert payload["summary"] == {"node_count": 4, "edge_count": 3}
+    assert payload["summary"] == {
+        "node_count": 4,
+        "edge_count": 3,
+        "concepts_available": True,
+    }
 
 
 def test_retraining_updates_chunks_and_rebuilds_index(

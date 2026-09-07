@@ -401,14 +401,14 @@ def _find_course(course_code: str) -> dict[str, Any]:
 def _build_course_graph(course_code: str) -> dict[str, Any]:
     course = _find_course(course_code)
     canonical_code = str(course["course_code"])
-    concept_path = (
-        config.concept_registry_path
-        if config.concept_registry_path.exists()
-        else config.concept_cache_path.with_name("concepts.json")
-    )
+    # Only the verified registry counts as concepts.  The old fallback read
+    # outputs/concepts.json, a compatibility projection that can predate the
+    # current extractor -- serving its noise ("中山大学", "课程名称") as a
+    # knowledge graph is worse than serving no concepts at all.
+    concepts_available = config.concept_registry_path.exists()
     concepts = [
         concept
-        for concept in _load_json(concept_path, [])
+        for concept in _load_json(config.concept_registry_path, [])
         if canonical_code.casefold()
         in {
             str(code).casefold()
@@ -499,6 +499,9 @@ def _build_course_graph(course_code: str) -> dict[str, Any]:
         "summary": {
             "node_count": len(nodes),
             "edge_count": len(edges),
+            # Tells a caller apart: a course with no concepts, versus a
+            # concept layer that was never built on this deployment.
+            "concepts_available": concepts_available,
         },
     }
 

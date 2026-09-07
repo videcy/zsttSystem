@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from src.config import config
 from src.online_service.chroma_retriever import ChromaRetriever
+from src.utils.lexical import term_set
 from src.online_service.persona import (
     DEFAULT_PERSONA,
     PERSONA_MODE,
@@ -737,23 +738,13 @@ class QueryRouter:
         )
         return course, hits
 
-    @staticmethod
-    def _evidence_terms(query: str) -> set[str]:
-        chinese = re.sub(r"[^\u4e00-\u9fff]", "", query)
-        terms = {
-            chinese[index : index + 2]
-            for index in range(max(0, len(chinese) - 1))
-        }
-        terms.update(re.findall(r"[a-z][a-z0-9]+", query.lower()))
-        return terms
-
     @classmethod
     def _relevant_excerpt(cls, query: str, text: str, limit: int = 700) -> str:
         """Keep complete, query-relevant passages instead of a fixed prefix."""
         text = text.strip()
         if len(text) <= limit:
             return text
-        terms = cls._evidence_terms(query)
+        terms = term_set(query)
         passages = [
             passage.strip()
             for passage in re.split(r"(?<=[。！？；])|\n+", text)

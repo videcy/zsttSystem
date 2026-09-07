@@ -40,6 +40,9 @@ from src.config import config  # noqa: E402
 from src.data_processing.concept_extractor import extract_course_concepts  # noqa: E402
 
 GOLD_PATH = Path("eval/datasets/concept_gold.json")
+# Both live beside the other pipeline artifacts.
+RULE_CACHE_PATH = config.chunks_output_path.with_name("rule_eval_cache.json")
+LEGACY_PROJECTION_PATH = config.chunks_output_path.with_name("concepts.json")
 _PUNCTUATION = re.compile(r"[\s·、,，。.:：;；()（）《》\"'\-_/]+")
 
 
@@ -85,7 +88,7 @@ def llm_predictions() -> dict[str, list[str]]:
             "the current extractor. Run `python run_pipeline.py concept` for a "
             "valid LLM arm."
         )
-        registry = _load_json(config.concept_cache_path.with_name("concepts.json"), [])
+        registry = _load_json(LEGACY_PROJECTION_PATH, [])
     predictions: dict[str, list[str]] = {}
     for concept in registry:
         name = str(concept.get("canonical_name") or concept.get("name") or "")
@@ -189,7 +192,7 @@ def score_arm(
 def make_template(courses: int, output: Path) -> Path:
     """Emit a gold template pre-filled with both arms' candidates."""
     chunks = syllabus_chunks()
-    rule = rule_predictions(chunks, config.concept_cache_path.with_name("rule_eval_cache.json"))
+    rule = rule_predictions(chunks, RULE_CACHE_PATH)
     llm = llm_predictions()
     codes = sorted(set(rule) | set(llm))[:courses]
     payload: dict[str, Any] = {
@@ -267,7 +270,7 @@ def main() -> None:
     arms = {
         "rule-baseline": rule_predictions(
             chunks,
-            config.concept_cache_path.with_name("rule_eval_cache.json"),
+            RULE_CACHE_PATH,
         ),
         "llm-normalizer": llm_predictions(),
     }

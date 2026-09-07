@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import re
 from functools import lru_cache
 from hashlib import md5
@@ -22,12 +21,13 @@ logger = logging.getLogger(__name__)
 
 def create_deepseek_client() -> OpenAI:
     """Create a DeepSeek client via the OpenAI-compatible interface."""
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
+    if not config.deepseek_api_key:
         raise ValueError("DEEPSEEK_API_KEY is required for DeepSeek API inference.")
 
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
-    return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(
+        api_key=config.deepseek_api_key,
+        base_url=config.deepseek_base_url,
+    )
 
 
 def extract_json_value(text: str) -> Any:
@@ -43,14 +43,6 @@ def extract_json_value(text: str) -> Any:
             continue
 
     raise ValueError("Model output does not contain a JSON object or array.")
-
-
-def extract_json_object(text: str) -> dict[str, Any]:
-    """Extract the first JSON object from model output."""
-    value = extract_json_value(text)
-    if not isinstance(value, dict):
-        raise ValueError("Model output does not contain a JSON object.")
-    return value
 
 
 def _iter_json_candidates(text: str) -> list[str]:
@@ -274,15 +266,13 @@ def embed_texts(
         raise ValueError("batch_size must be greater than 0.")
 
     if max_chars is None:
-        configured = os.getenv("EMBEDDING_MAX_CHARS", "").strip()
-        max_chars = int(configured) if configured else 3000
+        max_chars = config.embedding_max_chars
 
     sanitized = []
     for text in texts:
-        max_chars_val = max_chars if max_chars is not None else config.embedding_max_chars
         value = text if text.strip() else " "
-        if max_chars_val is not None and max_chars_val > 0:
-            value = value[:max_chars_val]
+        if max_chars > 0:
+            value = value[:max_chars]
         sanitized.append(value)
 
     provider = config.embedding_provider
