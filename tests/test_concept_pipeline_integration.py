@@ -378,7 +378,11 @@ def test_low_extraction_coverage_cannot_publish_an_empty_snapshot(
         {"chunk_id": "two", "text": "文本二", "metadata": {}},
     ]
     with (
-        patch.object(normalizer, "extract_core_concepts", return_value=[]),
+        patch.object(
+            normalizer,
+            "_extract_core_concepts_verified",
+            return_value=([], True),
+        ),
         pytest.raises(RuntimeError, match="coverage was too low"),
     ):
         normalizer.preprocess_chunks(chunks)

@@ -231,38 +231,35 @@ class ConceptNormalizer:
 
         extraction_cache = self._load_extraction_cache(extraction_cache_path)
 
-        def extract_chunk(chunk: dict[str, Any]) -> tuple[str, list[dict[str, str]]]:
+        def extract_chunk(
+            chunk: dict[str, Any],
+        ) -> tuple[str, list[dict[str, str]], bool]:
             metadata = chunk.get("metadata", {})
             chunk_text = str(chunk.get("text", "")).strip()
             normalized_metadata = metadata if isinstance(metadata, dict) else {}
             cache_key = self._extraction_cache_key(chunk_text, normalized_metadata)
-            cached = extraction_cache.get(cache_key)
-            cached_is_verified_llm_output = (
-                isinstance(cached, list)
-                and bool(cached)
-                and all(
-                    isinstance(item, dict)
-                    and item.get("extraction_source") == "llm"
-                    for item in cached
-                )
+            cached = self._decode_extraction_cache_entry(
+                extraction_cache.get(cache_key)
             )
-            if isinstance(cached, list) and (
-                self.api_client is None or cached_is_verified_llm_output
-            ):
-                return cache_key, cached
-            concepts = self.extract_core_concepts(
+            if cached is not None:
+                concepts, llm_verified = cached
+                if self.api_client is None or llm_verified:
+                    return cache_key, concepts, llm_verified
+            concepts, llm_verified = self._extract_core_concepts_verified(
                 chunk_text,
                 normalized_metadata,
             )
-            return cache_key, concepts
+            return cache_key, concepts, llm_verified
 
         with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
             # executor.map preserves input order, keeping generated artifacts deterministic.
             extracted_rows = list(executor.map(extract_chunk, chunks))
 
         extracted_by_chunk: list[list[dict[str, str]]] = []
-        for cache_key, concepts in extracted_rows:
-            extraction_cache[cache_key] = concepts
+        for cache_key, concepts, llm_verified in extracted_rows:
+            extraction_cache[cache_key] = self._encode_extraction_cache_entry(
+                concepts, llm_verified
+            )
             extracted_by_chunk.append(concepts)
         if extraction_cache_path is not None:
             self._write_json(extraction_cache_path, extraction_cache)
@@ -318,9 +315,24 @@ class ConceptNormalizer:
         metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
         """Call DeepSeek to extract core concepts from a teaching module chunk."""
+        return self._extract_core_concepts_verified(chunk_text, metadata)[0]
+
+    def _extract_core_concepts_verified(
+        self,
+        chunk_text: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, str]], bool]:
+        """Extract concepts and report whether the result is LLM-verified.
+
+        An empty result is a legitimate outcome, but the list itself cannot
+        carry provenance, so the flag is returned alongside it. Without this the
+        extraction cache cannot tell a verified empty extraction from a miss and
+        re-queries the model for those chunks on every run.
+        """
         normalized_text = str(chunk_text or "").strip()
         if not normalized_text:
-            return []
+            # Deterministic and permanent: no model call could change it.
+            return [], True
 
         metadata = metadata or {}
         prompt = (
@@ -362,17 +374,20 @@ class ConceptNormalizer:
                 action,
                 exc,
             )
-            return self._fallback_or_raise(normalized_text, metadata, exc)
+            return self._fallback_or_raise(normalized_text, metadata, exc), False
 
         if isinstance(response, dict):
             response = response.get("concepts")
         if not isinstance(response, list):
-            return self._fallback_or_raise(
-                normalized_text,
-                metadata,
-                ValueError(
-                    "concept extractor did not return a JSON object with a concepts array"
+            return (
+                self._fallback_or_raise(
+                    normalized_text,
+                    metadata,
+                    ValueError(
+                        "concept extractor did not return a JSON object with a concepts array"
+                    ),
                 ),
+                False,
             )
 
         normalized_concepts: list[dict[str, str]] = []
@@ -393,17 +408,20 @@ class ConceptNormalizer:
                 set(rejection_counts) == {"noise_name"}
                 and rejection_counts["noise_name"] == len(response)
             ):
-                return []
+                return [], True
             rejection_summary = self._format_rejection_counts(rejection_counts)
-            return self._fallback_or_raise(
-                normalized_text,
-                metadata,
-                ValueError(
-                    "concept extractor returned no schema-valid entries "
-                    f"(rejections: {rejection_summary})"
+            return (
+                self._fallback_or_raise(
+                    normalized_text,
+                    metadata,
+                    ValueError(
+                        "concept extractor returned no schema-valid entries "
+                        f"(rejections: {rejection_summary})"
+                    ),
                 ),
+                False,
             )
-        return normalized_concepts
+        return normalized_concepts, True
 
     def _fallback_or_raise(
         self,
@@ -498,21 +516,35 @@ class ConceptNormalizer:
             : self.max_verification_candidates
         ]
 
-        def verify_candidate(
-            candidate: dict[str, Any],
-        ) -> tuple[str, dict[str, Any] | None]:
+        resolved: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
+        for candidate in selected_candidates:
             source = concept_lookup.get(candidate["source_id"])
             target = concept_lookup.get(candidate["target_id"])
             if source is None or target is None:
-                return "", None
-            cache_key = self._validation_cache_key(candidate, source, target)
-            return cache_key, self._llm_verify_candidate(candidate, source, target)
+                continue
+            resolved.append(
+                (
+                    candidate,
+                    source,
+                    target,
+                    self._validation_cache_key(candidate, source, target),
+                )
+            )
 
-        with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
-            verified_results = [
-                *cached_results,
-                *executor.map(verify_candidate, selected_candidates),
-            ]
+        vote_tables = self._collect_votes_concurrently(resolved)
+        verified_results: list[tuple[str, dict[str, Any] | None]] = [*cached_results]
+        for index, (candidate, source, target, cache_key) in enumerate(resolved):
+            verified_results.append(
+                (
+                    cache_key,
+                    self._llm_verify_candidate(
+                        candidate,
+                        source,
+                        target,
+                        votes=vote_tables[index],
+                    ),
+                )
+            )
 
         verified_edges: list[dict[str, Any]] = []
         for cache_key, edge in verified_results:
@@ -531,36 +563,189 @@ class ConceptNormalizer:
         )
         return verified_edges
 
+    # Targets scored per matmul block. Keeps the similarity slab to
+    # block x registry floats instead of materializing the full N x N matrix.
+    _PAIR_BLOCK_SIZE = 512
+
     def _build_pair_candidates(
         self,
         canonical_registry: list[dict[str, Any]],
         embeddings: list[list[float]],
     ) -> list[dict[str, Any]]:
-        """Generate candidate rows before pair-wise merge."""
-        candidates: list[dict[str, Any]] = []
-        for target_index, target in enumerate(canonical_registry):
-            per_target: list[dict[str, Any]] = []
-            for source_index, source in enumerate(canonical_registry):
-                if target_index == source_index:
-                    continue
-                candidate = self._score_candidate(
-                    target=target,
-                    source=source,
-                    target_embedding=embeddings[target_index],
-                    source_embedding=embeddings[source_index],
-                )
-                if candidate is not None:
-                    per_target.append(candidate)
+        """Generate candidate rows before pair-wise merge.
 
-            per_target.sort(
-                key=lambda item: (
-                    -item["initial_confidence"],
-                    -item["score_components"]["S_vector"],
-                    item["source_id"],
-                )
+        Scoring every ordered pair is inherently O(N^2), so the arithmetic runs
+        as numpy block matmuls rather than per-pair Python. Only the surviving
+        top-k rows per target are expanded into candidate dicts, which keeps the
+        expensive evidence construction off the discarded majority.
+        """
+        count = len(canonical_registry)
+        if count < 2:
+            return []
+
+        matrix = self._embedding_matrix(embeddings, count)
+        features = self._pair_features(canonical_registry)
+        ids = np.array([item["id"] for item in canonical_registry])
+        top_k = self.candidate_top_k
+
+        candidates: list[dict[str, Any]] = []
+        for start in range(0, count, self._PAIR_BLOCK_SIZE):
+            stop = min(start + self._PAIR_BLOCK_SIZE, count)
+            block = np.arange(start, stop)
+            cosine, confidence, valid = self._score_pair_block(
+                block, matrix, features
             )
-            candidates.extend(per_target[: self.candidate_top_k])
+            for row, target_index in enumerate(block):
+                order = self._rank_block_row(
+                    valid[row], confidence[row], cosine[row], ids, top_k
+                )
+                target = canonical_registry[target_index]
+                candidates.extend(
+                    self._build_candidate_row(
+                        target=target,
+                        source=canonical_registry[source_index],
+                        cosine_score=float(cosine[row, source_index]),
+                    )
+                    for source_index in order
+                )
         return candidates
+
+    @staticmethod
+    def _embedding_matrix(embeddings: list[list[float]], count: int) -> np.ndarray:
+        """Build an L2-normalized matrix so cosine reduces to a matmul.
+
+        float64 is deliberate: scores are rounded to 6 decimals, which float32's
+        ~7 significant digits is not reliably wide enough to reproduce.
+        """
+        matrix = np.asarray(embeddings, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[0] != count:
+            raise ValueError(
+                "embeddings must be one dense vector per canonical concept"
+            )
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        # A zero vector scored 0.0 under the previous per-pair guard.
+        np.divide(matrix, norms, out=matrix, where=norms > 0)
+        matrix[norms[:, 0] == 0] = 0.0
+        return matrix
+
+    def _pair_features(
+        self, canonical_registry: list[dict[str, Any]]
+    ) -> dict[str, np.ndarray]:
+        """Precompute the per-concept arrays the pair scoring needs.
+
+        Every signal in ``_score_candidate`` depends on the pair only through
+        these columns, so each can be broadcast instead of recomputed per pair.
+        """
+        bloom = np.array(
+            [
+                self.BLOOM_ORDER.get(str(item.get("bloom_level", "")), 999)
+                for item in canonical_registry
+            ],
+            dtype=np.int16,
+        )
+
+        discipline_ids: dict[Any, int] = {}
+        discipline = np.array(
+            [
+                discipline_ids.setdefault(item.get("discipline"), len(discipline_ids))
+                for item in canonical_registry
+            ],
+            dtype=np.int32,
+        )
+
+        # ``_course_order_bonus_for_pair`` fires when any source order is below
+        # any target order, which is exactly min(source) < max(target).
+        min_order = np.full(len(canonical_registry), np.inf, dtype=np.float64)
+        max_order = np.full(len(canonical_registry), -np.inf, dtype=np.float64)
+        course_ids: dict[str, int] = {}
+        course_rows: list[list[int]] = []
+        for index, item in enumerate(canonical_registry):
+            codes = item.get("source_course_codes", []) or []
+            orders = [
+                value
+                for value in (self._extract_course_order(code) for code in codes)
+                if value is not None
+            ]
+            if orders:
+                min_order[index] = min(orders)
+                max_order[index] = max(orders)
+            course_rows.append(
+                [course_ids.setdefault(str(code), len(course_ids)) for code in codes]
+            )
+
+        course_mask = np.zeros((len(canonical_registry), len(course_ids)), dtype=bool)
+        for index, row in enumerate(course_rows):
+            if row:
+                course_mask[index, row] = True
+
+        return {
+            "bloom": bloom,
+            "discipline": discipline,
+            "min_order": min_order,
+            "max_order": max_order,
+            "course_mask": course_mask,
+        }
+
+    def _score_pair_block(
+        self,
+        block: np.ndarray,
+        matrix: np.ndarray,
+        features: dict[str, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Score one block of targets against every source concept."""
+        bloom = features["bloom"]
+        discipline = features["discipline"]
+        course_mask = features["course_mask"]
+
+        cosine = np.maximum(matrix[block] @ matrix.T, 0.0)
+
+        bloom_ok = bloom[None, :] <= bloom[block][:, None]
+        same_discipline = discipline[None, :] == discipline[block][:, None]
+        structure = np.where(
+            features["min_order"][None, :] < features["max_order"][block][:, None],
+            self.course_order_bonus,
+            0.0,
+        ).clip(0.0, 1.0)
+        rule = np.where(bloom_ok, np.where(same_discipline, 1.0, 0.5), 0.0)
+        domain_factor = np.where(same_discipline, 1.0, self.cross_discipline_decay)
+
+        raw_score = (
+            self.score_weight_vector * cosine
+            + self.score_weight_structure * structure
+            + self.score_weight_rule * rule
+        )
+        # Round before thresholding: the emitted rows carry rounded scores, so
+        # this keeps the cutoff and the tie-breaks consistent with the values a
+        # reader sees in the artifact.
+        cosine = cosine.round(6)
+        confidence = (raw_score * domain_factor).clip(0.0, 1.0).round(6)
+
+        shares_course = (
+            course_mask[block] @ course_mask.T
+            if course_mask.shape[1]
+            else np.zeros_like(bloom_ok)
+        )
+        valid = bloom_ok & ~shares_course & (confidence >= self.candidate_min_confidence)
+        valid[np.arange(block.size), block] = False
+
+        return cosine, confidence, valid
+
+    def _rank_block_row(
+        self,
+        valid: np.ndarray,
+        confidence: np.ndarray,
+        cosine: np.ndarray,
+        ids: np.ndarray,
+        top_k: int,
+    ) -> np.ndarray:
+        """Pick the top-k sources for one target, preserving the legacy order."""
+        indices = np.flatnonzero(valid)
+        if indices.size == 0 or top_k <= 0:
+            return indices[:0]
+        order = np.lexsort(
+            (ids[indices], -cosine[indices], -confidence[indices])
+        )
+        return indices[order[:top_k]]
 
     def _score_candidate(
         self,
@@ -580,6 +765,28 @@ class ConceptNormalizer:
             return None
 
         cosine_score = max(0.0, self._cosine_similarity(target_embedding, source_embedding))
+        candidate = self._build_candidate_row(
+            target=target,
+            source=source,
+            cosine_score=cosine_score,
+        )
+        if candidate["initial_confidence"] < self.candidate_min_confidence:
+            return None
+        return candidate
+
+    def _build_candidate_row(
+        self,
+        *,
+        target: dict[str, Any],
+        source: dict[str, Any],
+        cosine_score: float,
+    ) -> dict[str, Any]:
+        """Expand one scored pair into a full candidate row.
+
+        Split out from ``_score_candidate`` so the block scorer can defer this
+        work until after top-k selection — the evidence payload is far more
+        expensive than the arithmetic that decides whether a pair survives.
+        """
         structure_signal = self._structure_signal(source, target)
         rule_signal = self._rule_signal(source, target)
         same_discipline = source.get("discipline") == target.get("discipline")
@@ -591,8 +798,6 @@ class ConceptNormalizer:
             + self.score_weight_rule * rule_signal
         )
         initial_confidence = self._clamp01(raw_score * domain_factor)
-        if initial_confidence < self.candidate_min_confidence:
-            return None
 
         evidence = [
             {
@@ -688,33 +893,85 @@ class ConceptNormalizer:
             )
         return merged
 
-    def _llm_verify_candidate(
+    def _collect_votes_concurrently(
+        self,
+        resolved: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]],
+    ) -> list[list[dict[str, Any]] | None]:
+        """Gather every self-consistency vote across one flat thread pool.
+
+        Voting per candidate inside a worker capped the real API concurrency at
+        ``api_concurrency`` regardless of ``llm_vote_count``, and let one slow
+        pair hold a worker for all of its votes. Flattening the votes into the
+        pool makes ``api_concurrency`` mean in-flight requests, which is also
+        the number that matters for provider rate limits.
+        """
+        if not resolved:
+            return []
+        if self.api_client is None:
+            # Offline runs have no request to overlap; let the per-candidate
+            # path apply its own fallback or fail-closed rule.
+            return [None] * len(resolved)
+
+        tasks = [
+            index
+            for index in range(len(resolved))
+            for _ in range(self.llm_vote_count)
+        ]
+
+        def run_vote(index: int) -> tuple[int, dict[str, Any]]:
+            candidate, source, target, _ = resolved[index]
+            return index, self._dependency_vote(candidate, source, target)
+
+        vote_tables: list[list[dict[str, Any]] | None] = [[] for _ in resolved]
+        with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
+            # executor.map preserves input order, so votes land in a stable
+            # order per candidate and majority ties break deterministically.
+            for index, vote in executor.map(run_vote, tasks):
+                vote_tables[index].append(vote)
+        return vote_tables
+
+    def _dependency_vote(
         self,
         candidate: dict[str, Any],
         source: dict[str, Any],
         target: dict[str, Any],
     ) -> dict[str, Any]:
-        """Run self-consistency LLM validation on one merged candidate pair."""
-        votes: list[dict[str, Any]] = []
-        for _ in range(self.llm_vote_count):
-            if self.api_client is None:
-                if self.require_complete_llm_validation:
-                    raise RuntimeError("concept dependency validator is unavailable")
-                votes.append(self._fallback_dependency_vote(candidate))
-                continue
-            try:
-                vote = self._call_dependency_validator(candidate, source, target)
-            except Exception as exc:
-                if self.require_complete_llm_validation:
-                    raise RuntimeError(
-                        "concept dependency validation was incomplete; existing "
-                        "artifacts must be preserved"
-                    ) from exc
-                logger.warning(
-                    "[concept_normalizer] LLM dependency vote failed, using fallback: %s", exc
-                )
-                vote = self._fallback_dependency_vote(candidate)
-            votes.append(vote)
+        """Produce one dependency vote, falling back unless fail-closed."""
+        if self.api_client is None:
+            if self.require_complete_llm_validation:
+                raise RuntimeError("concept dependency validator is unavailable")
+            return self._fallback_dependency_vote(candidate)
+        try:
+            return self._call_dependency_validator(candidate, source, target)
+        except Exception as exc:
+            if self.require_complete_llm_validation:
+                raise RuntimeError(
+                    "concept dependency validation was incomplete; existing "
+                    "artifacts must be preserved"
+                ) from exc
+            logger.warning(
+                "[concept_normalizer] LLM dependency vote failed, using fallback: %s", exc
+            )
+            return self._fallback_dependency_vote(candidate)
+
+    def _llm_verify_candidate(
+        self,
+        candidate: dict[str, Any],
+        source: dict[str, Any],
+        target: dict[str, Any],
+        *,
+        votes: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate self-consistency votes for one merged candidate pair.
+
+        ``votes`` carries ballots already gathered by the shared pool; when it
+        is None the votes are collected here, keeping this callable on its own.
+        """
+        if votes is None:
+            votes = [
+                self._dependency_vote(candidate, source, target)
+                for _ in range(self.llm_vote_count)
+            ]
 
         requires_counter = Counter(vote.get("requires") is True for vote in votes)
         requires = requires_counter.most_common(1)[0][0]
@@ -1136,10 +1393,42 @@ class ConceptNormalizer:
         canonical_registry.sort(key=lambda item: (item["canonical_name"].casefold(), item["id"]))
         return alias_table, canonical_registry
 
+    @staticmethod
+    def _encode_extraction_cache_entry(
+        concepts: list[dict[str, str]],
+        llm_verified: bool,
+    ) -> Any:
+        """Serialize one extraction result, preserving its provenance.
+
+        A verified non-empty result stays a bare list so caches written by
+        earlier runs keep their shape; everything else needs the explicit flag
+        because the concept list alone cannot express it.
+        """
+        if concepts and llm_verified:
+            return concepts
+        return {"concepts": concepts, "llm_verified": llm_verified}
+
+    @staticmethod
+    def _decode_extraction_cache_entry(
+        entry: Any,
+    ) -> tuple[list[dict[str, str]], bool] | None:
+        """Read a cache entry back as (concepts, llm_verified), or None if unusable."""
+        if isinstance(entry, list):
+            # Legacy shape. An empty legacy list has no provenance, so treat it
+            # as unverified and let one re-extraction upgrade it in place.
+            llm_verified = bool(entry) and all(
+                isinstance(item, dict) and item.get("extraction_source") == "llm"
+                for item in entry
+            )
+            return entry, llm_verified
+        if isinstance(entry, dict) and isinstance(entry.get("concepts"), list):
+            return entry["concepts"], bool(entry.get("llm_verified"))
+        return None
+
     def _load_extraction_cache(
         self,
         extraction_cache_path: str | Path | None,
-    ) -> dict[str, list[dict[str, str]]]:
+    ) -> dict[str, Any]:
         if extraction_cache_path is None:
             return {}
         path = Path(extraction_cache_path)
