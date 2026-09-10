@@ -8,19 +8,20 @@ import re
 from typing import Any
 
 from src.config import config
+from src.data_processing.graph_builder import CONCEPT_DEPENDENCY_TYPES
 from src.online_service.generator import verify_answer_with_nli
 from src.utils.deepseek_client import generate_json_value
 
 logger = logging.getLogger(__name__)
 
 
-DEPENDENCY_RELATION_TYPES = (
-    "REQUIRES",
-    "FOUNDATION_OF",
-    "METHOD_ANALOGY",
-    "TOOL_PREREQ",
-    "CONCEPTUAL_BASIS",
-)
+# Read the dependency edges straight from the writer's definition. A second
+# hand-maintained copy here had drifted: it listed a REQUIRES type nothing ever
+# writes, which Neo4j reported as an unknown relationship type on every query.
+# Whether an edge is a prerequisite is the rel.requires property, checked in the
+# traversal below, not a relationship type of its own.
+# Sorted so the generated Cypher is byte-stable across processes.
+DEPENDENCY_RELATION_TYPES = tuple(sorted(CONCEPT_DEPENDENCY_TYPES))
 
 
 def extract_query_entities(question: str, llm_client: Any) -> dict[str, list[str]]:
