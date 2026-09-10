@@ -8,14 +8,14 @@ services:
       ANONYMIZED_TELEMETRY: "FALSE"
     volumes:
       - chroma_data:/data
+    # The 1.x image ships a Rust binary with no python/curl/wget, so the probe
+    # has to be something bash can do on its own.
     healthcheck:
       test:
-        - CMD-SHELL
-        - >-
-          python -c "import urllib.request,sys;
-          sys.exit(0 if urllib.request.urlopen(
-          'http://127.0.0.1:8000/api/v2/heartbeat', timeout=4).status == 200
-          else 1)"
+        - CMD
+        - /bin/bash
+        - -c
+        - "cat < /dev/null > /dev/tcp/127.0.0.1/8000"
       interval: 10s
       timeout: 5s
       retries: 12
