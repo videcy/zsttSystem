@@ -665,7 +665,19 @@ def test_neo4j_schema_matches_dependency_query_contract() -> None:
     )
 
     queries = "\n".join(query for query, _kwargs in transaction.calls)
-    assert "MATCH (n {managed_by: $managed_by})" in queries
+
+    # The snapshot must start by clearing what this pipeline owns, and
+    # ownership is recognised three ways: the ZSTT_* labels it alone creates,
+    # the current managed_by stamp, and a build_id left without that stamp by
+    # versions predating it. Missing the last one strands an old snapshot on
+    # the shared labels and the next MERGE trips the uniqueness constraint.
+    cleanup_query, cleanup_kwargs = transaction.calls[0]
+    assert "DETACH DELETE n" in cleanup_query
+    assert "n:ZSTT_Course OR n:ZSTT_Concept OR n:ZSTT_Chunk" in cleanup_query
+    assert "n.managed_by = $managed_by" in cleanup_query
+    assert "n.managed_by IS NULL AND n.build_id IS NOT NULL" in cleanup_query
+    assert cleanup_kwargs["managed_by"] == "zsttSystem"
+
     assert "MERGE (n:ZSTT_Concept" in queries
     assert "SET n:Concept:Knowledge_Point" in queries
     assert "MERGE (a)-[r:FOUNDATION_OF]->(b)" in queries

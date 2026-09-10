@@ -295,10 +295,21 @@ def _replace_managed_graph(
             """
         ).consume()
     else:
+        # Ownership has to be recognised three ways, because a node this
+        # pipeline wrote is not always stamped the same:
+        #   - the ZSTT_* labels, which only this pipeline creates;
+        #   - managed_by, the current ownership stamp;
+        #   - a build_id with no managed_by, written by versions that predate
+        #     that stamp and carried only the shared Course/Concept/Chunk
+        #     labels. Leaving those behind is what makes MERGE create a second
+        #     node and trip the uniqueness constraint on the shared label.
         tx.run(
             """
-            MATCH (n {managed_by: $managed_by})
-            WHERE n:Course OR n:Concept OR n:Chunk
+            MATCH (n)
+            WHERE (n:ZSTT_Course OR n:ZSTT_Concept OR n:ZSTT_Chunk)
+               OR ((n:Course OR n:Concept OR n:Chunk)
+                   AND (n.managed_by = $managed_by
+                        OR (n.managed_by IS NULL AND n.build_id IS NOT NULL)))
             DETACH DELETE n
             """,
             managed_by=MANAGED_BY,

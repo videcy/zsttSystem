@@ -398,8 +398,22 @@ def run_graph_stage(*, concept_stage_succeeded: bool | None = None) -> None:
             neo4j_status = "written"
         finally:
             driver.close()
-    except (Neo4jError, ServiceUnavailable, AuthError, OSError) as exc:
+    # AuthError derives from Neo4jError, so the reachability cases have to be
+    # caught first or they would be reported as failed writes.
+    except (ServiceUnavailable, AuthError, OSError) as exc:
         print(f"[graph] Neo4j unavailable: {exc}")
+    except Neo4jError as exc:
+        # The server answered and rejected the write. Calling that "unavailable"
+        # sends anyone debugging it after the connection instead of the data.
+        neo4j_status = "write_failed"
+        code = getattr(exc, "code", None) or "unknown"
+        print(f"[graph] Neo4j rejected the graph write ({code}): {exc}")
+        if "ConstraintValidationFailed" in code:
+            print(
+                "[graph] a node this pipeline does not recognise as its own "
+                "already holds that key; check for nodes carrying the shared "
+                "Course/Concept/Chunk labels without a managed_by stamp"
+            )
     manifest = {
         "build_id": build_id,
         "courses": sorted(
