@@ -339,6 +339,7 @@ class ConceptNormalizer:
             "5. source_course 填该概念所在课程名；source_chapter 填该概念所在章节名。\n"
             "6. 优先使用给定模块元数据中的 course_name 和 syllabus_section 作为 source 字段。\n"
             "7. 顶层必须是只含 concepts 字段的 JSON 对象，不要额外解释。\n"
+            "8. 最多输出 40 个概念；超出时保留最核心的，不要为凑数拆分概念。\n"
             f"模块元数据: {json.dumps(metadata, ensure_ascii=False)}\n"
             f"模块文本:\n{normalized_text}"
         )
@@ -348,7 +349,7 @@ class ConceptNormalizer:
                 self.llm_model_name,
                 prompt,
                 temperature=0.0,
-                max_output_tokens=1600,
+                max_output_tokens=4096,
             )
         except Exception as exc:
             action = (

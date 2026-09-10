@@ -18,6 +18,9 @@ from src.config import config
 
 logger = logging.getLogger(__name__)
 
+# DeepSeek chat models cap a single completion at 8192 output tokens.
+MAX_JSON_OUTPUT_TOKENS = 8192
+
 
 def create_deepseek_client() -> OpenAI:
     """Create a DeepSeek client via the OpenAI-compatible interface."""
@@ -107,6 +110,31 @@ def generate_text(
     json_mode: bool = False,
 ) -> str:
     """Generate plain text with DeepSeek chat completions."""
+    text, _ = _generate_text_with_finish_reason(
+        client,
+        model,
+        prompt,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        json_mode=json_mode,
+    )
+    return text
+
+
+def _generate_text_with_finish_reason(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    *,
+    temperature: float,
+    max_output_tokens: int,
+    json_mode: bool,
+) -> tuple[str, str | None]:
+    """Generate text and report why the model stopped.
+
+    ``finish_reason`` matters for JSON mode: a ``length`` stop means the object
+    was cut mid-structure and no amount of re-prompting will parse it.
+    """
     request: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -121,6 +149,7 @@ def generate_text(
         request["extra_body"] = {"thinking": {"type": "disabled"}}
     response = client.chat.completions.create(**request)
     choice = response.choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
     content = choice.message.content
     if isinstance(content, list):
         result = "".join(
@@ -134,10 +163,10 @@ def generate_text(
         logger.warning(
             "[deepseek_client] empty JSON content "
             "(finish_reason=%s, has_reasoning_content=%s)",
-            getattr(choice, "finish_reason", None),
+            finish_reason,
             bool(getattr(choice.message, "reasoning_content", None)),
         )
-    return result
+    return result, finish_reason
 
 
 def generate_json(
@@ -171,34 +200,54 @@ def generate_json_value(
 ) -> Any:
     """Generate JSON by prompting the model and extracting the first JSON value."""
     last_error: ValueError | None = None
+    truncated = False
+    budget = max_output_tokens
     for attempt in range(2):
-        retry_instruction = (
-            "\n上一次响应为空或不是合法 JSON。请只返回一个合法 JSON 对象。"
-            if attempt
-            else ""
-        )
-        text = generate_text(
+        if truncated:
+            # A ``length`` stop is a budget problem, not a formatting one:
+            # re-prompting at the same cap just truncates in the same place.
+            budget = min(budget * 2, MAX_JSON_OUTPUT_TOKENS)
+            retry_instruction = (
+                "\n上一次响应因长度被截断。请只返回一个合法 JSON 对象，"
+                "并尽量精简每个字段的内容。"
+            )
+        elif attempt:
+            retry_instruction = (
+                "\n上一次响应为空或不是合法 JSON。请只返回一个合法 JSON 对象。"
+            )
+        else:
+            retry_instruction = ""
+        text, finish_reason = _generate_text_with_finish_reason(
             client,
             model,
             prompt + retry_instruction,
             temperature=temperature,
-            max_output_tokens=max_output_tokens,
+            max_output_tokens=budget,
             json_mode=True,
         )
         try:
             return extract_json_value(text)
         except ValueError as exc:
             last_error = exc
+            truncated = finish_reason == "length"
             logger.warning(
                 "[deepseek_client] invalid JSON response "
-                "(attempt=%d, content_length=%d)",
+                "(attempt=%d, content_length=%d, finish_reason=%s, "
+                "max_output_tokens=%d)",
                 attempt + 1,
                 len(text),
+                finish_reason,
+                budget,
             )
     if last_error is not None:
+        reason = (
+            "output was truncated at the max_output_tokens limit"
+            if truncated
+            else "empty or invalid JSON"
+        )
         raise ValueError(
-            "DeepSeek returned empty or invalid JSON after two JSON-mode "
-            "attempts (thinking disabled)."
+            f"DeepSeek returned {reason} after two JSON-mode attempts "
+            "(thinking disabled)."
         ) from last_error
     raise ValueError("Model output does not contain valid JSON.")
 
