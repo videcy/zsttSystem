@@ -62,7 +62,7 @@
 
 > ⚠️ 注意：`outputs/concepts.json` 是**旧 pipeline 留下的产物**，里面仍有
 > "中山大学""本科课程教学大纲""课程名称"这类噪声。`concept_registry.json`
-> 尚未生成（需要 `DEEPSEEK_API_KEY` 跑一次 `run_pipeline.py concept`）。
+> 尚未生成（需要 `DEEPSEEK_API_KEY` 跑一次 `run_pipeline.py --stage concept`）。
 > `concept_eval.py` 在退回读 `concepts.json` 时会打印警告——**不要把这份旧产物
 > 当成 LLM 抽取结果写进论文**。
 
@@ -239,7 +239,7 @@ python eval/build_seed_dataset.py
 python eval/run_eval.py --stages routing --tag routing-check
 
 # 2. 建索引后的完整评测
-python run_pipeline.py all          # 需要 DEEPSEEK_API_KEY 才有概念/图谱阶段
+python run_pipeline.py --stage all          # 需要 DEEPSEEK_API_KEY 才有概念/图谱阶段
 python eval/run_eval.py --tag full
 
 # 3. 消融与权重

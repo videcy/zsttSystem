@@ -134,9 +134,9 @@ python eval/concept_eval.py
 需要重建索引，因此单独跑：
 
 ```bash
-EMBEDDING_PROVIDER=hash python run_pipeline.py embed
+EMBEDDING_PROVIDER=hash python run_pipeline.py --stage embed
 python eval/run_eval.py --stages retrieval --tag hash-embedding
-EMBEDDING_PROVIDER=local python run_pipeline.py embed
+EMBEDDING_PROVIDER=local python run_pipeline.py --stage embed
 python eval/run_eval.py --stages retrieval --tag local-embedding
 ```
 

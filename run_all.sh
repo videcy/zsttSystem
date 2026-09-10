@@ -50,7 +50,7 @@ PYTHON=.venv/bin/python
 docker compose up -d --wait chromadb neo4j
 
 if [[ "$RUN_PIPELINE" == "1" ]]; then
-  "$PYTHON" run_pipeline.py all
+  "$PYTHON" run_pipeline.py --stage all
 fi
 
 if curl -sf -m 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then

@@ -185,7 +185,7 @@ def build_retriever(
         return None
     if not retriever.connected or retriever.count == 0:
         print(
-            "[eval] vector index is empty -- run `python run_pipeline.py embed` "
+            "[eval] vector index is empty -- run `python run_pipeline.py --stage embed` "
             "to enable the retrieval and answer stages"
         )
         return None
