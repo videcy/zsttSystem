@@ -34,7 +34,7 @@ class Config:
 
     @property
     def text_model(self) -> str:
-        return os.getenv("TEXT_MODEL", "deepseek-v4-flash").strip()
+        return os.getenv("TEXT_MODEL", "deepseek-flash").strip()
 
     @property
     def judge_model(self) -> str:
