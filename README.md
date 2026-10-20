@@ -101,6 +101,10 @@ python run_pipeline.py --stage all                    # 离线管线
 - OpenAPI `http://127.0.0.1:8000/docs`
 - 健康检查 `http://127.0.0.1:8000/health`
 
+只想在本地预览前端、暂时没有启动 Docker 和导入本地语料时，可运行
+`python maintenance/preview_frontend.py`，再打开 `http://127.0.0.1:8765/#qa`。
+该预览服务只监听本机，页面的问答请求会转发到 `https://zsttsystem.top`；不要在其中输入个人或敏感信息。
+
 `.env` 里必填的只有本地数据库连接：
 
 ```env
