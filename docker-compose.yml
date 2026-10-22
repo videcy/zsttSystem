@@ -48,7 +48,10 @@ services:
   # The API itself. Service names replace the loopback addresses used by a
   # host-side .env, so the container talks to the compose network.
   api:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: zstt_api
     env_file: .env
     environment:
@@ -61,6 +64,7 @@ services:
     volumes:
       - corpus_data:/app/data
       - ./outputs:/app/outputs
+      - ./eval/datasets:/app/eval/datasets
       - model_cache:/models
     depends_on:
       chromadb:
@@ -72,7 +76,10 @@ services:
   # One-shot offline pipeline:
   #   docker compose --profile pipeline run --rm pipeline
   pipeline:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     profiles: ["pipeline"]
     env_file: .env
     environment:
@@ -89,7 +96,7 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
-    command: ["python", "run_pipeline.py", "all"]
+    command: ["python", "run_pipeline.py", "--stage", "all"]
 
 volumes:
   chroma_data:

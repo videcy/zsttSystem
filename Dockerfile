@@ -5,12 +5,14 @@
 # API with one checkout and one `docker compose up`.
 FROM python:3.11-slim
 
+ARG GIT_COMMIT=unknown
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     # Keep the sentence-transformer download on a mounted volume instead of
     # baking a 400 MB model into the image.
-    HF_HOME=/models
+    HF_HOME=/models \
+    GIT_COMMIT=${GIT_COMMIT}
 
 WORKDIR /app
 
