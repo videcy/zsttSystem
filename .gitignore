@@ -37,6 +37,7 @@ outputs/collection_alias.json
 eval/reports/*
 !eval/reports/.gitkeep
 eval/datasets/*.json
+!eval/datasets/concept_edges_gold.json
 
 # 临时文件
 .claude/

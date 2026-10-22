@@ -13,12 +13,13 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
 from src.utils.deepseek_client import create_deepseek_client, embed_texts, generate_json_value
 from src.config import config
+from src.online_service.program_graph import parse_semester
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,17 @@ _CONCEPT_NOISE = {
     "学分",
     "学时",
 }
+
+# Alias suffixes only match at the end of a term.  Keeping this list ordered
+# longest-first prevents ``基本概念`` from being reduced as ``概念`` first.
+ALIAS_TRAILING_MODIFIERS: tuple[str, ...] = (
+    "基本概念",
+    "的概念",
+    "概念",
+    "定义",
+    "方法",
+)
+ALIAS_IGNORED_CHARACTERS: tuple[str, ...] = ("的",)
 
 
 def _breadcrumb_enabled() -> bool:
@@ -128,10 +140,14 @@ class ConceptNormalizer:
         score_weight_rule: float | None = None,
         llm_vote_count: int | None = None,
         llm_vote_temperature: float | None = None,
+        require_unanimous: bool | None = None,
+        verified_min_confidence: float | None = None,
         api_concurrency: int | None = None,
         allow_rule_fallback: bool = True,
         require_complete_llm_validation: bool = False,
         allow_embedding_fallback: bool = True,
+        course_semesters: Mapping[str, int | None] | None = None,
+        courses_output_path: str | Path | None = None,
     ) -> None:
         self.llm_model_name = llm_model_name or config.text_model
         self.embedding_model_name = embedding_model_name or config.concept_normalization_model
@@ -198,6 +214,18 @@ class ConceptNormalizer:
             llm_vote_temperature if llm_vote_temperature is not None
             else config.concept_llm_vote_temperature
         )
+        self.require_unanimous = (
+            require_unanimous
+            if require_unanimous is not None
+            else config.concept_require_unanimous
+        )
+        self.verified_min_confidence = (
+            verified_min_confidence
+            if verified_min_confidence is not None
+            else config.concept_verified_min_confidence
+        )
+        if not 0.0 <= self.verified_min_confidence <= 1.0:
+            raise ValueError("verified_min_confidence must be between 0 and 1")
         self.api_concurrency = max(
             1,
             api_concurrency if api_concurrency is not None else config.concept_api_concurrency,
@@ -205,6 +233,15 @@ class ConceptNormalizer:
         self.allow_rule_fallback = allow_rule_fallback
         self.require_complete_llm_validation = require_complete_llm_validation
         self.allow_embedding_fallback = allow_embedding_fallback
+        self.courses_output_path = (
+            Path(courses_output_path) if courses_output_path is not None else None
+        )
+        self._course_semesters = (
+            self._normalize_course_semester_mapping(course_semesters)
+            if course_semesters is not None
+            else None
+        )
+        self._course_semesters_loaded = course_semesters is not None
         self._normalize_score_weights()
         try:
             self.api_client = create_deepseek_client()
@@ -259,11 +296,21 @@ class ConceptNormalizer:
             )
             if cached is not None:
                 concepts, llm_verified = cached
+                concepts = self._attach_source_evidence(
+                    concepts,
+                    chunk_text,
+                    chunk_id=str(chunk.get("chunk_id") or ""),
+                )
                 if self.api_client is None or llm_verified:
                     return cache_key, concepts, llm_verified
             concepts, llm_verified = self._extract_core_concepts_verified(
                 chunk_text,
                 normalized_metadata,
+            )
+            concepts = self._attach_source_evidence(
+                concepts,
+                chunk_text,
+                chunk_id=str(chunk.get("chunk_id") or ""),
             )
             return cache_key, concepts, llm_verified
 
@@ -309,6 +356,7 @@ class ConceptNormalizer:
         verified_edges = self.verify_candidate_links(
             candidate_links,
             canonical_registry,
+            chunks=chunks,
             validation_cache_path=validation_cache_path,
         )
 
@@ -482,7 +530,19 @@ class ConceptNormalizer:
         if not canonical_registry:
             return []
 
-        descriptions = [self._build_concept_description(item) for item in canonical_registry]
+        # Public-required (ideological/political) courses use MAR course codes.
+        # Their broad philosophical vocabulary otherwise dominates the top-k
+        # neighbourhoods and creates shallow cross-course links. Filtering at
+        # the source keeps them out of both the embedding batch and the merge.
+        eligible_registry = [
+            item
+            for item in canonical_registry
+            if not self._is_public_required_concept(item)
+        ]
+        if len(eligible_registry) < 2:
+            return []
+
+        descriptions = [self._build_concept_description(item) for item in eligible_registry]
         embeddings = embed_texts(
             self.embedding_client,
             self.retrieval_model_name,
@@ -490,8 +550,15 @@ class ConceptNormalizer:
             batch_size=min(32, max(1, len(descriptions))),
             allow_hash_fallback=self.allow_embedding_fallback,
         )
-        pair_candidates = self._build_pair_candidates(canonical_registry, embeddings)
+        pair_candidates = self._build_pair_candidates(eligible_registry, embeddings)
         merged_candidates = self._merge_candidate_pairs(pair_candidates)
+        eligible_ids = {str(item["id"]) for item in eligible_registry}
+        merged_candidates = [
+            candidate
+            for candidate in merged_candidates
+            if str(candidate.get("source_id")) in eligible_ids
+            and str(candidate.get("target_id")) in eligible_ids
+        ]
         merged_candidates.sort(
             key=lambda item: (-item["initial_confidence"], item["target_id"], item["source_id"])
         )
@@ -502,6 +569,7 @@ class ConceptNormalizer:
         candidate_links: list[dict[str, Any]],
         canonical_registry: list[dict[str, Any]],
         *,
+        chunks: list[dict[str, Any]] | None = None,
         validation_cache_path: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         """Validate merged candidate links with LLM self-consistency voting."""
@@ -509,6 +577,7 @@ class ConceptNormalizer:
             return []
 
         concept_lookup = {item["id"]: item for item in canonical_registry}
+        chunk_index = self._chunk_evidence_index(chunks)
         validation_cache = self._load_validation_cache(validation_cache_path)
         cached_results: list[tuple[str, dict[str, Any]]] = []
         uncached_candidates: list[dict[str, Any]] = []
@@ -516,6 +585,8 @@ class ConceptNormalizer:
             source = concept_lookup.get(candidate.get("source_id"))
             target = concept_lookup.get(candidate.get("target_id"))
             if source is None or target is None:
+                continue
+            if self._is_public_required_concept(source) or self._is_public_required_concept(target):
                 continue
             cache_key = self._validation_cache_key(candidate, source, target)
             cached = validation_cache.get(cache_key)
@@ -537,6 +608,8 @@ class ConceptNormalizer:
             source = concept_lookup.get(candidate["source_id"])
             target = concept_lookup.get(candidate["target_id"])
             if source is None or target is None:
+                continue
+            if self._is_public_required_concept(source) or self._is_public_required_concept(target):
                 continue
             resolved.append(
                 (
@@ -566,6 +639,25 @@ class ConceptNormalizer:
         for cache_key, edge in verified_results:
             if edge is None:
                 continue
+            source = concept_lookup.get(edge.get("source_id"))
+            target = concept_lookup.get(edge.get("target_id"))
+            if source is None or target is None:
+                continue
+            if self._is_public_required_concept(source) or self._is_public_required_concept(target):
+                continue
+            edge = dict(edge)
+            if edge.get("requires") is True:
+                source_evidence = self._find_concept_evidence(source, chunk_index)
+                target_evidence = self._find_concept_evidence(target, chunk_index)
+                if not source_evidence or not target_evidence:
+                    logger.info(
+                        "[concept_normalizer] dropping edge %s -> %s: missing syllabus evidence",
+                        edge.get("source_id"),
+                        edge.get("target_id"),
+                    )
+                    continue
+                edge["source_evidence"] = source_evidence
+                edge["target_evidence"] = target_evidence
             verified_edges.append(edge)
             # A transient provider failure must not become a durable validation
             # result. Only complete LLM votes are safe to reuse.
@@ -669,22 +761,17 @@ class ConceptNormalizer:
             dtype=np.int32,
         )
 
-        # ``_course_order_bonus_for_pair`` fires when any source order is below
-        # any target order, which is exactly min(source) < max(target).
-        min_order = np.full(len(canonical_registry), np.inf, dtype=np.float64)
-        max_order = np.full(len(canonical_registry), -np.inf, dtype=np.float64)
+        semester_values = [
+            self._concept_semester(item) for item in canonical_registry
+        ]
+        semester = np.array(
+            [value if value is not None else np.nan for value in semester_values],
+            dtype=np.float64,
+        )
         course_ids: dict[str, int] = {}
         course_rows: list[list[int]] = []
         for index, item in enumerate(canonical_registry):
             codes = item.get("source_course_codes", []) or []
-            orders = [
-                value
-                for value in (self._extract_course_order(code) for code in codes)
-                if value is not None
-            ]
-            if orders:
-                min_order[index] = min(orders)
-                max_order[index] = max(orders)
             course_rows.append(
                 [course_ids.setdefault(str(code), len(course_ids)) for code in codes]
             )
@@ -697,8 +784,7 @@ class ConceptNormalizer:
         return {
             "bloom": bloom,
             "discipline": discipline,
-            "min_order": min_order,
-            "max_order": max_order,
+            "semester": semester,
             "course_mask": course_mask,
         }
 
@@ -711,17 +797,28 @@ class ConceptNormalizer:
         """Score one block of targets against every source concept."""
         bloom = features["bloom"]
         discipline = features["discipline"]
+        semester = features["semester"]
         course_mask = features["course_mask"]
 
         cosine = np.maximum(matrix[block] @ matrix.T, 0.0)
 
         bloom_ok = bloom[None, :] <= bloom[block][:, None]
         same_discipline = discipline[None, :] == discipline[block][:, None]
-        structure = np.where(
-            features["min_order"][None, :] < features["max_order"][block][:, None],
-            self.course_order_bonus,
-            0.0,
-        ).clip(0.0, 1.0)
+        source_semester = semester[None, :]
+        target_semester = semester[block][:, None]
+        order_ok = (
+            np.isfinite(source_semester)
+            & np.isfinite(target_semester)
+            & (source_semester < target_semester)
+        )
+        # Only a known reverse order is a hard reject; unknown or equal
+        # semesters stay candidates without the order bonus.
+        reverse_order = (
+            np.isfinite(source_semester)
+            & np.isfinite(target_semester)
+            & (source_semester > target_semester)
+        )
+        structure = np.where(order_ok, self.course_order_bonus, 0.0).clip(0.0, 1.0)
         rule = np.where(bloom_ok, np.where(same_discipline, 1.0, 0.5), 0.0)
         domain_factor = np.where(same_discipline, 1.0, self.cross_discipline_decay)
 
@@ -741,7 +838,12 @@ class ConceptNormalizer:
             if course_mask.shape[1]
             else np.zeros_like(bloom_ok)
         )
-        valid = bloom_ok & ~shares_course & (confidence >= self.candidate_min_confidence)
+        valid = (
+            bloom_ok
+            & ~shares_course
+            & ~reverse_order
+            & (confidence >= self.candidate_min_confidence)
+        )
         valid[np.arange(block.size), block] = False
 
         return cosine, confidence, valid
@@ -774,10 +876,14 @@ class ConceptNormalizer:
         """Score one candidate source concept for a target concept."""
         if not self._bloom_allowed(source.get("bloom_level", ""), target.get("bloom_level", "")):
             return None
+        if self._is_public_required_concept(source) or self._is_public_required_concept(target):
+            return None
         if self._share_any_value(
             target.get("source_course_codes", []),
             source.get("source_course_codes", []),
         ):
+            return None
+        if self._has_reverse_course_order(source, target):
             return None
 
         cosine_score = max(0.0, self._cosine_similarity(target_embedding, source_embedding))
@@ -989,8 +1095,21 @@ class ConceptNormalizer:
                 for _ in range(self.llm_vote_count)
             ]
 
-        requires_counter = Counter(vote.get("requires") is True for vote in votes)
-        requires = requires_counter.most_common(1)[0][0]
+        all_confidence = [
+            self._clamp01(self._safe_float(vote.get("confidence", 0.0)))
+            for vote in votes
+        ]
+        average_confidence = sum(all_confidence) / max(len(all_confidence), 1)
+        unanimous = (
+            bool(votes)
+            and len(votes) == self.llm_vote_count
+            and all(vote.get("requires") is True for vote in votes)
+        )
+        if self.require_unanimous:
+            requires = unanimous and average_confidence >= self.verified_min_confidence
+        else:
+            requires_counter = Counter(vote.get("requires") is True for vote in votes)
+            requires = requires_counter.most_common(1)[0][0]
         relation_votes = [
             str(vote.get("relation_type", "NO_RELATION")).strip()
             for vote in votes
@@ -1004,10 +1123,12 @@ class ConceptNormalizer:
         supporting_votes = [vote for vote in votes if vote.get("requires") is True]
         if requires and relation_type == "NO_RELATION":
             requires = False
-        confidence_votes = supporting_votes if requires else votes
-        average_confidence = sum(
-            self._safe_float(vote.get("confidence", 0.0)) for vote in confidence_votes
-        ) / max(len(confidence_votes), 1)
+        if not self.require_unanimous:
+            confidence_votes = supporting_votes if requires else votes
+            average_confidence = sum(
+                self._safe_float(vote.get("confidence", 0.0))
+                for vote in confidence_votes
+            ) / max(len(confidence_votes), 1)
         reason = self._choose_majority_reason(
             supporting_votes if requires else votes
         )
@@ -1018,6 +1139,7 @@ class ConceptNormalizer:
             "requires": requires,
             "relation_type": relation_type if requires else "NO_RELATION",
             "confidence": round(self._clamp01(average_confidence), 6),
+            "unanimous": unanimous,
             "reason": reason,
             "candidate_confidence": candidate["initial_confidence"],
             "fusion_score": candidate["fusion_score"],
@@ -1153,32 +1275,46 @@ class ConceptNormalizer:
 
     def _course_order_bonus_for_pair(self, source: dict[str, Any], target: dict[str, Any]) -> float:
         """Add bonus when the source concept comes from an earlier course."""
-        source_orders = [
-            self._extract_course_order(code)
-            for code in source.get("source_course_codes", [])
-        ]
-        target_orders = [
-            self._extract_course_order(code)
-            for code in target.get("source_course_codes", [])
-        ]
-        source_orders = [value for value in source_orders if value is not None]
-        target_orders = [value for value in target_orders if value is not None]
-        if not source_orders or not target_orders:
-            return 0.0
+        return self.course_order_bonus if self._has_strict_course_order(source, target) else 0.0
 
-        for source_order in source_orders:
-            for target_order in target_orders:
-                if source_order < target_order:
-                    return self.course_order_bonus
-        return 0.0
+    def _has_strict_course_order(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> bool:
+        """Require both concept semesters to be known and source < target."""
+        source_semester = self._concept_semester(source)
+        target_semester = self._concept_semester(target)
+        return (
+            source_semester is not None
+            and target_semester is not None
+            and source_semester < target_semester
+        )
+
+    def _has_reverse_course_order(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> bool:
+        """Return whether both semesters are known and source > target."""
+        source_semester = self._concept_semester(source)
+        target_semester = self._concept_semester(target)
+        return (
+            source_semester is not None
+            and target_semester is not None
+            and source_semester > target_semester
+        )
 
     def _course_order_evidence(self, source: dict[str, Any], target: dict[str, Any]) -> str:
         """Describe the course-order relation used as prior."""
         source_codes = ",".join(source.get("source_course_codes", []))
         target_codes = ",".join(target.get("source_course_codes", []))
         if self._course_order_bonus_for_pair(source, target) > 0:
-            return f"{source_codes} precedes {target_codes}"
-        return f"no prerequisite advantage between {source_codes} and {target_codes}"
+            return (
+                f"{source_codes} (semester {self._concept_semester(source)}) precedes "
+                f"{target_codes} (semester {self._concept_semester(target)})"
+            )
+        return f"no fixed semester prerequisite advantage between {source_codes} and {target_codes}"
 
     def _build_concept_description(self, concept: dict[str, Any]) -> str:
         """Build a dense retrieval description for one canonical concept."""
@@ -1402,6 +1538,7 @@ class ConceptNormalizer:
                     "source_chapters": self._unique_values(member_concepts, "source_chapter"),
                     "source_course_codes": self._unique_values(member_concepts, "source_course_code"),
                     "source_occurrences": self._unique_source_occurrences(member_concepts),
+                    "source_evidence": self._unique_values(member_concepts, "source_evidence"),
                     "extraction_sources": self._unique_values(member_concepts, "extraction_source"),
                 }
             )
@@ -1482,6 +1619,8 @@ class ConceptNormalizer:
             "model": self.llm_model_name,
             "vote_count": self.llm_vote_count,
             "vote_temperature": self.llm_vote_temperature,
+            "require_unanimous": self.require_unanimous,
+            "verified_min_confidence": self.verified_min_confidence,
             "source_id": candidate.get("source_id"),
             "target_id": candidate.get("target_id"),
             "fusion_score": candidate.get("fusion_score"),
@@ -1718,13 +1857,19 @@ class ConceptNormalizer:
     ) -> list[dict[str, str]]:
         """Keep course/chapter provenance paired instead of forming a cross product."""
         occurrences: list[dict[str, str]] = []
-        seen: set[tuple[str, str, str]] = set()
+        seen: dict[tuple[str, str, str], int] = {}
         for concept in concepts:
             occurrence = {
                 "course": str(concept.get("source_course", "")).strip(),
                 "course_code": str(concept.get("source_course_code", "")).strip(),
                 "chapter": str(concept.get("source_chapter", "")).strip(),
             }
+            evidence = str(concept.get("source_evidence", "")).strip()
+            chunk_id = str(concept.get("source_chunk_id", "")).strip()
+            if evidence:
+                occurrence["evidence_sentence"] = evidence
+            if chunk_id:
+                occurrence["chunk_id"] = chunk_id
             key = (
                 occurrence["course"],
                 occurrence["course_code"],
@@ -1732,8 +1877,129 @@ class ConceptNormalizer:
             )
             if any(key) and key not in seen:
                 occurrences.append(occurrence)
-                seen.add(key)
+                seen[key] = len(occurrences) - 1
+            elif key in seen:
+                existing = occurrences[seen[key]]
+                if evidence and not existing.get("evidence_sentence"):
+                    existing["evidence_sentence"] = evidence
+                if chunk_id and not existing.get("chunk_id"):
+                    existing["chunk_id"] = chunk_id
         return occurrences
+
+    def _attach_source_evidence(
+        self,
+        concepts: list[dict[str, str]],
+        chunk_text: str,
+        *,
+        chunk_id: str = "",
+    ) -> list[dict[str, str]]:
+        """Attach the first source sentence containing each extracted concept."""
+        attached: list[dict[str, str]] = []
+        for concept in concepts:
+            record = dict(concept)
+            if not record.get("source_evidence"):
+                evidence = self._extract_evidence_sentence(
+                    chunk_text,
+                    str(record.get("name", "")),
+                )
+                if evidence:
+                    record["source_evidence"] = evidence
+            if chunk_id:
+                record["source_chunk_id"] = chunk_id
+            attached.append(record)
+        return attached
+
+    def _extract_evidence_sentence(self, text: str, *terms: str) -> str:
+        """Return the first source sentence containing any supplied concept term."""
+        term_keys = [
+            self._normalize_alias_key(term)
+            for term in terms
+            if self._normalize_alias_key(term)
+        ]
+        if not term_keys:
+            return ""
+        for raw_sentence in re.split(r"(?<=[。！？!?；;])\s*|\r?\n+", str(text or "")):
+            sentence = re.sub(r"\s+", " ", raw_sentence).strip()
+            if not sentence:
+                continue
+            normalized = self._normalize_alias_key(sentence)
+            if any(term_key in normalized for term_key in term_keys):
+                return sentence
+        return ""
+
+    @staticmethod
+    def _chunk_evidence_index(
+        chunks: list[dict[str, Any]] | None,
+    ) -> dict[str, list[str]]:
+        """Index syllabus chunk text by course code for evidence lookup."""
+        index: dict[str, list[str]] = defaultdict(list)
+        for chunk in chunks or []:
+            metadata = chunk.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("source_type") not in (None, "", "syllabus"):
+                continue
+            course_code = str(metadata.get("course_code") or "").strip()
+            text = str(chunk.get("text") or "").strip()
+            if course_code and text:
+                index[course_code].append(text)
+        return index
+
+    def _find_concept_evidence(
+        self,
+        concept: dict[str, Any],
+        chunk_index: dict[str, list[str]] | None = None,
+    ) -> str:
+        """Find a syllabus sentence for a concept without asking an LLM."""
+        terms = [
+            str(concept.get("canonical_name") or concept.get("name") or ""),
+            *[str(alias) for alias in concept.get("aliases") or []],
+        ]
+        for occurrence in concept.get("source_occurrences") or []:
+            if not isinstance(occurrence, dict):
+                continue
+            evidence = str(
+                occurrence.get("evidence_sentence")
+                or occurrence.get("evidence")
+                or occurrence.get("source_evidence")
+                or ""
+            ).strip()
+            if evidence and self._extract_evidence_sentence(evidence, *terms):
+                return evidence
+
+        stored_evidence = concept.get("source_evidence") or []
+        if isinstance(stored_evidence, str):
+            stored_evidence = [stored_evidence]
+        for evidence in stored_evidence:
+            evidence = str(evidence).strip()
+            if evidence and self._extract_evidence_sentence(evidence, *terms):
+                return evidence
+
+        for course_code in self._concept_course_codes(concept):
+            for text in (chunk_index or {}).get(course_code, []):
+                evidence = self._extract_evidence_sentence(text, *terms)
+                if evidence:
+                    return evidence
+        return ""
+
+    @staticmethod
+    def _concept_course_codes(concept: dict[str, Any]) -> list[str]:
+        values: list[str] = []
+        raw_codes = concept.get("source_course_codes") or []
+        if isinstance(raw_codes, str):
+            raw_codes = [raw_codes]
+        for value in [*raw_codes, concept.get("source_course_code"), concept.get("course_code")]:
+            code = str(value or "").strip()
+            if code and code not in values:
+                values.append(code)
+        return values
+
+    def _is_public_required_concept(self, concept: dict[str, Any]) -> bool:
+        """Return whether any provenance course is a public-required MAR course."""
+        return any(
+            code.upper().startswith("MAR")
+            for code in self._concept_course_codes(concept)
+        )
 
     def _merge_string_lists(self, items: list[dict[str, Any]], key: str) -> list[str]:
         """Merge list[str] fields from multiple candidate rows."""
@@ -1768,20 +2034,111 @@ class ConceptNormalizer:
         """Derive the default course code from chunk metadata."""
         return self._cleanup_term(metadata.get("course_code", ""))
 
-    def _extract_course_order(self, course_code: str) -> int | None:
-        """Extract the first digit from a course code as the study-order prior."""
-        match = re.search(r"\d", str(course_code or ""))
-        return int(match.group(0)) if match is not None else None
+    @staticmethod
+    def _normalize_course_code(course_code: Any) -> str:
+        """Normalize a course code for case-insensitive semester lookups."""
+        return str(course_code or "").strip().casefold()
+
+    def _normalize_course_semester_mapping(
+        self,
+        mapping: Mapping[str, int | None],
+    ) -> dict[str, int | None]:
+        """Parse an injected course-semester mapping, keeping unknown as ``None``."""
+        normalized: dict[str, int | None] = {}
+        for course_code, value in mapping.items():
+            code = self._normalize_course_code(course_code)
+            if not code:
+                continue
+            semester, _ = parse_semester(value)
+            current = normalized.get(code)
+            if semester is None:
+                normalized.setdefault(code, None)
+            elif current is None:
+                normalized[code] = semester
+            else:
+                normalized[code] = min(current, semester)
+        return normalized
+
+    def _load_course_semesters(self, path: str | Path) -> dict[str, int | None]:
+        """Read the earliest fixed semester for every course in ``courses.json``."""
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, list):
+            return {}
+
+        semesters: dict[str, int | None] = {}
+        for course in payload:
+            if not isinstance(course, Mapping):
+                continue
+            code = self._normalize_course_code(course.get("course_code"))
+            if not code:
+                continue
+            fixed: list[int] = []
+            for offering in course.get("offerings") or []:
+                if not isinstance(offering, Mapping):
+                    continue
+                semester, _ = parse_semester(offering.get("semester"))
+                if semester is not None:
+                    fixed.append(semester)
+            if code not in semesters:
+                semesters[code] = None
+            if fixed:
+                current = semesters[code]
+                semesters[code] = min(fixed + ([current] if current is not None else []))
+        return semesters
+
+    def _get_course_semesters(self) -> dict[str, int | None]:
+        """Return the lazily loaded, per-instance course-semester cache."""
+        if self._course_semesters_loaded:
+            return self._course_semesters or {}
+        path = self.courses_output_path or config.courses_output_path
+        self._course_semesters = self._load_course_semesters(path)
+        self._course_semesters_loaded = True
+        return self._course_semesters
+
+    def _concept_semester(self, concept: dict[str, Any]) -> int | None:
+        """Return a concept's earliest known course semester, or unknown.
+
+        A concept is only orderable when every source course has a fixed
+        semester.  Ignoring one unknown source would make the direction
+        depend on which records happened to be present, so this fails closed.
+        """
+        codes = concept.get("source_course_codes", []) or []
+        if isinstance(codes, str):
+            codes = [codes]
+        semesters: list[int] = []
+        course_semesters = self._get_course_semesters()
+        for course_code in codes:
+            semester = course_semesters.get(self._normalize_course_code(course_code))
+            if semester is None:
+                return None
+            semesters.append(semester)
+        return min(semesters) if semesters else None
 
     def _share_any_value(self, left: list[str], right: list[str]) -> bool:
         """Return whether two string lists overlap."""
         return bool(set(left) & set(right))
 
-    def _normalize_alias_key(self, text: str) -> str:
+    @staticmethod
+    def _normalize_alias_key(text: str) -> str:
         """Normalize aliases for case-insensitive and punctuation-insensitive matching."""
         normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
         normalized = normalized.replace("（", "(").replace("）", ")")
-        return re.sub(r"[\s_\-–—,，.。:：;；/\\()\[\]{}'\"`]+", "", normalized)
+        normalized = re.sub(r"[\s_\-–—,，.。:：;；/\\()\[\]{}'\"`]+", "", normalized)
+        while True:
+            stripped = False
+            for modifier in ALIAS_TRAILING_MODIFIERS:
+                if normalized.endswith(modifier) and len(normalized) > len(modifier):
+                    normalized = normalized[: -len(modifier)]
+                    stripped = True
+                    break
+            if not stripped:
+                break
+        for character in ALIAS_IGNORED_CHARACTERS:
+            normalized = normalized.replace(character, "")
+        return normalized
 
     def _cleanup_term(self, value: Any) -> str:
         """Trim concept strings and collapse internal whitespace."""

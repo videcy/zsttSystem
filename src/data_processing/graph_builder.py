@@ -14,6 +14,17 @@ CONCEPT_DEPENDENCY_TYPES = {
     "CONCEPTUAL_BASIS",
 }
 MANAGED_BY = "zsttSystem"
+PUBLIC_REQUIRED_COURSE_PREFIX = "MAR"
+
+
+def _is_public_required_concept(concept: dict) -> bool:
+    codes = concept.get("source_course_codes") or [concept.get("course_code")]
+    if isinstance(codes, str):
+        codes = [codes]
+    return any(
+        str(code or "").strip().upper().startswith(PUBLIC_REQUIRED_COURSE_PREFIX)
+        for code in codes
+    )
 
 
 def stable_id(label: str, value: str) -> str:
@@ -108,6 +119,11 @@ def build_graph_records(
         str(node["concept_id"])
         for node in nodes
         if node.get("label") == "Concept" and node.get("concept_id")
+    }
+    public_required_concept_ids = {
+        str(concept.get("id") or concept.get("concept_id"))
+        for concept in concepts
+        if _is_public_required_concept(concept)
     }
     for chunk in chunks if include_chunk_nodes else ():
         cid = chunk.get("chunk_id")
@@ -213,6 +229,8 @@ def build_graph_records(
             or source_id == target_id
             or source_id not in valid_concept_ids
             or target_id not in valid_concept_ids
+            or source_id in public_required_concept_ids
+            or target_id in public_required_concept_ids
             or not 0.0 <= confidence <= 1.0
             or confidence < verified_min_confidence
         ):
@@ -231,6 +249,8 @@ def build_graph_records(
                         "candidate_confidence",
                         "fusion_score",
                         "evidence",
+                        "source_evidence",
+                        "target_evidence",
                         "verification_source",
                     )
                     if key in dependency

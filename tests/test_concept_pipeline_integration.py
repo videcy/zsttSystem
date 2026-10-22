@@ -121,8 +121,20 @@ def test_dependency_validation_cache_reuses_only_complete_llm_results(
         "evidence": [],
     }
     registry = [
-        {"id": "source", "canonical_name": "线性规划"},
-        {"id": "target", "canonical_name": "整数规划"},
+        {
+            "id": "source",
+            "canonical_name": "线性规划",
+            "source_occurrences": [
+                {"evidence_sentence": "线性规划是本课程的基础模型。"}
+            ],
+        },
+        {
+            "id": "target",
+            "canonical_name": "整数规划",
+            "source_occurrences": [
+                {"evidence_sentence": "整数规划建立在规划模型之上。"}
+            ],
+        },
     ]
     cached_edge = {
         "source_id": "source",
@@ -155,7 +167,10 @@ def test_dependency_validation_cache_reuses_only_complete_llm_results(
             validation_cache_path=cache_path,
         )
 
-    assert first == second == [cached_edge]
+    assert len(first) == len(second) == 1
+    assert (first[0]["source_id"], first[0]["target_id"]) == ("source", "target")
+    assert first == second
+    assert first[0]["source_evidence"] == "线性规划是本课程的基础模型。"
     validator.assert_called_once()
 
 
@@ -188,7 +203,13 @@ def test_cached_edges_are_reused_before_new_validation_budget_is_applied(
         },
     ]
     registry = [
-        {"id": value, "canonical_name": value.upper()}
+        {
+            "id": value,
+            "canonical_name": value.upper(),
+            "source_occurrences": [
+                {"evidence_sentence": f"{value.upper()} is taught here."}
+            ],
+        }
         for value in ("a", "b", "c")
     ]
     cached_edge = {
