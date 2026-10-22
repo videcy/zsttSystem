@@ -52,6 +52,7 @@ services:
       context: .
       args:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        EMBEDDING_REQUIREMENTS: ${EMBEDDING_REQUIREMENTS:-requirements-local-embedding.txt}
     container_name: zstt_api
     env_file: .env
     environment:
@@ -80,6 +81,7 @@ services:
       context: .
       args:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        EMBEDDING_REQUIREMENTS: ${EMBEDDING_REQUIREMENTS:-requirements-local-embedding.txt}
     profiles: ["pipeline"]
     env_file: .env
     environment:
