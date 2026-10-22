@@ -781,3 +781,55 @@ def test_course_semesters_use_earliest_fixed_offering_across_plans_and_cache(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_failed_votes_keep_completed_pairs_in_validation_cache(tmp_path: Path) -> None:
+    def concept(concept_id: str, code: str) -> dict:
+        return {
+            "id": concept_id,
+            "canonical_name": concept_id,
+            "aliases": [concept_id],
+            "type": "concept",
+            "bloom_level": "understand",
+            "discipline": "information science",
+            "source_courses": [code],
+            "source_chapters": ["chapter"],
+            "source_course_codes": [code],
+        }
+
+    registry = [concept("a", "A100"), concept("b", "B200"), concept("c", "C300")]
+    candidates = [
+        {"source_id": "a", "target_id": "b", "fusion_score": 0.7, "initial_confidence": 0.7, "evidence": []},
+        {"source_id": "a", "target_id": "c", "fusion_score": 0.7, "initial_confidence": 0.7, "evidence": []},
+    ]
+    no_relation = {
+        "requires": False,
+        "relation_type": "NO_RELATION",
+        "confidence": 0.9,
+        "reason": "unrelated",
+        "dimensions": {},
+        "verification_source": "llm",
+    }
+
+    def validator(_candidate, _source, target):
+        if target["id"] == "c":
+            raise TimeoutError("provider timeout")
+        return dict(no_relation)
+
+    with patch(
+        "src.data_processing.concept_normalizer.create_deepseek_client",
+        return_value=object(),
+    ):
+        normalizer = ConceptNormalizer(wikipedia_enabled=False, llm_vote_count=3)
+    normalizer.require_complete_llm_validation = True
+    cache_path = tmp_path / "validation_cache.json"
+
+    with patch.object(normalizer, "_call_dependency_validator", side_effect=validator):
+        with pytest.raises(RuntimeError):
+            normalizer.verify_candidate_links(
+                candidates, registry, validation_cache_path=cache_path
+            )
+
+    cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert [(edge["source_id"], edge["target_id"]) for edge in cached.values()] == [("a", "b")]
+

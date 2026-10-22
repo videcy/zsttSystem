@@ -620,9 +620,11 @@ class ConceptNormalizer:
                 )
             )
 
-        vote_tables = self._collect_votes_concurrently(resolved)
+        vote_tables, vote_error = self._collect_votes_concurrently(resolved)
         verified_results: list[tuple[str, dict[str, Any] | None]] = [*cached_results]
         for index, (candidate, source, target, cache_key) in enumerate(resolved):
+            if vote_error is not None and vote_tables[index] is None:
+                continue
             verified_results.append(
                 (
                     cache_key,
@@ -646,6 +648,11 @@ class ConceptNormalizer:
             if self._is_public_required_concept(source) or self._is_public_required_concept(target):
                 continue
             edge = dict(edge)
+            # A transient provider failure must not become a durable validation
+            # result. Only complete LLM votes are safe to reuse.  Cache before
+            # the evidence filter so dropped pairs are not paid for again.
+            if edge.get("verification_source") == "llm":
+                validation_cache[cache_key] = edge
             if edge.get("requires") is True:
                 source_evidence = self._find_concept_evidence(source, chunk_index)
                 target_evidence = self._find_concept_evidence(target, chunk_index)
@@ -659,12 +666,11 @@ class ConceptNormalizer:
                 edge["source_evidence"] = source_evidence
                 edge["target_evidence"] = target_evidence
             verified_edges.append(edge)
-            # A transient provider failure must not become a durable validation
-            # result. Only complete LLM votes are safe to reuse.
-            if edge.get("verification_source") == "llm":
-                validation_cache[cache_key] = edge
         if validation_cache_path is not None:
             self._write_json(validation_cache_path, validation_cache)
+        if vote_error is not None:
+            # Completed votes are cached above, so a rerun only pays for the rest.
+            raise vote_error
 
         verified_edges.sort(
             key=lambda item: (-item["confidence"], item["target_id"], item["source_id"])
@@ -1018,7 +1024,7 @@ class ConceptNormalizer:
     def _collect_votes_concurrently(
         self,
         resolved: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]],
-    ) -> list[list[dict[str, Any]] | None]:
+    ) -> tuple[list[list[dict[str, Any]] | None], RuntimeError | None]:
         """Gather every self-consistency vote across one flat thread pool.
 
         Voting per candidate inside a worker capped the real API concurrency at
@@ -1026,13 +1032,16 @@ class ConceptNormalizer:
         pair hold a worker for all of its votes. Flattening the votes into the
         pool makes ``api_concurrency`` mean in-flight requests, which is also
         the number that matters for provider rate limits.
+
+        A candidate with any failed vote comes back as ``None`` together with
+        the first error, so the caller can keep the pairs that did finish.
         """
         if not resolved:
-            return []
+            return [], None
         if self.api_client is None:
             # Offline runs have no request to overlap; let the per-candidate
             # path apply its own fallback or fail-closed rule.
-            return [None] * len(resolved)
+            return [None] * len(resolved), None
 
         tasks = [
             index
@@ -1040,17 +1049,25 @@ class ConceptNormalizer:
             for _ in range(self.llm_vote_count)
         ]
 
-        def run_vote(index: int) -> tuple[int, dict[str, Any]]:
+        def run_vote(index: int) -> tuple[int, dict[str, Any] | RuntimeError]:
             candidate, source, target, _ = resolved[index]
-            return index, self._dependency_vote(candidate, source, target)
+            try:
+                return index, self._dependency_vote(candidate, source, target)
+            except RuntimeError as exc:
+                return index, exc
 
         vote_tables: list[list[dict[str, Any]] | None] = [[] for _ in resolved]
+        first_error: RuntimeError | None = None
         with ThreadPoolExecutor(max_workers=self.api_concurrency) as executor:
             # executor.map preserves input order, so votes land in a stable
             # order per candidate and majority ties break deterministically.
             for index, vote in executor.map(run_vote, tasks):
-                vote_tables[index].append(vote)
-        return vote_tables
+                if isinstance(vote, RuntimeError):
+                    first_error = first_error or vote
+                    vote_tables[index] = None
+                elif vote_tables[index] is not None:
+                    vote_tables[index].append(vote)
+        return vote_tables, first_error
 
     def _dependency_vote(
         self,
