@@ -55,6 +55,51 @@ def test_natural_semester_phrasings_route_to_fact() -> None:
         assert QueryRouter.classify(query) is QueryType.FACT
 
 
+def test_assessment_phrasings_route_to_fact() -> None:
+    for query in (
+        "《中外档案事业史》怎么考核？",
+        "《信息管理学基础》如何考核？",
+        "《信息管理学基础》怎么考试？",
+        "《信息管理学基础》考核形式是什么？",
+        "《信息管理学基础》考核办法是什么？",
+    ):
+        prediction = QueryRouter.classify_intent(query)
+        assert prediction.primary is QueryType.FACT, query
+        assert prediction.labels == (QueryType.FACT,), query
+
+
+def test_course_names_do_not_trigger_dependency_patterns() -> None:
+    for query in (
+        "《信息组织基础》主要讲什么内容？",
+        "《核聚变工程基础》主要讲什么内容？",
+        "《档案学基础》有哪些内容？",
+    ):
+        prediction = QueryRouter.classify_intent(query)
+        assert prediction.primary is QueryType.CONTENT, query
+        assert prediction.labels == (QueryType.CONTENT,), query
+
+
+def test_basis_outside_book_title_still_routes_to_dependency() -> None:
+    for query in (
+        "学《信息组织基础》需要什么基础？",
+        "学《X》需要什么基础？",
+    ):
+        assert QueryRouter.classify(query) is QueryType.DEPENDENCY, query
+
+
+def test_routing_regressions_keep_their_original_precedence() -> None:
+    expected = {
+        "信管专业要修哪些专业必修课？": QueryType.CATALOG,
+        "管理运筹学多少学分？": QueryType.FACT,
+        "《信息素养与创新思维》第三章讲什么？": QueryType.STRUCTURE,
+        "管理运筹学几学分，有哪些先修课？": QueryType.DEPENDENCY,
+        "《信息组织基础》主要讲什么内容？": QueryType.CONTENT,
+    }
+
+    for query, query_type in expected.items():
+        assert QueryRouter.classify(query) is query_type, query
+
+
 class _StubRouter(QueryRouter):
     """Router with every backend handler replaced by a recorded stub."""
 

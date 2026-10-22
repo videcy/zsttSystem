@@ -156,6 +156,11 @@ class Config:
         )
 
     @property
+    def course_name_similarity_threshold(self) -> float:
+        """Minimum ``difflib`` ratio for S1 course-name clarification candidates."""
+        return float(os.getenv("COURSE_NAME_SIMILARITY_THRESHOLD", "0.6"))
+
+    @property
     def graph_manifest_path(self) -> Path:
         return _path(os.getenv("GRAPH_MANIFEST_PATH", "outputs/graph_manifest.json"))
 

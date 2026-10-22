@@ -10,6 +10,7 @@ classification:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import re
 import json
 from dataclasses import dataclass, field
@@ -45,11 +46,43 @@ class QueryType(Enum):
 _DEPENDENCY_PATTERNS: list[str] = [
     r"(为什么|为何).{0,4}(学|需要|先修|前置|依赖|前提|先上)",
     r"(依赖|先修|前置|前提|基础).{0,4}(什么|哪些|哪个)",
+    # 书名号内的课名会在分类前被屏蔽，因此「学《X》需要什么基础」
+    # 需要由书名号外的问法本身命中 dependency。
+    r"(需要|需|要求|具备).{0,4}(什么|哪些|哪个).{0,2}(基础|前提|先修|前置|知识)",
     r"(课程|概念|知识).{0,4}(顺序|路径|依赖|关联)",
     r"(先学|后学|前置课程|先修课|预修课|前导课)",
     r"(有什么|有哪些).{0,4}(依赖|联系|关系|关联)",
     r"(怎么|如何).{0,4}(选修|选课|规划|安排)",
 ]
+
+_ASSESSMENT_MODE_PATTERN = (
+    r"怎么考核|如何考核|怎么考试|考核形式|考核办法"
+    r"|考核方式|怎么考|怎么评"
+)
+
+# 语料不记录字段（S2）。顺序即命中的优先级；只有课程已识别时才拒答。
+# 这里是封闭清单：不要把教材、考核方式等部分课程有记录的字段放进来。
+_UNRECORDED_FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        "上课地点/教室",
+        r"上课地点|上课教室|教室|在哪(?:里|儿)?上课|哪里上课",
+    ),
+    (
+        "考试具体日期/时间",
+        r"(?:期末|期中|课程|结课)?考试.{0,8}(?:具体)?"
+        r"(?:日期|时间|哪天|哪一天|什么时候|何时|几号)"
+        r"|(?:具体)?(?:日期|时间).{0,4}(?:期末|期中|课程)?考试",
+    ),
+    (
+        "历年成绩/平均分/及格率",
+        r"(?:历年|往年|去年|往届|上一届|上一学年).{0,8}"
+        r"(?:成绩|平均分|及格率)|平均分|及格率",
+    ),
+    (
+        "选课人数",
+        r"选课人数|多少人选(?:这|该|这门)?课|选这门课的有多少人",
+    ),
+)
 
 _FACT_PATTERNS: list[str] = [
     r"(学分|学时|开课学期|考核方式|任课教师|课程负责人|谁负责|负责人|教材|上课地点|教室)",
@@ -58,9 +91,12 @@ _FACT_PATTERNS: list[str] = [
     r"(老师是谁|哪位老师|主讲教师|授课教师|任课老师|授课老师|主讲老师)",
     r"(必修|选修|任选|公选|通识)",
     r"(期末考试|期中|平时成绩|考核|评分).{0,4}(方式|办法|比例|占比)",
+    _ASSESSMENT_MODE_PATTERN,
     # Natural phrasings of the semester field: routing evaluation showed that
     # ``开课学期`` alone missed every question a student actually types.
     r"(第几学期|什么学期|哪个学期|哪一学期|几年级).{0,3}(开|上|学|修|开课)?",
+    # S2 的封闭字段也必须稳定进入 fact，避免落到 hybrid 后做整体摘要。
+    *(pattern for _label, pattern in _UNRECORDED_FIELD_PATTERNS),
 ]
 
 _CATALOG_PATTERNS: list[str] = [
@@ -99,6 +135,19 @@ _INTENT_PATTERNS: tuple[tuple[QueryType, list[str]], ...] = (
     (QueryType.STRUCTURE, _STRUCTURE_PATTERNS),
     (QueryType.CONTENT, _CONTENT_PATTERNS),
 )
+
+_BOOK_TITLE_PATTERN = re.compile(r"《[^》]*》")
+
+
+def _mask_book_titles(text: str) -> str:
+    """Replace book-title contents before intent regex matching.
+
+    Course names such as 《信息组织基础》 can otherwise lend their own
+    substrings to dependency or other intent patterns.  Only the contents are
+    masked; the surrounding punctuation remains so phrases outside the title
+    keep their original boundaries.
+    """
+    return _BOOK_TITLE_PATTERN.sub("《》", text)
 
 # Below this confidence a single-label prediction is treated as unreliable and
 # falls through to the hybrid path, which retrieves more broadly.
@@ -275,7 +324,7 @@ _FACT_FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
         "instructor",
         r"任课教师|课程负责人|主讲教师|授课教师|谁负责|负责人|谁教|哪个老师|哪位老师|老师是谁",
     ),
-    ("assessment_mode", r"考核方式|考核形式|考核办法|怎么考核|如何考核|怎么考|怎么评"),
+    ("assessment_mode", _ASSESSMENT_MODE_PATTERN),
     (
         "grading_mode",
         r"成绩录入|成绩构成|成绩评定|成绩记载|评分方式|成绩比例|平时成绩占比",
@@ -322,6 +371,51 @@ _INSTRUCTOR_OWNER_PATTERN = r"课程负责人|负责人|谁负责"
 
 # 两源都没有记录时的固定文案：按拒答计，不自己编。
 _NO_INSTRUCTOR_RECORDED = "培养方案与教学大纲均未记录该课程的任课教师"
+_COURSE_NOT_FOUND_TEMPLATE = "培养方案中没有名为《{name}》的课程。"
+_COURSE_CLARIFY_PREFIX = "你是不是想问"
+_UNRECORDED_FIELD_TEMPLATE = "培养方案与教学大纲均未记录《{name}》的{field}。"
+
+
+_COURSE_NAME_PUNCTUATION = re.compile(
+    r"[\s\u3000·・_\-—–:：/\\（）()【】\[\]《》〈〉“”\"'、，,。.；;]+"
+)
+_COURSE_SOURCE_SUFFIX = re.compile(r"转自\s*doc", re.IGNORECASE)
+
+
+def _normalize_course_name(value: Any) -> str:
+    """Normalize a course name/alias for exact and character-level matching."""
+    text = str(value or "").strip().casefold()
+    text = _COURSE_SOURCE_SUFFIX.sub("", text)
+    return _COURSE_NAME_PUNCTUATION.sub("", text)
+
+
+def _course_display_name(course: dict[str, Any]) -> str:
+    """Return a user-facing course name without pipeline source suffixes."""
+    name = str(course.get("course_name") or course.get("course_code") or "").strip()
+    name = re.sub(r"\s*转自\s*doc$", "", name, flags=re.IGNORECASE).strip()
+    return name or str(course.get("course_code") or "").strip()
+
+
+def _course_alias_values(course: dict[str, Any]) -> list[str]:
+    aliases = course.get("aliases") or course.get("course_aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    values = [
+        course.get("course_code"),
+        course.get("course_name"),
+        course.get("english_name"),
+        *aliases,
+    ]
+    return [str(value).strip() for value in values if str(value or "").strip()]
+
+
+def _course_similarity_values(course: dict[str, Any]) -> list[str]:
+    """Aliases used for fuzzy matching; bare course codes score poorly and are excluded."""
+    aliases = course.get("aliases") or course.get("course_aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    values = [course.get("course_name"), course.get("english_name"), *aliases]
+    return [str(value).strip() for value in values if str(value or "").strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +492,158 @@ class QueryRouter:
         self._doc_tree_override: Any = None
 
     # ------------------------------------------------------------------
+    # S1/S2 safety gates
+    # ------------------------------------------------------------------
+    def _course_alias_index(self) -> dict[str, list[dict[str, Any]]]:
+        """Build a normalized exact index over course names, aliases and codes."""
+        index: dict[str, list[dict[str, Any]]] = {}
+        for course in self.courses:
+            for value in _course_alias_values(course):
+                normalized = _normalize_course_name(value)
+                if not normalized:
+                    continue
+                bucket = index.setdefault(normalized, [])
+                if not any(item is course for item in bucket):
+                    bucket.append(course)
+        return index
+
+    @staticmethod
+    def _bracketed_course_names(query: str) -> list[str]:
+        return [
+            match.strip()
+            for match in re.findall(r"《([^《》]+)》", query)
+            if match.strip()
+        ]
+
+    def _course_from_bracketed_name(self, name: str) -> dict[str, Any] | None:
+        matches = self._course_alias_index().get(_normalize_course_name(name), [])
+        if not matches:
+            return None
+        return max(matches, key=lambda course: len(_course_display_name(course)))
+
+    def _linked_course(self, query: str) -> dict[str, Any] | None:
+        """Resolve the course without changing ``_link_course``'s legacy rules."""
+        linked = self._link_course(query)
+        if linked is not None:
+            return linked
+        for name in self._bracketed_course_names(query):
+            course = self._course_from_bracketed_name(name)
+            if course is not None:
+                return course
+        return None
+
+    def _course_name_gate(self, query: str) -> RouteResult | None:
+        """S1: validate every 《课程名》 before any backend is dispatched."""
+        names = self._bracketed_course_names(query)
+        if not names or not self.courses:
+            return None
+
+        alias_index = self._course_alias_index()
+        unknown = next(
+            (
+                name
+                for name in names
+                if _normalize_course_name(name) not in alias_index
+            ),
+            None,
+        )
+        if unknown is None:
+            return None
+
+        normalized_unknown = _normalize_course_name(unknown)
+        threshold = config.course_name_similarity_threshold
+        scored: list[tuple[float, str, dict[str, Any]]] = []
+        for course in self.courses:
+            best_score = max(
+                (
+                    difflib.SequenceMatcher(
+                        None,
+                        normalized_unknown,
+                        _normalize_course_name(value),
+                    ).ratio()
+                    for value in _course_similarity_values(course)
+                ),
+                default=0.0,
+            )
+            if best_score >= threshold:
+                scored.append((best_score, _course_display_name(course), course))
+
+        # 同一门课可能同时命中课程名和英文名/别名，按课程身份去重。
+        candidates: list[tuple[float, str, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in sorted(scored, key=lambda item: (-item[0], item[1])):
+            _score, display, course = row
+            identity = (
+                str(course.get("course_code") or ""),
+                _normalize_course_name(display),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(row)
+            if len(candidates) == 3:
+                break
+
+        if not candidates:
+            return RouteResult(
+                _COURSE_NOT_FOUND_TEMPLATE.format(name=unknown),
+                query_type="refused",
+                metadata={
+                    "status": "refused",
+                    "error_code": "COURSE_NOT_FOUND",
+                    "course_name": unknown,
+                },
+            )
+
+        candidate_names = [display for _score, display, _course in candidates]
+        question = "/".join(f"《{name}》" for name in candidate_names)
+        return RouteResult(
+            f"{_COURSE_CLARIFY_PREFIX}{question}？",
+            query_type="clarify",
+            metadata={
+                "status": "clarify",
+                "error_code": "COURSE_AMBIGUOUS",
+                "course_name": unknown,
+                "candidates": candidate_names,
+            },
+        )
+
+    def _unrecorded_field_gate(self, query: str) -> RouteResult | None:
+        """S2: refuse known courses' never-recorded fields without retrieval."""
+        if not self.courses:
+            return None
+        course = self._linked_course(query)
+        if course is None:
+            return None
+        matched_field = next(
+            (
+                label
+                for label, pattern in _UNRECORDED_FIELD_PATTERNS
+                if re.search(pattern, query)
+            ),
+            None,
+        )
+        if matched_field is None:
+            return None
+        display_name = _course_display_name(course)
+        return RouteResult(
+            _UNRECORDED_FIELD_TEMPLATE.format(
+                name=display_name,
+                field=matched_field,
+            ),
+            query_type="fact",
+            metadata={
+                "status": "refused",
+                "error_code": "FIELD_NOT_RECORDED",
+                "course_code": course.get("course_code"),
+                "course_name": display_name,
+                "field": matched_field,
+                "vector_hits": 0,
+                "llm_used": False,
+            },
+        )
+
+    # ------------------------------------------------------------------
     # Intent classification
     # ------------------------------------------------------------------
     @staticmethod
@@ -408,7 +654,7 @@ class QueryRouter:
         what changes is that a query is allowed to carry more than one intent
         and to report how confident the winning one is.
         """
-        textual = query.strip().lower()
+        textual = _mask_book_titles(query.strip().lower())
         scores: dict[str, int] = {}
         matched: list[QueryType] = []
         for query_type, patterns in _INTENT_PATTERNS:
@@ -461,6 +707,18 @@ class QueryRouter:
         metadata indicating which backends were used.
         """
         intent = self.classify_intent(query)
+        safety_gate = self._course_name_gate(query)
+        if safety_gate is None:
+            safety_gate = self._unrecorded_field_gate(query)
+        if safety_gate is not None:
+            safety_gate.query_type = intent.primary.value
+            safety_gate.metadata.update(
+                persona=persona,
+                persona_mode=PERSONA_MODE,
+                persona_profile_version=PERSONA_PROFILE_VERSION,
+                **intent.as_metadata(),
+            )
+            return safety_gate
         merge_labels = self._mergeable_labels(intent)
 
         if merge_labels:
@@ -1142,6 +1400,24 @@ class QueryRouter:
             return ""
         return text[:limit] + ("…" if len(text) > limit else "")
 
+    @staticmethod
+    def _first_chunk_id(node: Any) -> str | None:
+        """Return the node's first usable chunk id, if it has one."""
+        for chunk_id in getattr(node, "chunk_ids", None) or []:
+            value = str(chunk_id or "").strip()
+            if value:
+                return value
+        return None
+
+    @classmethod
+    def _first_outline_chunk_id(cls, outline: list[Any]) -> str | None:
+        """Return the first usable chunk id in document-tree node order."""
+        for node in outline:
+            chunk_id = cls._first_chunk_id(node)
+            if chunk_id:
+                return chunk_id
+        return None
+
     @classmethod
     def _render_chapter_answer(
         cls,
@@ -1174,6 +1450,9 @@ class QueryRouter:
             "course_name": course.get("course_name"),
             "section": title,
         }
+        chunk_id = cls._first_chunk_id(node)
+        if chunk_id:
+            citation["chunk_id"] = chunk_id
         return "\n".join(lines), [citation]
 
     @classmethod
@@ -1220,6 +1499,9 @@ class QueryRouter:
             "course_name": course.get("course_name"),
             "section": "教学进度",
         }
+        chunk_id = cls._first_outline_chunk_id(outline)
+        if chunk_id:
+            citation["chunk_id"] = chunk_id
         return "\n".join(lines), [citation], count
 
     async def _structure_fallback(
@@ -1505,8 +1787,7 @@ class QueryRouter:
             f"{category_keyword or ''}课程包括：\n"
             + "\n".join(f"{index}. {line}" for index, line in enumerate(lines, 1))
         )
-        citations: list[dict[str, Any]] = []
-        seen_sources: set[str] = set()
+        citations_by_source: dict[str, dict[str, Any]] = {}
         for course, offering in matches:
             citation = self._catalog_citation(course, offering)
             citation["course_code"] = None
@@ -1516,9 +1797,17 @@ class QueryRouter:
                 f" / {offering.get('course_subcategory', '')}"
             ).strip(" /")
             source = str(citation.get("source_file", ""))
-            if source and source not in seen_sources:
-                citations.append(citation)
-                seen_sources.add(source)
+            if not source:
+                continue
+            grouped = citations_by_source.get(source)
+            if grouped is None:
+                citation["course_codes"] = []
+                citations_by_source[source] = citation
+                grouped = citation
+            course_code = str(course.get("course_code") or "").strip()
+            if course_code and course_code not in grouped["course_codes"]:
+                grouped["course_codes"].append(course_code)
+        citations = list(citations_by_source.values())
         return RouteResult(
             description,
             citations,
