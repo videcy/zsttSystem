@@ -5,14 +5,12 @@
 # API with one checkout and one `docker compose up`.
 FROM python:3.11-slim
 
-ARG GIT_COMMIT=unknown
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     # Keep the sentence-transformer download on a mounted volume instead of
     # baking a 400 MB model into the image.
-    HF_HOME=/models \
-    GIT_COMMIT=${GIT_COMMIT}
+    HF_HOME=/models
 
 WORKDIR /app
 
@@ -32,6 +30,11 @@ RUN useradd --create-home --uid 10001 zstt \
     && mkdir -p /app/outputs /app/data/syllabi /app/data/training_plans /models \
     && chown -R zstt:zstt /app /models
 USER zstt
+
+# Declared last: the commit changes on every build and would otherwise
+# invalidate the dependency layer above.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 
 EXPOSE 8000
 
