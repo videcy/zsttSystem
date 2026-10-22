@@ -6,6 +6,8 @@ without re-reading the corpus:
 ``question``            the user-facing query, verbatim
 ``expected_route``      ``fact`` | ``content`` | ``dependency`` | ``catalog`` |
                         ``hybrid`` -- the path that *should* answer it
+``acceptable_routes``   additional routes that are valid for an unanswerable
+                        item, where the route itself is not the graded point
 ``answerable``          ``False`` for the deliberately unanswerable items that
                         measure the refusal mechanism
 ``answer_keys``         substrings that must appear in a correct answer; an
@@ -30,6 +32,7 @@ class GoldItem:
     id: str
     question: str
     expected_route: str
+    acceptable_routes: list[str] = field(default_factory=list)
     answerable: bool = True
     answer_keys: list[str] = field(default_factory=list)
     gold_chunk_ids: list[str] = field(default_factory=list)
@@ -57,6 +60,12 @@ class GoldItem:
                 f"{self.id}: expected_route {self.expected_route!r} "
                 f"not in {ROUTES}"
             )
+        for route in self.acceptable_routes:
+            if route not in ROUTES:
+                problems.append(
+                    f"{self.id}: acceptable_routes value {route!r} "
+                    f"not in {ROUTES}"
+                )
         if self.answerable and not (
             self.answer_keys or self.gold_chunk_ids or self.gold_course_codes
         ):

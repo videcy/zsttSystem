@@ -22,10 +22,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -43,6 +45,33 @@ from src.online_service.query_router import QueryRouter  # noqa: E402
 
 ROUTE_LABELS = ("fact", "content", "dependency", "catalog", "hybrid", "structure")
 DEFAULT_STAGES = ("routing", "retrieval", "answer")
+
+
+def resolve_git_commit(
+    *,
+    env: Mapping[str, str] | None = None,
+    repo_root: Path | None = None,
+) -> str:
+    """Return the build/runtime commit without making eval depend on git."""
+    environment = os.environ if env is None else env
+    from_env = str(environment.get("GIT_COMMIT") or "").strip()
+    if from_env:
+        return from_env
+
+    root = repo_root or Path(__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    commit = str(result.stdout or "").strip()
+    return commit or "unknown"
 
 
 def resolve_dataset_path(explicit: str | None = None) -> Path:
@@ -75,6 +104,9 @@ def grade_routing(items: Sequence[GoldItem]) -> dict[str, Any]:
                 "expected_route": item.expected_route,
                 "predicted_route": prediction.primary.value,
                 "predicted_labels": [label.value for label in prediction.labels],
+                "acceptable_routes": list(
+                    getattr(item, "acceptable_routes", ()) or ()
+                ),
                 "confidence": prediction.confidence,
             }
         )
@@ -177,6 +209,10 @@ async def grade_answers(
                 route_result.citations,
                 gold_chunk_ids=item.gold_chunk_ids,
                 gold_course_codes=item.gold_course_codes,
+            ),
+            "citation_precision_chunk": metrics.citation_precision_chunk(
+                route_result.citations,
+                gold_chunk_ids=item.gold_chunk_ids,
             ),
             # M5.2 新指标：章节覆盖率 / 顺序正确率 / 教师字段准确率。
             "chapter_coverage": metrics.chapter_coverage(
@@ -346,6 +382,22 @@ def render_markdown(report: dict[str, Any]) -> str:
     nli = report.get("nli_attribution")
     if nli:
         lines.extend([metrics.render_metric_table(nli, "NLI 归因（--dump-nli）"), ""])
+    concept_edges = report.get("concept_edges")
+    if concept_edges:
+        lines.extend(
+            [
+                "### 概念依赖边人工抽检",
+                "",
+                "| 准确率 | 可接受率 | 样本量 | 已标注 | 抽样方式 |",
+                "| --- | --- | --- | --- | --- |",
+                f"| {concept_edges.get('accuracy', 0.0):.2%} | "
+                f"{concept_edges.get('acceptable_accuracy', 0.0):.2%} | "
+                f"{concept_edges.get('sample_size', 0)} | "
+                f"{concept_edges.get('labelled_size', 0)} | "
+                f"`{concept_edges.get('sampling_method', '')}` |",
+                "",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -380,6 +432,7 @@ def evaluate(
     keep_details: bool = True,
     collection_name: str | None = None,
     dump_nli: bool = False,
+    concept_edges_gold: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the requested stages and assemble one report dictionary."""
     stages = tuple(stages)
@@ -402,6 +455,7 @@ def evaluate(
         "dataset_summary": dataset_summary(items),
         "stages": list(stages),
         "environment": {
+            "git_commit": resolve_git_commit(),
             "embedding_model": config.retrieval_model_name,
             "collection": retriever.collection_name if retriever else None,
             "indexed_chunks": retriever.count if retriever else 0,
@@ -412,6 +466,13 @@ def evaluate(
             "persona": persona or "per-item",
         },
     }
+    gold_path = Path(concept_edges_gold) if concept_edges_gold else Path(
+        "eval/datasets/concept_edges_gold.json"
+    )
+    if gold_path.exists():
+        from eval.concept_edges_eval import evaluate_gold
+
+        report["concept_edges"] = evaluate_gold(gold_path)
 
     try:
         if "routing" in stages:
@@ -482,6 +543,11 @@ def main() -> None:
         action="store_true",
         help="导出逐条 claim 的 NLI 明细（verdict/相似度/是否保留）与归因表（默认关闭）",
     )
+    parser.add_argument(
+        "--concept-edges-gold",
+        default=None,
+        help="概念依赖边人工抽检金标；默认读取 eval/datasets/concept_edges_gold.json（存在时）",
+    )
     parser.add_argument("--output-dir", default=None)
     arguments = parser.parse_args()
 
@@ -500,6 +566,7 @@ def main() -> None:
         use_llm=not arguments.no_llm,
         use_neo4j=not arguments.no_neo4j,
         dump_nli=arguments.dump_nli,
+        concept_edges_gold=arguments.concept_edges_gold,
     )
     directory = Path(arguments.output_dir) if arguments.output_dir else config.eval_report_dir
     json_path, markdown_path = write_report(report, directory)

@@ -19,6 +19,17 @@ python eval/run_eval.py                # 索引就绪后跑全量三阶段
 报告写到 `eval/reports/<时间戳>-<tag>.json` 与同名 `.md`。`.md` 可以直接贴进
 论文初稿，`.json` 保留逐题明细，用于错误分析。
 
+在 Docker Compose 容器里跑评测时，报告统一写到已挂载的
+`/app/outputs/eval-reports`，这样重建容器不会丢失：
+
+```bash
+docker compose exec api python eval/run_eval.py \
+  --output-dir /app/outputs/eval-reports
+```
+
+`./eval/datasets` 会挂载到容器的 `/app/eval/datasets`，因此人工标注的评测集
+也不会随镜像重建而消失。
+
 ---
 
 ## 1. 数据集
@@ -120,6 +131,7 @@ python eval/run_eval.py                # 索引就绪后跑全量三阶段
 | `tune_rerank.py` | 最优权重 + 敏感性曲线 | 回答"为什么是 0.75" |
 | `persona_overlap.py` | 角色两两重合率 | 决定角色感知的表述强度 |
 | `concept_eval.py` | 规则基线 vs LLM 抽取 P/R/F1 | 概念抽取质量表 |
+| `concept_edges_eval.py` | 概念依赖边分层抽检与准确率 | 验证入选边的真实有效率 |
 
 ```bash
 python eval/ablation.py --with-answers
@@ -127,7 +139,14 @@ python eval/tune_rerank.py --metric recall@5
 python eval/persona_overlap.py --top-k 5
 python eval/concept_eval.py --make-template --courses 20   # 先标注
 python eval/concept_eval.py
+python eval/concept_edges_eval.py --make-template           # 生成 50 条分层抽检
+python eval/concept_edges_eval.py                           # 标注后计算准确率
 ```
+
+`concept_edges_eval.py` 按有向课程对分层，从 `requires=true` 的入选边中
+抽取 50 条；模板中标 `成立 / 不成立 / 勉强`。严格准确率只把“成立”算正确，
+同时报告“成立+勉强”的可接受率、样本量和抽样方式。`run_eval.py` 检测到
+`eval/datasets/concept_edges_gold.json` 时，也会把该指标写入主评测报告。
 
 ### 嵌入模型消融（hash vs 真实向量）
 

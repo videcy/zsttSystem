@@ -30,6 +30,9 @@ REFUSAL_MARKERS: tuple[str, ...] = (
     "证据不足",
     "无法确认",
     "无法回答",
+    "培养方案中没有名为",
+    "你是不是想问",
+    "均未记录",
     # Degraded-backend messages: not an answer either, and counting them as
     # answers would inflate the hallucination rate whenever Neo4j is down.
     "未连接 Neo4j",
@@ -113,7 +116,15 @@ def routing_report(
         for item in results
     ]
     matrix = confusion_matrix(pairs, labels)
-    correct = sum(1 for gold, predicted in pairs if gold == predicted)
+    correct = 0
+    for item, (_, predicted) in zip(results, pairs):
+        accepted = {str(item["expected_route"])}
+        acceptable = item.get("acceptable_routes") or ()
+        if isinstance(acceptable, str):
+            acceptable = (acceptable,)
+        accepted.update(str(route) for route in acceptable)
+        if predicted in accepted:
+            correct += 1
     in_labels = sum(
         1
         for item in results
@@ -247,13 +258,46 @@ def citation_precision(
         return None
     correct = 0
     for citation in citations:
-        chunk_id = str(citation.get("chunk_id", ""))
-        course_code = str(citation.get("course_code", ""))
-        if gold_ids and chunk_id in gold_ids:
-            correct += 1
-        elif not gold_ids and gold_courses and course_code in gold_courses:
+        chunk_id = str(citation.get("chunk_id") or "")
+        if gold_ids and chunk_id:
+            if chunk_id in gold_ids:
+                correct += 1
+            continue
+        if not gold_courses:
+            continue
+        course_code = str(citation.get("course_code") or "")
+        if course_code:
+            citation_courses = {course_code}
+        else:
+            course_codes = citation.get("course_codes") or ()
+            if isinstance(course_codes, str):
+                course_codes = (course_codes,)
+            citation_courses = {str(code) for code in course_codes if code}
+        if citation_courses & gold_courses:
             correct += 1
     return round(correct / len(citations), 4)
+
+
+def citation_precision_chunk(
+    citations: Sequence[Mapping[str, Any]],
+    *,
+    gold_chunk_ids: Sequence[str] = (),
+) -> float | None:
+    """Share of chunk-bearing citations whose chunk id is in the gold set."""
+    chunk_citations = [
+        citation
+        for citation in citations
+        if str(citation.get("chunk_id") or "")
+    ]
+    gold_ids = {str(value) for value in gold_chunk_ids}
+    if not chunk_citations or not gold_ids:
+        return None
+    correct = sum(
+        1
+        for citation in chunk_citations
+        if str(citation.get("chunk_id")) in gold_ids
+    )
+    return round(correct / len(chunk_citations), 4)
 
 
 def generation_report(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -267,6 +311,11 @@ def generation_report(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         item["citation_precision"]
         for item in results
         if item.get("citation_precision") is not None
+    ]
+    chunk_citation_scores = [
+        item["citation_precision_chunk"]
+        for item in results
+        if item.get("citation_precision_chunk") is not None
     ]
     with_answer = [item for item in results if item.get("answerable")]
     report: dict[str, Any] = {
@@ -286,6 +335,12 @@ def generation_report(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             else None
         ),
         "scored_citations": len(citation_scores),
+        "citation_precision_chunk": (
+            round(sum(chunk_citation_scores) / len(chunk_citation_scores), 4)
+            if chunk_citation_scores
+            else None
+        ),
+        "scored_chunk_citations": len(chunk_citation_scores),
     }
     if with_answer:
         report["uncited_answer_rate"] = round(
