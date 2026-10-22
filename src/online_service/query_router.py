@@ -521,17 +521,6 @@ class QueryRouter:
             return None
         return max(matches, key=lambda course: len(_course_display_name(course)))
 
-    def _linked_course(self, query: str) -> dict[str, Any] | None:
-        """Resolve the course without changing ``_link_course``'s legacy rules."""
-        linked = self._link_course(query)
-        if linked is not None:
-            return linked
-        for name in self._bracketed_course_names(query):
-            course = self._course_from_bracketed_name(name)
-            if course is not None:
-                return course
-        return None
-
     def _course_name_gate(self, query: str) -> RouteResult | None:
         """S1: validate every 《课程名》 before any backend is dispatched."""
         names = self._bracketed_course_names(query)
@@ -612,7 +601,7 @@ class QueryRouter:
         """S2: refuse known courses' never-recorded fields without retrieval."""
         if not self.courses:
             return None
-        course = self._linked_course(query)
+        course = self._link_course(query)
         if course is None:
             return None
         matched_field = next(
@@ -1621,8 +1610,21 @@ class QueryRouter:
 
     def _link_course(self, query: str) -> dict[str, Any] | None:
         lowered = query.lower()
-        matches = [c for c in self.courses if str(c.get("course_code", "")).lower() in lowered or str(c.get("course_name", "")) in query]
-        return max(matches, key=lambda c: len(str(c.get("course_name", "")))) if matches else None
+        # Syllabus-only courses are stored as "X 转自DOC"; users type just "X".
+        matches = [
+            c
+            for c in self.courses
+            if str(c.get("course_code", "")).lower() in lowered
+            or str(c.get("course_name", "")) in query
+            or _course_display_name(c) in query
+        ]
+        if matches:
+            return max(matches, key=lambda c: len(_course_display_name(c)))
+        for name in self._bracketed_course_names(query):
+            course = self._course_from_bracketed_name(name)
+            if course is not None:
+                return course
+        return None
 
     @property
     def program_index(self) -> ProgramIndex:

@@ -399,3 +399,19 @@ def test_chapter_summary_drops_heading_path_and_table_labels() -> None:
     summary = QueryRouter._chapter_summary(None, node)
 
     assert summary == "1数字信息环境变化 2数字信息组织理论"
+
+
+def test_link_course_matches_syllabus_only_names_without_source_suffix() -> None:
+    router = QueryRouter.__new__(QueryRouter)
+    router.courses = [
+        {"course_code": "IM301", "course_name": "情报学概论 转自DOC"},
+        {"course_code": "IM302", "course_name": "工匠书缘 古籍的修复与文化传承 转自DOC"},
+    ]
+
+    for query, code in [
+        ("《情报学概论》的任课教师是谁？", "IM301"),
+        ("情报学概论的老师是谁", "IM301"),
+        ("《工匠书缘：古籍的修复与文化传承》的任课教师是谁？", "IM302"),
+    ]:
+        course = router._link_course(query)
+        assert course is not None and course["course_code"] == code, query
