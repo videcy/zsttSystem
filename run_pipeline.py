@@ -494,7 +494,8 @@ def run_concept_stage() -> bool:
                 validation_cache_path=config.concept_validation_cache_path,
             )
         except RuntimeError as exc:
-            print(f"[concept] skipped: {exc}")
+            cause = f" (cause: {exc.__cause__!r})" if exc.__cause__ else ""
+            print(f"[concept] skipped: {exc}{cause}")
             return False
 
     enriched_by_id = {
