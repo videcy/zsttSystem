@@ -31,6 +31,11 @@ RUN useradd --create-home --uid 10001 zstt \
     && chown -R zstt:zstt /app /models
 USER zstt
 
+# Declared last: the commit changes on every build and would otherwise
+# invalidate the dependency layer above.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \

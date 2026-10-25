@@ -48,7 +48,11 @@ services:
   # The API itself. Service names replace the loopback addresses used by a
   # host-side .env, so the container talks to the compose network.
   api:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        EMBEDDING_REQUIREMENTS: ${EMBEDDING_REQUIREMENTS:-requirements-local-embedding.txt}
     container_name: zstt_api
     env_file: .env
     environment:
@@ -56,11 +60,14 @@ services:
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
       NEO4J_URI: bolt://neo4j:7687
+      # eval/reports is baked into the image; reports must land on the mounted volume.
+      EVAL_REPORT_DIR: outputs/eval-reports
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
       - corpus_data:/app/data
       - ./outputs:/app/outputs
+      - ./eval/datasets:/app/eval/datasets
       - model_cache:/models
     depends_on:
       chromadb:
@@ -72,7 +79,11 @@ services:
   # One-shot offline pipeline:
   #   docker compose --profile pipeline run --rm pipeline
   pipeline:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        EMBEDDING_REQUIREMENTS: ${EMBEDDING_REQUIREMENTS:-requirements-local-embedding.txt}
     profiles: ["pipeline"]
     env_file: .env
     environment:
@@ -89,7 +100,7 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
-    command: ["python", "run_pipeline.py", "all"]
+    command: ["python", "run_pipeline.py", "--stage", "all"]
 
 volumes:
   chroma_data:

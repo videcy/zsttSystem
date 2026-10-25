@@ -26,6 +26,22 @@ _PROMPT_TEMPLATE_ANNOTATION = re.compile(r"[（(][^（()）]*(?:必填|细化至
 # 兜底摘要不能把它当成要点。
 _HEADING_PATH_LINE = re.compile(r"^[^。！？；\n]{1,80}\s/\s[^。！？；\n]{1,80}。?$")
 
+# 进度表的合计行没有回答价值，不能进入兜底摘要。
+_TOTAL_ROW = re.compile(r"^合计[:：]?\s*\d+")
+
+# 以冒号结尾的整行是引出下文的过渡句（「核心内容：」「……相关信息如下：」），
+# 本身不是事实。
+_TRANSITION_LABELS = frozenset({"核心内容：", "教学要点：", "课程概览："})
+
+
+def _is_transition_sentence(text: str) -> bool:
+    normalized = text.strip()
+    return (
+        not normalized
+        or normalized.endswith(("：", ":"))
+        or normalized in _TRANSITION_LABELS
+    )
+
 # 生成与改写 prompt 共用的证据顺序约束（M6.6）。
 _EVIDENCE_ORDER_CONSTRAINT = (
     "证据按原文顺序排列；涉及章节时按章节号顺序列出，不得合并或跳过证据中出现的章节。"
@@ -223,12 +239,18 @@ def build_fallback_answer(
             if passage.strip()
             and passage.strip() != section
             and not _HEADING_PATH_LINE.match(passage.strip())
+            and not _TOTAL_ROW.match(passage.strip())
         ]
         if not passages:
             continue
+        candidates = [
+            passage for passage in passages if not _is_transition_sentence(passage)
+        ]
+        if not candidates:
+            continue
         if re.search(r"学什么|主要学习|主要讲|讲什么|课程内容", query):
             summary = max(
-                enumerate(passages),
+                enumerate(candidates),
                 key=lambda value: (
                     3 * ("掌握" in value[1])
                     + 2 * ("学习" in value[1] or "包括" in value[1])
@@ -237,7 +259,7 @@ def build_fallback_answer(
                 ),
             )[1]
         else:
-            summary = passages[0]
+            summary = candidates[0]
         if len(summary) > 140:
             summary = summary[:137].rstrip("，,；;：: ") + "……"
         bullet = f"- {section}：{summary}"
@@ -332,12 +354,11 @@ def _split_sentences(answer: str) -> list[str]:
                 continue
             in_source_listing = False
         normalized = re.sub(r"^(?:[-*•]|\d+[.)、])\s*", "", normalized)
-        # 以冒号结尾的整行是引出下文的过渡句（「核心内容：」「……相关信息如下：」），本身不是事实
-        if not normalized or normalized.endswith(("：", ":")):
+        if _is_transition_sentence(normalized):
             continue
         for part in re.split(r"(?<=[。！？!?；;])\s*", normalized):
             claim = part.strip()
-            if claim and claim not in {"核心内容：", "教学要点：", "课程概览："}:
+            if not _is_transition_sentence(claim):
                 claims.append(claim)
     return claims
 

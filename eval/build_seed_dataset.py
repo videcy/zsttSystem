@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -95,6 +96,9 @@ CONTENT_SECTIONS = (
     "overview",
 )
 
+#: 文档标题末尾可能带来源标记（如 ``_转自DOC`` / `` 转自 DOC``）。
+_DOC_SOURCE_SUFFIX = re.compile(r"[\s_]*转自[\s_]*DOC\s*$", re.IGNORECASE)
+
 
 def _load(path: Path) -> Any:
     if not path.exists():
@@ -118,6 +122,14 @@ def _format_value(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value)
+
+
+def _clean_course_name(value: Any) -> str:
+    """Return a user-facing course name without a ``转自DOC`` title suffix."""
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    return _DOC_SOURCE_SUFFIX.sub("", name).strip()
 
 
 def _fact_items(
@@ -148,7 +160,7 @@ def _fact_items(
             if pass_index == 0 and code in used_courses:
                 continue
             used_courses.add(code)
-            name = str(course.get("course_name") or code)
+            name = _clean_course_name(course.get("course_name")) or code
             value = _format_value(course.get(field))
             items.append(
                 GoldItem(
@@ -183,7 +195,7 @@ def _content_items(
     rng.shuffle(pool)
     items: list[GoldItem] = []
     for course in pool[: QUOTAS["content"]]:
-        name = str(course["course_name"])
+        name = _clean_course_name(course["course_name"])
         items.append(
             GoldItem(
                 id=f"content-{len(items) + 1:03d}",
@@ -219,10 +231,12 @@ def _dependency_items(
             if len(items) >= QUOTAS["dependency"]:
                 break
             template = DEPENDENCY_TEMPLATES[template_index % len(DEPENDENCY_TEMPLATES)]
-            name = str(course.get("course_name") or course["course_code"])
+            name = _clean_course_name(course.get("course_name")) or str(
+                course["course_code"]
+            )
             prerequisites = [str(code) for code in course.get("prerequisites") or []]
             prerequisite_names = [
-                str(by_code.get(code, {}).get("course_name") or code)
+                _clean_course_name(by_code.get(code, {}).get("course_name")) or code
                 for code in prerequisites
             ]
             if not prerequisite_names:
@@ -287,7 +301,7 @@ def _catalog_items(courses: list[dict[str, Any]], rng: random.Random) -> list[Go
             members = by_program[program]
             keys = list(
                 dict.fromkeys(
-                    str(course.get("course_name"))
+                    _clean_course_name(course.get("course_name"))
                     for course in members
                     if course.get("course_name")
                 )
@@ -371,8 +385,11 @@ def _unanswerable_items(
         items.append(
             GoldItem(
                 id=f"noanswer-{len(items) + 1:03d}",
-                question=template.format(name=str(course["course_name"])),
+                question=template.format(
+                    name=_clean_course_name(course["course_name"])
+                ),
                 expected_route="fact",
+                acceptable_routes=["fact", "hybrid"],
                 answerable=False,
                 gold_course_codes=[str(course["course_code"])],
                 source="auto-seed",
@@ -478,8 +495,34 @@ def _node_chunk_ids(node: Mapping[str, Any]) -> list[str]:
     return [str(cid) for cid in ids if str(cid)]
 
 
-def _document_name(document: Mapping[str, Any]) -> str:
-    return str(document.get("course_name") or document.get("course_code") or "").strip()
+def _document_name(
+    document: Mapping[str, Any],
+    course_names: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve a display name, preferring the course catalogue over doc titles."""
+    code = str(document.get("course_code") or "").strip()
+    catalogue_name = _clean_course_name((course_names or {}).get(code))
+    if catalogue_name:
+        return catalogue_name
+    return _clean_course_name(
+        document.get("course_name") or document.get("title") or code
+    )
+
+
+def _course_name_map(courses: list[dict[str, Any]], doc_tree: Any) -> dict[str, str]:
+    """Build code -> name from doc titles, then override with courses.json."""
+    names: dict[str, str] = {}
+    for document in _documents(doc_tree):
+        code = str(document.get("course_code") or "").strip()
+        name = _document_name(document)
+        if code and name:
+            names[code] = name
+    for course in courses:
+        code = str(course.get("course_code") or "").strip()
+        name = _clean_course_name(course.get("course_name"))
+        if code and name:
+            names[code] = name
+    return names
 
 
 def _profile_records(profiles: Any) -> list[tuple[str, dict[str, Any]]]:
@@ -556,11 +599,15 @@ def _spread(candidates: list[Any], quota: int, group_key: Any) -> list[Any]:
     return picked
 
 
-def _structure_chapter_items(doc_tree: Any, rng: random.Random) -> list[GoldItem]:
+def _structure_chapter_items(
+    doc_tree: Any,
+    rng: random.Random,
+    course_names: Mapping[str, str] | None = None,
+) -> list[GoldItem]:
     """《X》第 N 章讲什么？——chunk 级金标 = 该章 chunk_ids。"""
     candidates: list[tuple[Any, ...]] = []
     for document in _documents(doc_tree):
-        name = _document_name(document)
+        name = _document_name(document, course_names)
         code = str(document.get("course_code") or "").strip()
         if not name:
             continue
@@ -592,11 +639,15 @@ def _structure_chapter_items(doc_tree: Any, rng: random.Random) -> list[GoldItem
     return items
 
 
-def _structure_outline_items(doc_tree: Any, rng: random.Random) -> list[GoldItem]:
+def _structure_outline_items(
+    doc_tree: Any,
+    rng: random.Random,
+    course_names: Mapping[str, str] | None = None,
+) -> list[GoldItem]:
     """《X》一共有几章？分别是什么？——整表金标 = 全部章节 chunk_ids。"""
     candidates: list[tuple[str, str, list[str], list[str]]] = []
     for document in _documents(doc_tree):
-        name = _document_name(document)
+        name = _document_name(document, course_names)
         code = str(document.get("course_code") or "").strip()
         chapters = _chapter_nodes(document)
         titles = [str(node.get("title") or "").strip() for node in chapters]
@@ -637,6 +688,7 @@ def _fact_instructor_items(
     profiles: Any,
     courses: list[dict[str, Any]],
     rng: random.Random,
+    course_names: Mapping[str, str] | None = None,
 ) -> list[GoldItem]:
     """《X》的任课教师是谁？——金标取大纲结构化字段，优先培养方案为 ``/`` 的课。"""
     plan_instructor = {
@@ -647,10 +699,12 @@ def _fact_instructor_items(
     candidates: list[tuple[int, str, str, list[str], list[str]]] = []
     for key, profile in _profile_records(profiles):
         names = _profile_names(profile)
-        name = str(profile.get("course_name") or "").strip()
+        code = _profile_code(profile, key)
+        name = _clean_course_name((course_names or {}).get(code))
+        if not name:
+            name = _clean_course_name(profile.get("course_name"))
         if not names or not name:
             continue
-        code = _profile_code(profile, key)
         priority = 0 if _is_missing(plan_instructor.get(code)) else 1
         chunk_ids = _profile_chunk_ids(
             profile, ("course_owner", "lectur", "instructor", "teacher", "教师", "负责")
@@ -705,7 +759,7 @@ def _fact_instructor_missing_items(
         if len(items) >= STRUCTURE_QUOTAS["fact-instructor-missing"]:
             break
         code = str(course.get("course_code") or "")
-        name = str(course.get("course_name") or "").strip()
+        name = _clean_course_name(course.get("course_name"))
         if not code or not name:
             continue
         if not _is_missing(course.get("instructor")):
@@ -727,7 +781,11 @@ def _fact_instructor_missing_items(
     return items
 
 
-def _fact_assessment_items(profiles: Any, rng: random.Random) -> list[GoldItem]:
+def _fact_assessment_items(
+    profiles: Any,
+    rng: random.Random,
+    course_names: Mapping[str, str] | None = None,
+) -> list[GoldItem]:
     """《X》怎么考核？——金标取 syllabus_profile.assessment_mode。"""
     candidates: list[tuple[str, str, str, list[str]]] = []
     for key, profile in _profile_records(profiles):
@@ -736,10 +794,12 @@ def _fact_assessment_items(profiles: Any, rng: random.Random) -> list[GoldItem]:
             mode = "；".join(str(part) for part in mode if not _is_missing(part))
         if _is_missing(mode):
             continue
-        name = str(profile.get("course_name") or "").strip()
+        code = _profile_code(profile, key)
+        name = _clean_course_name((course_names or {}).get(code))
+        if not name:
+            name = _clean_course_name(profile.get("course_name"))
         if not name:
             continue
-        code = _profile_code(profile, key)
         chunk_ids = _profile_chunk_ids(profile, ("assessment", "grading", "考核", "成绩"))
         candidates.append((code, name, str(mode).strip(), chunk_ids))
     rng.shuffle(candidates)
@@ -762,11 +822,15 @@ def _fact_assessment_items(profiles: Any, rng: random.Random) -> list[GoldItem]:
     return items
 
 
-def _noanswer_chapter_items(doc_tree: Any, rng: random.Random) -> list[GoldItem]:
+def _noanswer_chapter_items(
+    doc_tree: Any,
+    rng: random.Random,
+    course_names: Mapping[str, str] | None = None,
+) -> list[GoldItem]:
     """《X》第 99 章讲什么？——章号不存在于文档树，期望拒答。"""
     candidates: list[tuple[str, str]] = []
     for document in _documents(doc_tree):
-        name = _document_name(document)
+        name = _document_name(document, course_names)
         code = str(document.get("course_code") or "").strip()
         if not name or not _chapter_nodes(document):
             continue
@@ -819,12 +883,13 @@ def build(output: Path) -> dict[str, Any]:
     # M5.1 新题型：从并行交付的产物自动生成；产物缺失时跳过并告警（不抛异常）。
     doc_tree = _load_optional(config.doc_tree_path)
     profiles = _load_optional(config.syllabus_profiles_path)
-    items.extend(_structure_chapter_items(doc_tree, rng))
-    items.extend(_structure_outline_items(doc_tree, rng))
-    items.extend(_fact_instructor_items(profiles, courses, rng))
+    course_names = _course_name_map(courses, doc_tree)
+    items.extend(_structure_chapter_items(doc_tree, rng, course_names))
+    items.extend(_structure_outline_items(doc_tree, rng, course_names))
+    items.extend(_fact_instructor_items(profiles, courses, rng, course_names))
     items.extend(_fact_instructor_missing_items(courses, profiles))
-    items.extend(_fact_assessment_items(profiles, rng))
-    items.extend(_noanswer_chapter_items(doc_tree, rng))
+    items.extend(_fact_assessment_items(profiles, rng, course_names))
+    items.extend(_noanswer_chapter_items(doc_tree, rng, course_names))
 
     problems = [problem for item in items for problem in item.validate()]
     if problems:

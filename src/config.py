@@ -156,6 +156,11 @@ class Config:
         )
 
     @property
+    def course_name_similarity_threshold(self) -> float:
+        """Minimum ``difflib`` ratio for S1 course-name clarification candidates."""
+        return float(os.getenv("COURSE_NAME_SIMILARITY_THRESHOLD", "0.6"))
+
+    @property
     def graph_manifest_path(self) -> Path:
         return _path(os.getenv("GRAPH_MANIFEST_PATH", "outputs/graph_manifest.json"))
 
@@ -354,7 +359,7 @@ class Config:
     # -- Concept Normalization -----------------------------------------------
     @property
     def concept_cluster_threshold(self) -> float:
-        return float(os.getenv("CONCEPT_CLUSTER_THRESHOLD", "0.84"))
+        return float(os.getenv("CONCEPT_CLUSTER_THRESHOLD", "0.94"))
 
     @property
     def concept_top_k(self) -> int:
@@ -370,7 +375,12 @@ class Config:
 
     @property
     def concept_max_verification_candidates(self) -> int:
-        return max(0, int(os.getenv("CONCEPT_MAX_VERIFICATION_CANDIDATES", "500")))
+        return max(0, int(os.getenv("CONCEPT_MAX_VERIFICATION_CANDIDATES", "3000")))
+
+    @property
+    def concept_require_unanimous(self) -> bool:
+        """Require every validation vote to agree before accepting an edge."""
+        return _bool(os.getenv("CONCEPT_REQUIRE_UNANIMOUS", "true"))
 
     @property
     def concept_min_extraction_coverage(self) -> float:
