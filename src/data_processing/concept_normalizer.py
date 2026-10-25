@@ -56,6 +56,13 @@ ALIAS_TRAILING_MODIFIERS: tuple[str, ...] = (
 )
 ALIAS_IGNORED_CHARACTERS: tuple[str, ...] = ("的",)
 
+# Syllabus schedule rows are "label：value" lines; the 育人元素 value runs until
+# the next label (周次/重点、难点/备注 …) or the end of the chunk.
+_EDUCATION_FIELD = re.compile(
+    r"^(?:育人元素|思政元素|课程思政)[:：].*?(?=^[\u4e00-\u9fff、]{2,8}[:：]|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
 
 def _breadcrumb_enabled() -> bool:
     """判定概念增强文本是否需要叠加面包屑前缀（与 chroma_index 同语义）。
@@ -319,11 +326,20 @@ class ConceptNormalizer:
             extracted_rows = list(executor.map(extract_chunk, chunks))
 
         extracted_by_chunk: list[list[dict[str, str]]] = []
-        for cache_key, concepts, llm_verified in extracted_rows:
+        for chunk, (cache_key, concepts, llm_verified) in zip(chunks, extracted_rows):
             extraction_cache[cache_key] = self._encode_extraction_cache_entry(
                 concepts, llm_verified
             )
-            extracted_by_chunk.append(concepts)
+            chunk_text = str(chunk.get("text", ""))
+            extracted_by_chunk.append(
+                [
+                    concept
+                    for concept in concepts
+                    if not self._is_education_field_only(
+                        str(concept.get("name", "")), chunk_text
+                    )
+                ]
+            )
         if extraction_cache_path is not None:
             self._write_json(extraction_cache_path, extraction_cache)
 
@@ -1902,6 +1918,19 @@ class ConceptNormalizer:
                 if chunk_id and not existing.get("chunk_id"):
                     existing["chunk_id"] = chunk_id
         return occurrences
+
+    def _is_education_field_only(self, name: str, chunk_text: str) -> bool:
+        """Whether a concept appears only in the syllabus 育人元素 field.
+
+        That field carries ideological framing (诚实守信, 为民情怀 …), not course
+        knowledge, so concepts found nowhere else must not enter the graph.
+        Filtering after extraction keeps the extraction cache valid.
+        """
+        key = self._normalize_alias_key(name)
+        if not key or key not in self._normalize_alias_key(chunk_text):
+            return False
+        knowledge_text = _EDUCATION_FIELD.sub("", chunk_text)
+        return key not in self._normalize_alias_key(knowledge_text)
 
     def _attach_source_evidence(
         self,

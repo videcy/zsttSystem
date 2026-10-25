@@ -833,3 +833,27 @@ def test_failed_votes_keep_completed_pairs_in_validation_cache(tmp_path: Path) -
     cached = json.loads(cache_path.read_text(encoding="utf-8"))
     assert [(edge["source_id"], edge["target_id"]) for edge in cached.values()] == [("a", "b")]
 
+
+def test_concepts_only_in_education_field_are_detected() -> None:
+    text = (
+        "章节：第四章 档案事业及其构成\n"
+        "内容：档案行政工作；档案管理工作等\n"
+        "学时：2\n"
+        "育人元素：档案工作的根本目的是便于社会各方面的利用。"
+        "体现了以人民为中心，全心全意为人民服务。\n"
+        "重点、难点：重点：档案事业构成\n"
+        "周次：第3 周"
+    )
+    with patch(
+        "src.data_processing.concept_normalizer.create_deepseek_client",
+        return_value=object(),
+    ):
+        normalizer = ConceptNormalizer(wikipedia_enabled=False)
+
+    assert normalizer._is_education_field_only("全心全意为人民服务", text)
+    assert normalizer._is_education_field_only("便于社会各方面的利用", text)
+    assert not normalizer._is_education_field_only("档案管理工作", text)
+    assert not normalizer._is_education_field_only("档案事业", text)
+    assert not normalizer._is_education_field_only("档案事业构成", text)
+    assert not normalizer._is_education_field_only("不在原文里的概念", text)
+
