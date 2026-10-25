@@ -60,6 +60,8 @@ services:
       CHROMA_HOST: chromadb
       CHROMA_PORT: "8000"
       NEO4J_URI: bolt://neo4j:7687
+      # eval/reports is baked into the image; reports must land on the mounted volume.
+      EVAL_REPORT_DIR: outputs/eval-reports
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

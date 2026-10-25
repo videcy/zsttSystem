@@ -415,3 +415,13 @@ def test_link_course_matches_syllabus_only_names_without_source_suffix() -> None
     ]:
         course = router._link_course(query)
         assert course is not None and course["course_code"] == code, query
+
+
+def test_link_course_prefers_programme_course_over_syllabus_twin() -> None:
+    router = QueryRouter.__new__(QueryRouter)
+    router.courses = [
+        {"course_code": "IM220", "course_name": "数据结构 转自DOC"},
+        {"course_code": "IM294", "course_name": "数据结构", "offerings": [{"credits": 3}]},
+    ]
+
+    assert router._link_course("数据结构几学分")["course_code"] == "IM294"

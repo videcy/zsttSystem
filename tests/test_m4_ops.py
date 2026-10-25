@@ -161,10 +161,10 @@ def test_compose_persists_eval_data_and_uses_stage_flag() -> None:
     assert "GIT_COMMIT: ${GIT_COMMIT:-unknown}" in compose
 
 
-def test_eval_readme_documents_persistent_report_directory() -> None:
-    readme = (ROOT / "eval/README.md").read_text(encoding="utf-8")
+def test_compose_writes_eval_reports_to_mounted_directory() -> None:
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
-    assert "--output-dir /app/outputs/eval-reports" in readme
+    assert "EVAL_REPORT_DIR: outputs/eval-reports" in compose
 
 
 def test_dockerfile_exports_build_commit() -> None:

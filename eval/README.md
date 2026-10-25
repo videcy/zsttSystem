@@ -19,12 +19,11 @@ python eval/run_eval.py                # 索引就绪后跑全量三阶段
 报告写到 `eval/reports/<时间戳>-<tag>.json` 与同名 `.md`。`.md` 可以直接贴进
 论文初稿，`.json` 保留逐题明细，用于错误分析。
 
-在 Docker Compose 容器里跑评测时，报告统一写到已挂载的
-`/app/outputs/eval-reports`，这样重建容器不会丢失：
+在 Docker Compose 容器里，`EVAL_REPORT_DIR` 已设为 `outputs/eval-reports`（已挂载），
+报告不会随重建容器丢失，`/eval/latest` 也从这里读，不用再加 `--output-dir`：
 
 ```bash
-docker compose exec api python eval/run_eval.py \
-  --output-dir /app/outputs/eval-reports
+docker compose exec api python eval/run_eval.py
 ```
 
 `./eval/datasets` 会挂载到容器的 `/app/eval/datasets`，因此人工标注的评测集

@@ -1045,7 +1045,7 @@ class QueryRouter:
                     },
                 )
             return None
-        course_label = course.get("course_name") or course.get("course_code")
+        course_label = _course_display_name(course)
         answer = f"{course_label}：{'，'.join(facts)}。"
         if notes:
             answer += "；".join(notes)
@@ -1415,7 +1415,7 @@ class QueryRouter:
         node: Any,
     ) -> tuple[str, list[dict[str, Any]]]:
         """第 N 章的确定性回答：章节序号 + 标题 + 内容 + 学时 + 资料来源。"""
-        name = course.get("course_name") or course.get("course_code")
+        name = _course_display_name(course)
         course_code = str(course.get("course_code") or "")
         title = str(getattr(node, "title", "") or "").strip()
         number = getattr(node, "chapter_no", None)
@@ -1436,7 +1436,7 @@ class QueryRouter:
         citation = {
             "source_file": source or None,
             "course_code": course.get("course_code"),
-            "course_name": course.get("course_name"),
+            "course_name": _course_display_name(course),
             "section": title,
         }
         chunk_id = cls._first_chunk_id(node)
@@ -1452,7 +1452,7 @@ class QueryRouter:
         outline: list[Any],
     ) -> tuple[str, list[dict[str, Any]], int]:
         """整门课教学进度：有序章节目录（含非章节行）+ 资料来源。"""
-        name = course.get("course_name") or course.get("course_code")
+        name = _course_display_name(course)
         course_code = str(course.get("course_code") or "")
         document = _safe_tree_call(doc_tree, "latest_document", course_code)
         non_chapter = [
@@ -1485,7 +1485,7 @@ class QueryRouter:
         citation = {
             "source_file": source or None,
             "course_code": course.get("course_code"),
-            "course_name": course.get("course_name"),
+            "course_name": _course_display_name(course),
             "section": "教学进度",
         }
         chunk_id = cls._first_outline_chunk_id(outline)
@@ -1619,7 +1619,12 @@ class QueryRouter:
             or _course_display_name(c) in query
         ]
         if matches:
-            return max(matches, key=lambda c: len(_course_display_name(c)))
+            # A syllabus-only twin ("X 转自DOC") shares the display name with the
+            # programme course; prefer the one that carries offerings.
+            return max(
+                matches,
+                key=lambda c: (len(_course_display_name(c)), bool(c.get("offerings"))),
+            )
         for name in self._bracketed_course_names(query):
             course = self._course_from_bracketed_name(name)
             if course is not None:
@@ -1678,7 +1683,7 @@ class QueryRouter:
         return {
             "source_file": source_file.rsplit("/", 1)[-1] or None,
             "course_code": course.get("course_code"),
-            "course_name": course.get("course_name"),
+            "course_name": _course_display_name(course),
             "section": "培养方案课程信息",
         }
 
@@ -1781,7 +1786,7 @@ class QueryRouter:
 
         matches.sort(key=sort_key)
         lines = [
-            f"{course.get('course_name')}（{course.get('course_code')}）"
+            f"{_course_display_name(course)}（{course.get('course_code')}）"
             for course, _offering in matches
         ]
         description = (
@@ -2209,7 +2214,7 @@ class QueryRouter:
             items.append(
                 {
                     "course_code": course.get("course_code"),
-                    "course_name": course.get("course_name"),
+                    "course_name": _course_display_name(course),
                     "section": title,
                     "source_file": source_file,
                     "source_type": "syllabus",
@@ -2457,14 +2462,14 @@ class QueryRouter:
                     if matched:
                         supporting_hits.append(hit)
             if prerequisites:
-                course_label = course.get("course_name") or course.get("course_code")
+                course_label = _course_display_name(course)
                 course_by_code = {
                     str(item.get("course_code", "")): item
                     for item in self.courses
                 }
                 prerequisite_labels = [
                     (
-                        f"{course_by_code[value].get('course_name')}（{value}）"
+                        f"{_course_display_name(course_by_code[value])}（{value}）"
                         if value in course_by_code
                         else value
                     )
