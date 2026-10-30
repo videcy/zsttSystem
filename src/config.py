@@ -40,6 +40,15 @@ class Config:
     def judge_model(self) -> str:
         return os.getenv("JUDGE_MODEL", self.text_model).strip()
 
+    @property
+    def llm_thinking(self) -> str:
+        """文本生成是否开启 thinking：``disabled``（默认）/ ``enabled``。
+
+        JSON 模式始终关闭 thinking，不受此项影响。
+        """
+        value = os.getenv("LLM_THINKING", "disabled").strip().lower()
+        return value if value in {"disabled", "enabled"} else "disabled"
+
     # -- Embedding -----------------------------------------------------------
     @property
     def embedding_provider(self) -> str:

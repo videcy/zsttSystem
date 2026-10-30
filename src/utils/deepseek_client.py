@@ -146,6 +146,10 @@ def _generate_text_with_finish_reason(
         # extraction needs the final answer in ``content`` rather than an
         # optional reasoning-only response, so disable thinking explicitly.
         request["extra_body"] = {"thinking": {"type": "disabled"}}
+    elif config.llm_thinking != "enabled":
+        # 普通文本生成同样默认关闭 thinking：推理过程会占用 max_tokens，
+        # 预算耗尽时 ``content`` 为空（R-2f）。LLM_THINKING=enabled 可切回。
+        request["extra_body"] = {"thinking": {"type": "disabled"}}
     response = client.chat.completions.create(**request)
     choice = response.choices[0]
     finish_reason = getattr(choice, "finish_reason", None)
@@ -158,10 +162,11 @@ def _generate_text_with_finish_reason(
         ).strip()
     else:
         result = str(content or "").strip()
-    if json_mode and not result:
+    if not result:
         logger.warning(
-            "[deepseek_client] empty JSON content "
+            "[deepseek_client] empty %s content "
             "(finish_reason=%s, has_reasoning_content=%s)",
+            "JSON" if json_mode else "text",
             finish_reason,
             bool(getattr(choice.message, "reasoning_content", None)),
         )

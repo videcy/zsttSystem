@@ -48,6 +48,14 @@ _EVIDENCE_ORDER_CONSTRAINT = (
 )
 
 
+class EmptyGenerationError(RuntimeError):
+    """LLM 可用但返回了空内容（如 thinking 耗尽 max_tokens）。
+
+    不能静默换成兜底摘要再送去 NLI：摘要是原文照抄，必然通过校验，
+    会被误标成已校验的正常回答（R-2f）。
+    """
+
+
 def generation_max_tokens(route_type: str) -> int:
     """按路由类型返回答案长度上限。
 
@@ -333,11 +341,9 @@ def generate_answer_once(
         temperature=0.1,
         max_output_tokens=generation_max_tokens(route_type),
     )
-    return answer.strip() if answer and answer.strip() else build_fallback_answer(
-        query,
-        evidence_items,
-        persona,
-    )
+    if not answer or not answer.strip():
+        raise EmptyGenerationError("answer generation returned empty content")
+    return answer.strip()
 
 
 def _split_sentences(answer: str) -> list[str]:
@@ -538,7 +544,7 @@ def _rewrite_answer(
         max_output_tokens=generation_max_tokens(route_type),
     )
     if not rewritten or not rewritten.strip():
-        raise ValueError("answer rewrite returned empty content")
+        raise EmptyGenerationError("answer rewrite returned empty content")
     return rewritten.strip()
 
 
