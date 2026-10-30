@@ -56,7 +56,7 @@ from src.online_service.persona import (
 from src.online_service.program_graph import (
     build_program_graph,
     corpus_overview,
-    load_concept_links,
+    load_configured_concept_links,
     program_catalog,
 )
 from src.online_service.query_router import QueryRouter
@@ -366,12 +366,7 @@ async def course_dependencies(
 
 
 def _concept_links() -> dict[str, Any] | None:
-    return load_concept_links(
-        config.concept_registry_path,
-        config.concept_verified_edge_path,
-        min_confidence=config.concept_verified_min_confidence,
-        loader=_safe_load_json,
-    )
+    return load_configured_concept_links()
 
 
 @app.get("/programs")

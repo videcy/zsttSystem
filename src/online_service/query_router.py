@@ -20,6 +20,7 @@ from typing import Any, Optional
 from src.config import config
 from src.online_service.chroma_retriever import ChromaRetriever
 from src.utils.lexical import term_set
+from src.online_service.program_graph import load_configured_concept_links
 from src.online_service.program_index import ProgramIndex
 from src.online_service.persona import (
     DEFAULT_PERSONA,
@@ -52,6 +53,7 @@ _DEPENDENCY_PATTERNS: list[str] = [
     r"(课程|概念|知识).{0,4}(顺序|路径|依赖|关联)",
     r"(先学|后学|前置课程|先修课|预修课|前导课)",
     r"(有什么|有哪些).{0,4}(依赖|联系|关系|关联)",
+    r"(有关系|有联系|有关联)吗|有没有(关系|联系|关联)",
     r"(怎么|如何).{0,4}(选修|选课|规划|安排)",
 ]
 
@@ -374,6 +376,21 @@ _NO_INSTRUCTOR_RECORDED = "培养方案与教学大纲均未记录该课程的�
 _COURSE_NOT_FOUND_TEMPLATE = "培养方案中没有名为《{name}》的课程。"
 _COURSE_CLARIFY_PREFIX = "你是不是想问"
 _UNRECORDED_FIELD_TEMPLATE = "培养方案与教学大纲均未记录《{name}》的{field}。"
+
+# 两门课之间的关系问法；闸门要求同时链接到至少两门课，单独出现不触发。
+_COURSE_RELATION_PATTERN = re.compile(
+    r"有什么关系|什么关系|有关系吗|有没有关系|什么联系|有联系吗|有关联吗|关联"
+    r"|区别和联系|哪个先学|先学哪个"
+)
+# 评测按「无法说明两者存在关系」识别这类拒答，措辞不要改。
+_COURSE_RELATION_NOT_FOUND_TEMPLATE = (
+    "根据培养方案与课程图谱，《{a}》与《{b}》之间没有先修关系，"
+    "也没有经过验证的知识关联，无法说明两者存在关系。"
+)
+# 间接先修链的最大边数。
+_RELATION_MAX_DEPTH = 3
+# 知识关联最多列出的概念对数。
+_RELATION_MAX_EXAMPLES = 3
 
 
 _COURSE_NAME_PUNCTUATION = re.compile(
@@ -708,6 +725,21 @@ class QueryRouter:
                 **intent.as_metadata(),
             )
             return safety_gate
+        # 两门课之间有没有关系，是结构化数据能确定回答的问题，不交给检索或 LLM。
+        relation_courses = (
+            self._link_courses(query) if _COURSE_RELATION_PATTERN.search(query) else []
+        )
+        if len(relation_courses) >= 2:
+            result = await asyncio.to_thread(
+                self._handle_course_relation, relation_courses[0], relation_courses[1]
+            )
+            result.metadata.update(
+                persona=persona,
+                persona_mode=PERSONA_MODE,
+                persona_profile_version=PERSONA_PROFILE_VERSION,
+                **intent.as_metadata(),
+            )
+            return result
         merge_labels = self._mergeable_labels(intent)
 
         if merge_labels:
@@ -1608,16 +1640,71 @@ class QueryRouter:
             },
         )
 
-    def _link_course(self, query: str) -> dict[str, Any] | None:
+    def _link_courses(
+        self,
+        query: str,
+        *,
+        with_bracketed: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Every course the query mentions, in order of appearance.
+
+        Names match longest first and a span already claimed by a longer name
+        is not matched again (「大数据分析」不再命中「大数据」)。 Syllabus-only
+        twins ("X 转自DOC") share a display name with the programme course and
+        count as one course -- the one that carries offerings wins.  Bracketed
+        names the plain match did not cover resolve through the alias index.
+        """
         lowered = query.lower()
-        # Syllabus-only courses are stored as "X 转自DOC"; users type just "X".
-        matches = [
-            c
-            for c in self.courses
-            if str(c.get("course_code", "")).lower() in lowered
-            or str(c.get("course_name", "")) in query
-            or _course_display_name(c) in query
-        ]
+        candidates: list[tuple[str, str, dict[str, Any]]] = []
+        for course in self.courses:
+            for text, haystack in {
+                (str(course.get("course_name", "")), query),
+                (_course_display_name(course), query),
+                (str(course.get("course_code", "")).lower(), lowered),
+            }:
+                if text:
+                    candidates.append((text, haystack, course))
+        # 稳定排序：同长度时带 offerings 的在前，其余保持课程表顺序。
+        candidates.sort(key=lambda item: (-len(item[0]), not item[2].get("offerings")))
+
+        covered: list[tuple[int, int]] = []
+        found: dict[str, tuple[int, dict[str, Any]]] = {}
+
+        def free_start(haystack: str, text: str) -> int | None:
+            pos = haystack.find(text)
+            while pos != -1:
+                end = pos + len(text)
+                if all(end <= lo or pos >= hi for lo, hi in covered):
+                    return pos
+                pos = haystack.find(text, pos + 1)
+            return None
+
+        for text, haystack, course in candidates:
+            name = _course_display_name(course)
+            if name in found:
+                continue
+            start = free_start(haystack, text)
+            if start is not None:
+                covered.append((start, start + len(text)))
+                found[name] = (start, course)
+
+        if with_bracketed:
+            for match in re.finditer(r"《([^《》]+)》", query):
+                lo, hi = match.span(1)
+                if any(lo < end and start < hi for start, end in covered):
+                    continue
+                course = self._course_from_bracketed_name(match.group(1).strip())
+                if course is not None and _course_display_name(course) not in found:
+                    covered.append((lo, hi))
+                    found[_course_display_name(course)] = (lo, course)
+        return [course for _start, course in sorted(found.values(), key=lambda v: v[0])]
+
+    def _link_course(self, query: str) -> dict[str, Any] | None:
+        order = {id(course): index for index, course in enumerate(self.courses)}
+        matches = sorted(
+            self._link_courses(query, with_bracketed=False),
+            key=lambda course: order[id(course)],
+        )
         if matches:
             # A syllabus-only twin ("X 转自DOC") shares the display name with the
             # programme course; prefer the one that carries offerings.
@@ -1625,11 +1712,9 @@ class QueryRouter:
                 matches,
                 key=lambda c: (len(_course_display_name(c)), bool(c.get("offerings"))),
             )
-        for name in self._bracketed_course_names(query):
-            course = self._course_from_bracketed_name(name)
-            if course is not None:
-                return course
-        return None
+        # 只有书名号里的别名 / 英文名能对上时，取第一个。
+        bracketed = self._link_courses(query)
+        return bracketed[0] if bracketed else None
 
     @property
     def program_index(self) -> ProgramIndex:
@@ -2418,6 +2503,125 @@ class QueryRouter:
                 seen.add(identity)
         return citations
 
+    def _concept_links(self) -> dict[str, Any] | None:
+        """与 `/programs/graph` 同一份知识关联汇总；产物不存在时为 None。"""
+        return load_configured_concept_links()
+
+    def _same_name_codes(self, course: dict[str, Any]) -> set[str]:
+        """Codes of the course and its same-name twins ("X 转自DOC", 多个学期的同名课)."""
+        name = _course_display_name(course)
+        return {
+            str(c.get("course_code", ""))
+            for c in self.courses
+            if _course_display_name(c) == name
+        }
+
+    def _prerequisite_chain(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        """Shortest prerequisite chain ``source -> ... -> target``, or None.
+
+        BFS from ``target`` back along ``courses[].prerequisites``; at most
+        ``_RELATION_MAX_DEPTH`` edges.  Twins of one display name count as the
+        same course, so a chain can start from any of their codes.
+        """
+        by_code = {str(c.get("course_code", "")): c for c in self.courses}
+        source_codes = self._same_name_codes(source)
+        queue = [[code] for code in sorted(self._same_name_codes(target))]
+        seen = {chain[0] for chain in queue}
+        while queue:
+            chain = queue.pop(0)
+            if chain[-1] in source_codes and len(chain) > 1:
+                return [by_code[code] for code in reversed(chain)]
+            if len(chain) > _RELATION_MAX_DEPTH:
+                continue
+            for value in (by_code.get(chain[-1]) or {}).get("prerequisites") or []:
+                value = str(value).strip()
+                if value in by_code and value not in seen:
+                    seen.add(value)
+                    queue.append([*chain, value])
+        return None
+
+    def _handle_course_relation(
+        self,
+        course_a: dict[str, Any],
+        course_b: dict[str, Any],
+    ) -> RouteResult:
+        """S3: answer "A 和 B 有什么关系" from the plan and the concept graph.
+
+        Looks, in both directions, for a prerequisite chain and then for a
+        verified knowledge link; with neither, refuses instead of retrieving.
+        """
+        name_a, name_b = _course_display_name(course_a), _course_display_name(course_b)
+        codes = [str(course_a.get("course_code", "")), str(course_b.get("course_code", ""))]
+        metadata: dict[str, Any] = {
+            "backend": "catalog",
+            "course_codes": codes,
+            "llm_used": False,
+            "vector_hits": 0,
+        }
+
+        sentences: list[str] = []
+        citations: list[dict[str, Any]] = []
+        for source, target in ((course_a, course_b), (course_b, course_a)):
+            chain = self._prerequisite_chain(source, target)
+            if chain is None:
+                continue
+            names = [_course_display_name(c) for c in chain]
+            if len(chain) == 2:
+                sentences.append(f"《{names[0]}》是《{names[1]}》的先修课程。")
+            else:
+                sentences.append(
+                    f"《{names[0]}》是《{names[-1]}》的间接先修课程，"
+                    f"先修链为：{'→'.join(f'《{n}》' for n in names)}。"
+                )
+            citations.extend(self._catalog_citation(c, None) for c in chain[1:])
+        if sentences:
+            metadata["relation_type"] = "prerequisite"
+            return RouteResult(
+                "".join(sentences),
+                citations=citations,
+                query_type="dependency",
+                metadata=metadata,
+            )
+
+        pairs = (self._concept_links() or {}).get("pairs") or {}
+        parts: list[str] = []
+        budget = _RELATION_MAX_EXAMPLES
+        for source, target in ((course_a, course_b), (course_b, course_a)):
+            examples = [
+                example
+                for source_code in sorted(self._same_name_codes(source))
+                for target_code in sorted(self._same_name_codes(target))
+                for example in pairs.get((source_code, target_code), [])
+            ][:budget]
+            if examples:
+                budget -= len(examples)
+                parts.append(
+                    f"《{_course_display_name(source)}》到《{_course_display_name(target)}》："
+                    + "、".join(examples)
+                )
+        if parts:
+            metadata["relation_type"] = "knowledge"
+            return RouteResult(
+                f"《{name_a}》与《{name_b}》没有先修要求，但图谱中有经过验证的知识关联："
+                f"{'；'.join(parts)}（由 LLM 验证的概念依赖汇总得出）。",
+                query_type="dependency",
+                metadata=metadata,
+            )
+
+        return RouteResult(
+            _COURSE_RELATION_NOT_FOUND_TEMPLATE.format(a=name_a, b=name_b),
+            query_type="dependency",
+            metadata={
+                **metadata,
+                "status": "refused",
+                "error_code": "COURSE_RELATION_NOT_FOUND",
+            },
+        )
+
     async def _handle_dependency(
         self,
         query: str,
@@ -2542,7 +2746,7 @@ class QueryRouter:
                 query_type="dependency",
                 metadata={
                     "backend": "zsttSystem_Neo4j",
-                    "status": "degraded",
+                    "status": "refused",
                     "error_code": "DEPENDENCY_NOT_FOUND",
                 },
             )
