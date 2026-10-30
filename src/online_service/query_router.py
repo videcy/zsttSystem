@@ -1847,8 +1847,9 @@ class QueryRouter:
             preferred_section_types=preferred,
             source_boosts=profile["source_boosts"],
         )
+        # 课程名、课程代码与用户问题拼接，让「学分」「学期」类问题取到对应字段所在的块。
         plan_query = (
-            f"{course.get('course_name', '')} {course_code} 培养方案 课程信息"
+            f"{course.get('course_name', '')} {course_code} {query}"
             if course
             else query
         )

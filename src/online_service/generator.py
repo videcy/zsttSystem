@@ -56,6 +56,16 @@ class EmptyGenerationError(RuntimeError):
     """
 
 
+def _evidence_order_constraint(evidence_items: list[dict[str, Any]]) -> str:
+    """章节顺序约束只在证据里有整门课补齐项（coverage_filler）时才下发（R-2c）。"""
+    if any(
+        item.get("coverage_filler")
+        for item in select_generation_evidence(evidence_items)
+    ):
+        return f"{_EVIDENCE_ORDER_CONSTRAINT}\n"
+    return ""
+
+
 def generation_max_tokens(route_type: str) -> int:
     """按路由类型返回答案长度上限。
 
@@ -324,11 +334,13 @@ def generate_answer_once(
     prompt = (
         "你是课程知识库问答助手。仅根据下面的证据回答，不得补充证据之外的事实。\n"
         f"{profile['prompt']}\n"
-        "回答格式必须是：\n"
-        "1. 第一段直接回答问题；\n"
-        "2. 使用“核心内容：”列出简洁要点；\n"
-        "3. 使用“资料来源：”列出课程、章节和文件名。\n"
-        f"{_EVIDENCE_ORDER_CONSTRAINT}\n"
+        "回答要求：\n"
+        "1. 第一句必须直接回答问题本身（是否 / 何时 / 多少 / 谁 / 是什么）；\n"
+        "2. 只有问题询问课程内容、章节或要点时，才使用“核心内容：”列出简洁要点；"
+        "问是否、何时、多少、谁时，用一到两句话回答，不列核心内容；\n"
+        "3. 证据中与问题无关的内容不要写进回答；\n"
+        "4. 资料来源由系统自动追加，正文中不要写“资料来源”。\n"
+        f"{_evidence_order_constraint(evidence_items)}"
         "不要输出 JSON、查询 ID、分数、chunk_id、内部字段或代码块。"
         "证据不足时明确说明无法确认。\n"
         f"问题：{query}\n\n"
@@ -529,8 +541,12 @@ def _rewrite_answer(
         "你是课程知识库问答助手。上一版回答包含证据不足或冲突的句子。"
         "请完全重写回答，只保留能由证据直接支持的事实；无法确认的内容不要猜测。\n"
         f"{profile['prompt']}\n"
-        "回答仍需包含直接回答、核心内容和资料来源，但不得输出校验过程或JSON。\n"
-        f"{_EVIDENCE_ORDER_CONSTRAINT}\n"
+        "第一句必须直接回答问题本身；只有问题询问课程内容、章节或要点时，"
+        "才使用“核心内容：”列出要点，否则用一到两句话回答；"
+        "证据中与问题无关的内容不要写进回答；"
+        "资料来源由系统自动追加，正文中不要写“资料来源”。"
+        "不得输出校验过程或JSON。\n"
+        f"{_evidence_order_constraint(evidence_items)}"
         f"问题：{query}\n"
         f"上一版回答：{answer}\n"
         f"未通过句子：{unsupported}\n\n"
