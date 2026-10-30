@@ -66,12 +66,15 @@ docker compose exec api python eval/run_eval.py
 > 示例特意选了学分字段。任课教师题同样在种子集里（`field=instructor`），
 > 但姓名不写进入库的文档。
 
-- `expected_route`：`fact` / `content` / `dependency` / `catalog` / `hybrid`
+- `expected_route`：`fact` / `content` / `dependency` / `catalog` / `hybrid` / `structure` / `existence`
 - `answer_keys`：**全部命中才算答对**；单个 key 内用 `|` 表示"任一等价说法"
 - `gold_chunk_ids`：人工标注的证据 chunk；**有它就按 chunk 级判定**
 - `gold_course_codes`：没有 chunk 标注时的课程级近似判定（报告会分别统计
   `chunk_level_items` / `course_level_items`，写论文时必须说明比例）
 - `answerable: false`：无答案题，用于测拒答；这类题**不允许**有 `answer_keys`
+- `focus_keys`：答案**第一句**应包含的片段（`|` 分隔候选），只给 `existence` 题用，
+  拒答题也可以带；`expected_semester`：`semester-phrasing` 题的正确学期（1-8）。
+  两者只服务于「答案切题率」，不影响 `answer_keys` 的判定
 
 ### 种子集自动生成的边界
 
@@ -86,6 +89,41 @@ docker compose exec api python eval/run_eval.py
    否则路由准确率会被高估
 
 标注分工建议：每人 40 题，两人交叉复核，冲突记在 `notes` 里。
+
+### E5 补充子集（问法多样、课名不带书名号）
+
+模板题都带书名号、每类只有一种问法，测不出「两门课的关系」「有没有这门课」
+「大几」这类真实问法的问题。E5 在种子集末尾追加五个子集（`subset` 字段区分，
+只依赖 `courses.json`，relation 另读 concept 产物；追加在最后，既有子集的题
+和随机序列不变）：
+
+| 子集 | 题量 | 路由 | 构造与金标 |
+| --- | --- | --- | --- |
+| `relation-neg` | 15 | `dependency` | 随机课程对，排除直接先修、深度 ≤3 的间接先修、知识关联（两个方向都算）。三种问法：「X与Y之间有什么关系」「X和Y有关系吗」「《X》与《Y》有什么联系」。不可回答题，期望拒答（`error_code=COURSE_RELATION_NOT_FOUND`，文案含「无法说明两者存在关系」） |
+| `relation-pos` | 15 | `dependency` | 有先修边或知识关联的课程对，直接 / 间接 / 知识关联各取约三分之一（某类不足由其他类补）；`answer_keys` 为两门课的课名，`notes` 记 `relation=direct|indirect|concept` |
+| `existence` | 15 | `existence` | 10 门存在的课（其中 5 题带专业线索，如「信管专业有X这门课吗」）+ 5 门不存在的课；课名不带书名号。存在 → 答案以「有。」开头；带线索且该专业没有 → 含「中没有《X》」；课程不存在 → 拒答或反问 |
+| `semester-phrasing` | 30 | `fact` | 10 门课 × 3 种问法（大几 / 什么时候上 / 这门课是大几才开 / 哪一年开）。只选各方案学期一致、且为单个整数学期的课，按学期轮流取 |
+| `no-brackets` | 20 | 同源题 | 从既有 fact / dependency 题各抽 10 题，去掉书名号，路由与答案要点不变（`notes` 记源题 id） |
+
+判定细节：
+
+- 先修关系取 `courses[].prerequisites` 的有向图；知识关联复用
+  `program_graph.aggregate_concept_links`，`min_confidence` 取
+  `config.concept_verified_min_confidence`（与 `/programs/graph` 一致）。
+- **concept 产物缺失时**（`concept_registry.json` / `concept_verified_edges.json`），
+  relation 子集只按先修判定，并在 stderr 告警。此时 `relation-neg` 里可能混入
+  实际有知识关联的课程对（`notes` 会标「concept 产物缺失」），不要拿这版金标
+  去算正式数字。
+- 关系子集不选课名含「与 / 和 / 及 / 、」的课（「X与Y」问法本身有歧义），也不选
+  同名课、一个课名是另一个子串的课程对。
+- 带专业线索的存在性题只在无歧义的两端出题：主修方案里有 → 「有」；该专业任何
+  类型的方案里都没有 → 「没有」；只在辅修方案出现的课跳过。「信管」依赖部署侧的
+  `PROGRAM_ALIASES`。
+- 学期题用 `第\s*n\s*学期` 匹配，并同时检查年级换算（奇数上、偶数下，如第 4 学期
+  对应「大二下」）。
+
+用真实数据生成时用环境变量指定产物位置（`COURSES_OUTPUT_PATH`、`CHUNKS_OUTPUT_PATH`、
+`CONCEPT_REGISTRY_PATH`、`CONCEPT_VERIFIED_EDGE_PATH`）。
 
 ---
 
@@ -110,13 +148,25 @@ docker compose exec api python eval/run_eval.py
 - `citation_precision`：引用指向的 chunk/课程是否被金标接受
 - `uncited_answer_rate`：给出答案却没有任何引用的比例（可溯性的反面指标）
 
+### 答案切题率（E5）
+
+只对 `existence`、`semester-phrasing` 两个子集计算，衡量「不该说的说了没有」：
+
+- `answer_on_topic_rate`：答案第一句（按「。」或换行切分，保留句末「。」）是否含期望
+  片段——`existence` 看 `focus_keys`（「有。」/「没有」或反问「你是不是想问」），
+  `semester-phrasing` 看「第 n 学期」。答案里只要出现章节标题行（如
+  「第一章 绪论（3 学时）」，`coverage_filler` 带进来的整门课章节），一律判不切题
+- `chapter_heading_rate`：答案含章节标题行的比例
+- `<子集>_on_topic_rate`：分子集的切题率
+- `semester-phrasing` 的 `answer_correct` 另用正则 + 年级换算计分，见上
+
 ### 拒答
 
 - `correct_refusal_rate`：无答案题里正确拒答的比例
 - `hallucination_rate` = 1 − 正确拒答率（无答案题却给了答案）
 - `false_refusal_rate`：有答案题里被误拒的比例
 
-拒答判定基于 `metrics.REFUSAL_MARKERS`——生成端改了拒答措辞，这里必须同步，
+拒答判定基于 `metrics.REFUSAL_MARKERS`（含 S3 关系闸门的「无法说明两者存在关系」）——生成端改了拒答措辞，这里必须同步，
 `tests/test_eval_harness.py` 会盯着这一点。
 
 ---
