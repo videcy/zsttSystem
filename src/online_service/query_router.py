@@ -1847,8 +1847,9 @@ class QueryRouter:
             preferred_section_types=preferred,
             source_boosts=profile["source_boosts"],
         )
+        # 课程名、课程代码与用户问题拼接，让「学分」「学期」类问题取到对应字段所在的块。
         plan_query = (
-            f"{course.get('course_name', '')} {course_code} 培养方案 课程信息"
+            f"{course.get('course_name', '')} {course_code} {query}"
             if course
             else query
         )
@@ -2266,6 +2267,7 @@ class QueryRouter:
             query, evidence_items, course, doc_tree
         )
         from src.online_service.generator import (
+            EmptyGenerationError,
             build_fallback_answer,
             select_generation_evidence,
         )
@@ -2288,9 +2290,18 @@ class QueryRouter:
                 "content",
             )
             metadata.update(verification_metadata)
-        except Exception:
+        except Exception as exc:
             answer = build_fallback_answer(query, evidence_items, persona)
-            metadata.update(status="degraded", error_code="LLM_UNAVAILABLE")
+            # 空输出（如 thinking 耗尽 max_tokens）与 LLM 不可用分开记，兜底摘要
+            # 不经过 NLI，也不标 ok（R-2f）。
+            metadata.update(
+                status="degraded",
+                error_code=(
+                    "LLM_EMPTY_OUTPUT"
+                    if isinstance(exc, EmptyGenerationError)
+                    else "LLM_UNAVAILABLE"
+                ),
+            )
         citations = (
             []
             if metadata.get("nli_status") in {"refused", "unavailable"}
@@ -2333,6 +2344,7 @@ class QueryRouter:
             query, evidence_items, course, doc_tree
         )
         from src.online_service.generator import (
+            EmptyGenerationError,
             build_fallback_answer,
             select_generation_evidence,
         )
@@ -2354,11 +2366,15 @@ class QueryRouter:
                 "hybrid",
             )
             metadata.update(verification_metadata)
-        except Exception:
+        except Exception as exc:
             answer = build_fallback_answer(query, evidence_items, persona)
             metadata.update(
                 status="degraded",
-                error_code="LLM_UNAVAILABLE",
+                error_code=(
+                    "LLM_EMPTY_OUTPUT"
+                    if isinstance(exc, EmptyGenerationError)
+                    else "LLM_UNAVAILABLE"
+                ),
             )
         citations = (
             []
