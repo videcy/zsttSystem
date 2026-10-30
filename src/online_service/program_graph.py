@@ -19,6 +19,7 @@ without Neo4j -- the same promise the content path makes.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -263,6 +264,28 @@ def load_concept_links(
         _CONCEPT_LINK_CACHE.clear()
         _CONCEPT_LINK_CACHE[key] = cached
     return cached
+
+
+def _safe_load_json(path: Path) -> Any:
+    """只读、容错地读取 JSON；缺失或损坏都返回 None。"""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_configured_concept_links() -> dict[str, Any] | None:
+    """按配置的产物路径与阈值加载课程对知识关联；`/programs/graph` 与路由层共用。"""
+    from src.config import config
+
+    return load_concept_links(
+        config.concept_registry_path,
+        config.concept_verified_edge_path,
+        min_confidence=config.concept_verified_min_confidence,
+        loader=_safe_load_json,
+    )
 
 
 # ---------------------------------------------------------------------------

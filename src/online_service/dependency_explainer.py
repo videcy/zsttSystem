@@ -68,16 +68,42 @@ def build_dependency_answer(
 ) -> dict[str, Any] | None:
     """Build a structured dependency answer from the concept dependency subgraph."""
     entities = extract_query_entities(question, llm_client)
-    target_nodes = locate_target_concepts(entities, neo4j_session)
+    names = _merge_unique(entities["courses"], entities["concepts"])
+    # 多实体时按实体分组：问题问的是实体之间的关系，只有「起点属于一组、
+    # 终点属于另一组」的路径才算数，否则会把各自内部的路径当成答案。
+    groups: list[list[dict[str, Any]]] = []
+    if len(names) >= 2:
+        for name in names:
+            group = locate_target_concepts(
+                {
+                    "courses": [name] if name in entities["courses"] else [],
+                    "concepts": [name] if name in entities["concepts"] else [],
+                },
+                neo4j_session,
+            )
+            if group:
+                groups.append(group)
+        target_nodes = _merge_target_groups(groups)
+    else:
+        target_nodes = locate_target_concepts(entities, neo4j_session)
     if not target_nodes:
         return None
 
     paths = retrieve_dependency_paths(target_nodes, neo4j_session, max_depth=max_depth)
+    # 有实体没在图谱里定位到时，只有「关系 / 联系」类问法才拒答；
+    # 「需要什么基础」类问法保持原行为，避免多抽出的杂项实体误伤。
+    multi = len(names) >= 2 and (len(groups) >= 2 or _is_relation_question(question))
+    if multi:
+        paths = _connecting_paths(paths, groups)
+        if not paths:
+            return _not_connected_result(entities, names)
     if not paths:
         return None
 
     prerequisites = aggregate_prerequisites(paths)
-    explanation = generate_dependency_explanation(question, paths, prerequisites, llm_client)
+    explanation = generate_dependency_explanation(
+        question, paths, prerequisites, llm_client, connected=multi
+    )
     return {
         "linked_entities": entities,
         "target_concepts": target_nodes,
@@ -284,13 +310,24 @@ def generate_dependency_explanation(
     paths: list[dict[str, Any]],
     prerequisites: list[dict[str, Any]],
     llm_client: Any,
+    *,
+    connected: bool = False,
 ) -> dict[str, Any]:
-    """Generate a grounded Chinese explanation and Mermaid graph from paths."""
+    """Generate a grounded Chinese explanation and Mermaid graph from paths.
+
+    ``connected`` 表示 paths 已经过「两端分属不同实体」的过滤（多实体问题）。
+    """
+    # 问「关系 / 联系」时不能预设关系存在，只让模型陈述路径体现的依赖方向。
+    instruction = (
+        "请仅根据下列路径说明两者的依赖方向；路径不能说明的关系不要推断。\n"
+        if _is_relation_question(question)
+        else "请仅使用这些依赖关系，用通俗中文解释为什么必须先学这些先修知识。\n"
+    )
     prompt = (
         f"用户问题：{question}\n"
         f"系统检索到的依赖路径：{json.dumps(_compact_paths_for_prompt(paths), ensure_ascii=False)}\n"
         f"先修知识聚合：{json.dumps(prerequisites, ensure_ascii=False)}\n"
-        "请仅使用这些依赖关系，用通俗中文解释为什么必须先学这些先修知识。\n"
+        f"{instruction}"
         "只输出 JSON 对象 {\"explanation\": \"...\"}，explanation 不超过200字。"
         "不要输出图、表格或 JSON 以外的内容。"
     )
@@ -382,7 +419,12 @@ def generate_dependency_explanation(
         # These structured views are deterministic projections of verified
         # graph paths; the LLM is only allowed to phrase the explanation.
         "prerequisite_table": _build_prerequisite_table(prerequisites),
-        "explanation": explanation or _fallback_explanation(prerequisites),
+        "explanation": explanation
+        or (
+            _path_summary(paths)
+            if connected
+            else _fallback_explanation(prerequisites)
+        ),
         "mermaid": build_mermaid_graph(paths),
         **nli_metadata,
     }
@@ -409,6 +451,80 @@ def build_mermaid_graph(paths: list[dict[str, Any]]) -> str:
     for left_id, right_id in sorted(edges):
         lines.append(f"    {left_id}[{labels[left_id]}] --> {right_id}[{labels[right_id]}]")
     return "\n".join(lines)
+
+
+_RELATION_QUESTION = re.compile(r"关系|联系|关联|区别")
+
+
+def _is_relation_question(question: str) -> bool:
+    """问「X 和 Y 有什么关系」而不是「为什么要先学 / 需要什么基础」。"""
+    return bool(_RELATION_QUESTION.search(question))
+
+
+def _merge_target_groups(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Union of per-entity concept groups, unique by concept_id."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for node in group:
+            concept_id = str(node.get("concept_id") or "")
+            if concept_id and concept_id not in seen:
+                seen.add(concept_id)
+                merged.append(node)
+    return merged
+
+
+def _connecting_paths(
+    paths: list[dict[str, Any]],
+    groups: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Keep paths whose start and end belong to two different entity groups."""
+    group_ids = [{str(node.get("concept_id")) for node in group} for group in groups]
+    kept = []
+    for path in paths:
+        source = str((path.get("source") or {}).get("concept_id"))
+        target = str((path.get("target") or {}).get("concept_id"))
+        if any(
+            source in left and target in right
+            for i, left in enumerate(group_ids)
+            for j, right in enumerate(group_ids)
+            if i != j
+        ):
+            kept.append(path)
+    return kept
+
+
+def _not_connected_result(entities: dict[str, list[str]], names: list[str]) -> dict[str, Any]:
+    """Refusal for a multi-entity question whose entities share no dependency path."""
+    return {
+        "status": "refused",
+        "error_code": "DEPENDENCY_NOT_CONNECTED",
+        "explanation": (
+            f"图谱中没有找到《{names[0]}》与《{names[1]}》之间的依赖路径，"
+            "无法说明两者存在关系。"
+        ),
+        "linked_entities": entities,
+        "target_concepts": [],
+        "prerequisites": [],
+        "prerequisite_table": "",
+        "mermaid": "",
+        "paths": [],
+        "nli_verified": None,
+        "nli_status": "skipped",
+        "nli_details": [],
+        "nli_attempts": 0,
+        "nli_verification_target": "returned_answer",
+    }
+
+
+def _path_summary(paths: list[dict[str, Any]]) -> str:
+    """Deterministic wording for connected paths when the LLM explanation is dropped."""
+    lines = []
+    for path in paths[:3]:
+        names = " → ".join(str(node.get("name", "")) for node in path.get("nodes", []))
+        if names:
+            lines.append(names)
+    return "图谱中检索到的依赖路径：" + "；".join(lines) + "。"
 
 
 def _fallback_extract_query_entities(question: str) -> dict[str, list[str]]:
