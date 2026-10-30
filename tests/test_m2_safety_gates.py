@@ -225,3 +225,67 @@ def test_closed_unrecorded_field_list_is_covered(query: str, field: str) -> None
     assert result.metadata["field"] == field
     assert router.calls == []
     assert router.vector_retriever.calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# R4：S1 的课名校验扩展到不带书名号的存在性问法（「有 X 这门课吗」）。
+# 这里不替换 _handle_single_intent，走真实的 EXISTENCE 分发。
+# --------------------------------------------------------------------------- #
+
+
+class _ExistenceRouter(QueryRouter):
+    def __init__(self) -> None:
+        self.courses = _COURSES
+        self.vector_retriever = _ExplodingRetriever()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "有火星种植学这门课吗",
+        "有没有火星种植学课",
+        "开不开火星种植学",
+        "火星种植学这门课存在吗",
+    ],
+)
+def test_unbracketed_absent_course_in_existence_question_is_refused(
+    query: str,
+) -> None:
+    router = _ExistenceRouter()
+
+    result = asyncio.run(router.route(query, "s1-existence-absent"))
+
+    assert QueryRouter.classify(query) is QueryType.EXISTENCE
+    assert result.answer == "培养方案中没有名为《火星种植学》的课程。"
+    assert result.metadata["status"] == "refused"
+    assert result.metadata["error_code"] == "COURSE_NOT_FOUND"
+    assert result.metadata["llm_used"] is False
+    assert result.metadata["vector_hits"] == 0
+    assert router.vector_retriever.calls == 0
+
+
+def test_unbracketed_similar_course_in_existence_question_asks_to_clarify() -> None:
+    router = _ExistenceRouter()
+
+    result = asyncio.run(router.route("有信息管理基础这门课吗", "s1-existence-clarify"))
+
+    assert result.answer.startswith("你是不是想问")
+    assert "《信息管理学基础》" in result.answer
+    assert result.metadata["status"] == "clarify"
+    assert result.metadata["error_code"] == "COURSE_AMBIGUOUS"
+    assert 1 <= len(result.metadata["candidates"]) <= 3
+    assert router.vector_retriever.calls == 0
+
+
+@pytest.mark.parametrize("name", ["信息检索", "信管基础", "IM282"])
+def test_unbracketed_known_course_alias_or_code_in_existence_question_is_found(
+    name: str,
+) -> None:
+    router = _ExistenceRouter()
+
+    result = asyncio.run(router.route(f"有{name}这门课吗", "s1-existence-known"))
+
+    assert result.answer.startswith("有。")
+    assert result.metadata["llm_used"] is False
+    assert "error_code" not in result.metadata
+    assert router.vector_retriever.calls == 0
