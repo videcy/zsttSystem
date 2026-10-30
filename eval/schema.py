@@ -5,7 +5,8 @@ without re-reading the corpus:
 
 ``question``            the user-facing query, verbatim
 ``expected_route``      ``fact`` | ``content`` | ``dependency`` | ``catalog`` |
-                        ``hybrid`` -- the path that *should* answer it
+                        ``hybrid`` | ``structure`` | ``existence`` -- the path
+                        that *should* answer it
 ``acceptable_routes``   additional routes that are valid for an unanswerable
                         item, where the route itself is not the graded point
 ``answerable``          ``False`` for the deliberately unanswerable items that
@@ -24,7 +25,15 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Iterable
 
-ROUTES = ("fact", "content", "dependency", "catalog", "hybrid", "structure")
+ROUTES = (
+    "fact",
+    "content",
+    "dependency",
+    "catalog",
+    "hybrid",
+    "structure",
+    "existence",
+)
 
 
 @dataclass
@@ -43,6 +52,11 @@ class GoldItem:
     # 都是可空字段，旧数据集不带这些键时行为不变。
     gold_chapter_titles: list[str] = field(default_factory=list)
     expected_instructors: list[str] = field(default_factory=list)
+    # E5 新增金标：答案切题率用。focus_keys 是答案第一句应包含的片段
+    # （``|`` 分隔候选，existence 题用，拒答题也可带）；expected_semester 是
+    # semester-phrasing 题的正确学期（1-8），计分按「第 n 学期」+ 年级换算。
+    focus_keys: list[str] = field(default_factory=list)
+    expected_semester: int | None = None
     subset: str = ""
     persona: str = "student"
     source: str = "human"

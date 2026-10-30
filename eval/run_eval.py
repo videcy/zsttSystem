@@ -43,7 +43,15 @@ from src.config import config  # noqa: E402
 from src.online_service.chroma_retriever import ChromaRetriever, RerankWeights  # noqa: E402
 from src.online_service.query_router import QueryRouter  # noqa: E402
 
-ROUTE_LABELS = ("fact", "content", "dependency", "catalog", "hybrid", "structure")
+ROUTE_LABELS = (
+    "fact",
+    "content",
+    "dependency",
+    "catalog",
+    "hybrid",
+    "structure",
+    "existence",
+)
 DEFAULT_STAGES = ("routing", "retrieval", "answer")
 
 
@@ -196,6 +204,13 @@ async def grade_answers(
         )
         answer = route_result.answer or ""
         refused = metrics.is_refusal(answer)
+        # semester-phrasing 用「第 n 学期」正则 + 年级换算计分，其余题沿用 answer_keys。
+        if item.expected_semester:
+            answer_correct = metrics.semester_answer_correct(
+                answer, item.expected_semester
+            )
+        else:
+            answer_correct = metrics.answer_covers_keys(answer, item.answer_keys)
         row: dict[str, Any] = {
             "id": item.id,
             "subset": item.subset,
@@ -203,7 +218,10 @@ async def grade_answers(
             "answer_keys": item.answer_keys,
             "route": route_result.query_type,
             "refused": refused,
-            "answer_correct": metrics.answer_covers_keys(answer, item.answer_keys),
+            "answer_correct": answer_correct,
+            "error_code": (getattr(route_result, "metadata", None) or {}).get(
+                "error_code"
+            ),
             "citation_count": len(route_result.citations),
             "citation_precision": metrics.citation_precision(
                 route_result.citations,
@@ -225,6 +243,21 @@ async def grade_answers(
                 answer,
                 item.expected_instructors,
                 known_names=known_instructor_names,
+            ),
+            # E5 新指标：答案切题率，只对 existence / semester-phrasing 计算。
+            "on_topic": (
+                metrics.answer_on_topic(
+                    answer,
+                    focus_keys=item.focus_keys,
+                    expected_semester=item.expected_semester,
+                )
+                if item.subset in metrics.ON_TOPIC_SUBSETS
+                else None
+            ),
+            "chapter_heading": (
+                metrics.has_chapter_heading(answer)
+                if item.subset in metrics.ON_TOPIC_SUBSETS
+                else None
             ),
             "answer_preview": answer[:160],
         }
@@ -360,6 +393,11 @@ def render_markdown(report: dict[str, Any]) -> str:
     if instructor:
         lines.extend(
             [metrics.render_metric_table(instructor, "教师字段（Instructor）"), ""]
+        )
+    relevance = report.get("answer_relevance")
+    if relevance and relevance.get("on_topic_items"):
+        lines.extend(
+            [metrics.render_metric_table(relevance, "答案切题率（Answer relevance）"), ""]
         )
     refusal_by_subset = report.get("refusal_by_subset")
     if refusal_by_subset:
@@ -508,6 +546,9 @@ def evaluate(
             )
             report["structure"] = metrics.structure_report(answers["results"])
             report["instructor"] = metrics.instructor_report(answers["results"])
+            report["answer_relevance"] = metrics.answer_relevance_report(
+                answers["results"]
+            )
             if dump_nli:
                 # P0-5 归因表：只有显式开启 --dump-nli 时才写入报告。
                 report["nli_attribution"] = metrics.nli_attribution(answers["results"])

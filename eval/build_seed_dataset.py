@@ -17,10 +17,12 @@ after a corpus update produces a reviewable diff instead of a new file.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import random
 import re
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -28,6 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.schema import GoldItem, dataset_summary, save_dataset  # noqa: E402
 from src.config import config  # noqa: E402
+from src.online_service.program_graph import (  # noqa: E402
+    aggregate_concept_links,
+    parse_semester,
+)
 
 SEED = 20260905
 
@@ -854,6 +860,435 @@ def _noanswer_chapter_items(
     return items
 
 
+# ---------------------------------------------------------------------------
+# E5 补充子集：关系 / 存在性 / 学期问法 / 不带书名号
+# 针对 10-29 诊断出的问题构造：模板题都带书名号、问法单一、没有「两门课的关系」
+# 「有没有这门课」「大几」这类题。金标全部从 courses.json（和 concept 产物）派生。
+# ---------------------------------------------------------------------------
+
+#: E5 各子集的目标条数；课程池不足时取可用最大值。
+E5_QUOTAS: dict[str, int] = {
+    "relation-neg": 15,
+    "relation-pos": 15,
+    "existence-real": 10,
+    "existence-cue": 5,  # existence-real 里带专业线索的题数（不额外加题）
+    "existence-absent": 5,
+    "semester-courses": 10,
+    "semester-per-course": 3,
+    "no-brackets-fact": 10,
+    "no-brackets-dependency": 10,
+}
+
+#: 间接先修的最大深度（与 S3 的 BFS 口径一致）。
+RELATION_MAX_DEPTH = 3
+
+RELATION_TEMPLATES = (
+    "{a}与{b}之间有什么关系？",
+    "{a}和{b}有关系吗？",
+    "《{a}》与《{b}》有什么联系？",
+)
+
+#: 课名里带连接词时，「X与Y」的问法本身有歧义，关系子集不选这类课。
+_RELATION_NAME_CONNECTORS = ("与", "和", "及", "、")
+
+EXISTENCE_TEMPLATES = (
+    "有{name}这门课吗？",
+    "有没有{name}课？",
+    "本科生有{name}这门课吗？",
+)
+EXISTENCE_CUE_TEMPLATE = "{cue}有{name}这门课吗？"
+
+#: 专业线索：(问法里的说法, offerings.program_name 里的关键词)。
+#: 「信管」依赖部署侧的 PROGRAM_ALIASES（见 .env）。
+PROGRAM_CUES: tuple[tuple[str, str], ...] = (
+    ("信管专业", "信息管理与信息系统"),
+    ("图书馆学专业", "图书馆学"),
+    ("档案学专业", "档案学"),
+)
+
+#: 一门课在培养方案中的「主修」类型；带专业线索的存在性题以它为准。
+_MAIN_PROGRAM_TYPE = "主修专业"
+
+#: 期望答案片段（第一句要包含）。
+EXISTS_FOCUS = "有。"
+ABSENT_FOCUS = "没有|你是不是想问"
+
+SEMESTER_TEMPLATES = (
+    "{name}在大几开设？",
+    "{name}什么时候上？",
+    "{name}这门课是大几才开？",
+    "{name}哪一年开？",
+)
+
+_SEMESTER_GRADES = "一二三四五六七八九"
+
+
+def semester_to_grade(semester: int) -> str:
+    """学期换算成年级：1 -> 大一上，4 -> 大二下（奇数上、偶数下）。"""
+    year = (semester + 1) // 2
+    half = "上" if semester % 2 else "下"
+    return f"大{_SEMESTER_GRADES[year - 1]}{half}"
+
+
+def _unique_named_courses(courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """有代码、有 offerings、清洗后课名唯一的课程，按代码排序（保证可复现）。"""
+    counts: dict[str, int] = {}
+    for course in courses:
+        name = _clean_course_name(course.get("course_name"))
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    pool = []
+    for course in courses:
+        name = _clean_course_name(course.get("course_name"))
+        if (
+            name
+            and counts[name] == 1
+            and course.get("course_code")
+            and course.get("offerings")
+        ):
+            pool.append(course)
+    return sorted(pool, key=lambda course: str(course["course_code"]))
+
+
+def _load_concept_pairs() -> set[frozenset[str]] | None:
+    """知识关联的课程对（无向）；concept 产物缺失时返回 ``None``。"""
+    registry = _load_optional(config.concept_registry_path)
+    edges = _load_optional(config.concept_verified_edge_path)
+    if not isinstance(registry, list) or not isinstance(edges, list):
+        return None
+    links = aggregate_concept_links(
+        registry, edges, min_confidence=config.concept_verified_min_confidence
+    )
+    return {frozenset(pair) for pair in links["pairs"]}
+
+
+def _prerequisite_distances(
+    courses: list[dict[str, Any]],
+    max_depth: int = RELATION_MAX_DEPTH,
+) -> dict[frozenset[str], int]:
+    """有向先修图上两门课的最短距离（任一方向，深度不超过 ``max_depth``）。"""
+    successors: dict[str, list[str]] = {}
+    for course in courses:
+        code = str(course.get("course_code") or "")
+        for prerequisite in course.get("prerequisites") or []:
+            if code and prerequisite:
+                successors.setdefault(str(prerequisite), []).append(code)
+    distances: dict[frozenset[str], int] = {}
+    for start in successors:
+        seen = {start: 0}
+        queue: deque[str] = deque([start])
+        while queue:
+            node = queue.popleft()
+            if seen[node] >= max_depth:
+                continue
+            for nxt in successors.get(node, ()):
+                if nxt in seen:
+                    continue
+                seen[nxt] = seen[node] + 1
+                queue.append(nxt)
+                key = frozenset((start, nxt))
+                distances[key] = min(distances.get(key, max_depth), seen[nxt])
+    return distances
+
+
+def _pick_pairs(
+    candidates: list[tuple[Any, ...]],
+    quota: int,
+    used: set[str],
+) -> list[tuple[Any, ...]]:
+    """每对课程的两端都尽量没出现过；不够再放宽。``candidates`` 前两项为课程代码。"""
+    picked: list[tuple[Any, ...]] = []
+    for strict in (True, False):
+        for candidate in candidates:
+            if len(picked) >= quota:
+                return picked
+            if candidate in picked:
+                continue
+            if strict and (candidate[0] in used or candidate[1] in used):
+                continue
+            picked.append(candidate)
+            used.update(candidate[:2])
+    return picked
+
+
+def _relation_items(
+    courses: list[dict[str, Any]],
+    concept_pairs: set[frozenset[str]] | None,
+    rng: random.Random,
+) -> list[GoldItem]:
+    """relation-neg / relation-pos：两门课没有 / 有先修或知识关联。
+
+    判定：直接先修、深度 <= 3 的间接先修、知识关联，两个方向都算；
+    ``concept_pairs`` 为 ``None``（concept 产物缺失）时只按先修判定。
+    """
+    pool = [
+        course
+        for course in _unique_named_courses(courses)
+        if not any(
+            token in _clean_course_name(course["course_name"])
+            for token in _RELATION_NAME_CONNECTORS
+        )
+    ]
+    names = {
+        str(course["course_code"]): _clean_course_name(course["course_name"])
+        for course in pool
+    }
+    codes = sorted(names)
+    distances = _prerequisite_distances(courses)
+
+    negatives: list[tuple[Any, ...]] = []
+    positives: dict[str, list[tuple[Any, ...]]] = {"direct": [], "indirect": [], "concept": []}
+    for index, a in enumerate(codes):
+        for b in codes[index + 1 :]:
+            # 一个课名是另一个的子串时，课名链接本身有歧义，不出题。
+            if names[a] in names[b] or names[b] in names[a]:
+                continue
+            key = frozenset((a, b))
+            distance = distances.get(key)
+            if distance == 1:
+                positives["direct"].append((a, b, "direct"))
+            elif distance is not None:
+                positives["indirect"].append((a, b, "indirect"))
+            elif concept_pairs and key in concept_pairs:
+                positives["concept"].append((a, b, "concept"))
+            else:
+                negatives.append((a, b, "none"))
+
+    items: list[GoldItem] = []
+    shuffled_neg = list(negatives)
+    rng.shuffle(shuffled_neg)
+    for number, (a, b, _) in enumerate(
+        _pick_pairs(shuffled_neg, E5_QUOTAS["relation-neg"], set()), start=1
+    ):
+        if rng.random() < 0.5:
+            a, b = b, a
+        items.append(
+            GoldItem(
+                id=f"relation-neg-{number:03d}",
+                question=RELATION_TEMPLATES[(number - 1) % len(RELATION_TEMPLATES)].format(
+                    a=names[a], b=names[b]
+                ),
+                expected_route="dependency",
+                answerable=False,
+                gold_course_codes=[a, b],
+                subset="relation-neg",
+                source="auto-seed",
+                notes="无先修（深度<=3）也无知识关联；期望拒答 error_code=COURSE_RELATION_NOT_FOUND"
+                + ("" if concept_pairs is not None else "（concept 产物缺失，仅按先修判定）"),
+            )
+        )
+
+    # 三类关系各取约三分之一，某一类不够时由其他类补足。
+    quota = E5_QUOTAS["relation-pos"]
+    kinds = ("direct", "indirect", "concept")
+    shares = {kind: quota // len(kinds) for kind in kinds}
+    for kind in kinds[: quota - sum(shares.values())]:
+        shares[kind] += 1
+    used: set[str] = set()
+    chosen: list[tuple[Any, ...]] = []
+    for kind in kinds:
+        rng.shuffle(positives[kind])
+        chosen.extend(_pick_pairs(positives[kind], shares[kind], used))
+    for kind in kinds:
+        leftovers = [pair for pair in positives[kind] if pair not in chosen]
+        chosen.extend(_pick_pairs(leftovers, quota - len(chosen), used))
+    for number, (a, b, kind) in enumerate(chosen[:quota], start=1):
+        if rng.random() < 0.5:
+            a, b = b, a
+        items.append(
+            GoldItem(
+                id=f"relation-pos-{number:03d}",
+                question=RELATION_TEMPLATES[(number - 1) % len(RELATION_TEMPLATES)].format(
+                    a=names[a], b=names[b]
+                ),
+                expected_route="dependency",
+                answer_keys=[names[a], names[b]],
+                gold_course_codes=[a, b],
+                subset="relation-pos",
+                source="auto-seed",
+                notes=f"relation={kind}",
+            )
+        )
+    return items
+
+
+def _program_status(course: Mapping[str, Any], keyword: str) -> str:
+    """该专业有没有这门课：``present``（主修有）/ ``absent``（任何类型都没有）/ ``unclear``。
+
+    只在无歧义的两端出题：只在辅修方案里出现的课算 ``unclear``，不进金标。
+    """
+    in_program = [
+        offering
+        for offering in course.get("offerings") or []
+        if keyword in str(offering.get("program_name") or "")
+    ]
+    if not in_program:
+        return "absent"
+    if any(str(o.get("program_type") or "") == _MAIN_PROGRAM_TYPE for o in in_program):
+        return "present"
+    return "unclear"
+
+
+def _existence_items(
+    courses: list[dict[str, Any]],
+    rng: random.Random,
+) -> list[GoldItem]:
+    """existence：不带书名号的「有没有 X 这门课」，含专业线索题与不存在的课。"""
+    pool = [
+        course
+        for course in _unique_named_courses(courses)
+        if len(_clean_course_name(course["course_name"])) <= 20
+    ]
+    if not pool:
+        return []
+    rng.shuffle(pool)
+    used: set[str] = set()
+    items: list[GoldItem] = []
+
+    def add_real(course: dict[str, Any], question: str, notes: str, present: bool) -> None:
+        name = _clean_course_name(course["course_name"])
+        keys = [EXISTS_FOCUS] if present else [f"中没有《{name}》"]
+        used.add(str(course["course_code"]))
+        items.append(
+            GoldItem(
+                id=f"existence-{len(items) + 1:03d}",
+                question=question,
+                expected_route="existence",
+                answer_keys=keys,
+                focus_keys=list(keys),
+                gold_course_codes=[str(course["course_code"])],
+                subset="existence",
+                source="auto-seed",
+                notes=notes,
+            )
+        )
+
+    # 带专业线索：一半以上是「该专业没有这门课」，其余是「有」。
+    wanted_states = ("absent", "present", "absent", "present", "absent")
+    for index in range(E5_QUOTAS["existence-cue"]):
+        cue, keyword = PROGRAM_CUES[index % len(PROGRAM_CUES)]
+        state = wanted_states[index % len(wanted_states)]
+        course = next(
+            (
+                candidate
+                for candidate in pool
+                if str(candidate["course_code"]) not in used
+                and _program_status(candidate, keyword) == state
+            ),
+            None,
+        )
+        if course is None:
+            continue
+        name = _clean_course_name(course["course_name"])
+        add_real(
+            course,
+            EXISTENCE_CUE_TEMPLATE.format(cue=cue, name=name),
+            f"program_cue={keyword};program_has_course={state == 'present'}",
+            present=state == "present",
+        )
+
+    plain = [c for c in pool if str(c["course_code"]) not in used]
+    for course in plain[: E5_QUOTAS["existence-real"] - len(items)]:
+        name = _clean_course_name(course["course_name"])
+        template = EXISTENCE_TEMPLATES[len(items) % len(EXISTENCE_TEMPLATES)]
+        add_real(course, template.format(name=name), "course_exists=True", present=True)
+
+    for name in rng.sample(ABSENT_COURSES, min(E5_QUOTAS["existence-absent"], len(ABSENT_COURSES))):
+        template = EXISTENCE_TEMPLATES[len(items) % len(EXISTENCE_TEMPLATES)]
+        items.append(
+            GoldItem(
+                id=f"existence-{len(items) + 1:03d}",
+                question=template.format(name=name),
+                expected_route="existence",
+                answerable=False,
+                focus_keys=[ABSENT_FOCUS],
+                subset="existence",
+                source="auto-seed",
+                notes="课程不存在于语料中",
+            )
+        )
+    return items
+
+
+def _fixed_semester(course: Mapping[str, Any]) -> int | None:
+    """各培养方案学期一致、且为单个整数学期时返回该学期，否则 ``None``。"""
+    semesters = {
+        parse_semester(offering.get("semester"))[0]
+        for offering in course.get("offerings") or []
+    }
+    if len(semesters) != 1:
+        return None
+    return next(iter(semesters))  # 区间（弹性）学期解析为 None
+
+
+def _semester_items(
+    courses: list[dict[str, Any]],
+    rng: random.Random,
+) -> list[GoldItem]:
+    """semester-phrasing：「大几 / 什么时候上 / 哪一年」，金标 = 第 n 学期 + 年级换算。"""
+    by_semester: dict[int, list[tuple[dict[str, Any], int]]] = {}
+    for course in _unique_named_courses(courses):
+        semester = _fixed_semester(course)
+        if semester is not None and 1 <= semester <= 8:
+            by_semester.setdefault(semester, []).append((course, semester))
+    for group in by_semester.values():
+        rng.shuffle(group)
+
+    # 按学期轮流取，让大一到大四都出现。
+    selected: list[tuple[dict[str, Any], int]] = []
+    queues = [by_semester[key] for key in sorted(by_semester)]
+    while len(selected) < E5_QUOTAS["semester-courses"] and any(queues):
+        for queue in queues:
+            if queue and len(selected) < E5_QUOTAS["semester-courses"]:
+                selected.append(queue.pop())
+
+    items: list[GoldItem] = []
+    per_course = min(E5_QUOTAS["semester-per-course"], len(SEMESTER_TEMPLATES))
+    for index, (course, semester) in enumerate(selected):
+        name = _clean_course_name(course["course_name"])
+        grade = semester_to_grade(semester)
+        for offset in range(per_course):
+            template = SEMESTER_TEMPLATES[(index + offset) % len(SEMESTER_TEMPLATES)]
+            items.append(
+                GoldItem(
+                    id=f"semester-phrasing-{len(items) + 1:03d}",
+                    question=template.format(name=name),
+                    expected_route="fact",
+                    answer_keys=[f"第{semester}学期|第 {semester} 学期", grade],
+                    focus_keys=[f"第{semester}学期|第 {semester} 学期"],
+                    expected_semester=semester,
+                    gold_course_codes=[str(course["course_code"])],
+                    subset="semester-phrasing",
+                    source="auto-seed",
+                    notes=f"semester={semester};grade={grade}",
+                )
+            )
+    return items
+
+
+def _no_bracket_items(base: list[GoldItem], rng: random.Random) -> list[GoldItem]:
+    """no-brackets：从既有 fact / dependency 题里抽样，去掉书名号，期望路由不变。"""
+    items: list[GoldItem] = []
+    for prefix, quota in (
+        ("fact-", E5_QUOTAS["no-brackets-fact"]),
+        ("dependency-", E5_QUOTAS["no-brackets-dependency"]),
+    ):
+        candidates = [
+            item for item in base if item.id.startswith(prefix) and "《" in item.question
+        ]
+        for source in rng.sample(candidates, min(quota, len(candidates))):
+            items.append(
+                dataclasses.replace(
+                    source,
+                    id=f"no-brackets-{len(items) + 1:03d}",
+                    question=source.question.replace("《", "").replace("》", ""),
+                    subset="no-brackets",
+                    notes=f"{source.notes};源题={source.id}".lstrip(";"),
+                )
+            )
+    return items
+
+
 def _format_subset_counts(items: list[GoldItem]) -> None:
     """日志：说明各子集实际产出条数（产物不足时取到多少就多少）。"""
     counts: dict[str, int] = {}
@@ -891,6 +1326,17 @@ def build(output: Path) -> dict[str, Any]:
     items.extend(_fact_assessment_items(profiles, rng, course_names))
     items.extend(_noanswer_chapter_items(doc_tree, rng, course_names))
 
+    # E5 补充子集：只依赖 courses.json（relation 另用 concept 产物，缺失时降级）。
+    # 同样追加在最后，不改变上面各子集的随机序列。
+    concept_pairs = _load_concept_pairs()
+    if concept_pairs is None:
+        print("[seed] concept 产物缺失，relation 子集仅按先修判定", file=sys.stderr)
+    base_items = list(items)
+    items.extend(_relation_items(courses, concept_pairs, rng))
+    items.extend(_existence_items(courses, rng))
+    items.extend(_semester_items(courses, rng))
+    items.extend(_no_bracket_items(base_items, rng))
+
     problems = [problem for item in items for problem in item.validate()]
     if problems:
         raise SystemExit("generated items failed validation:\n  " + "\n  ".join(problems))
@@ -905,7 +1351,9 @@ def build(output: Path) -> dict[str, Any]:
         description=(
             "自动生成的种子评测集：既有事实/内容/依赖/目录/无答案五类，"
             "新增 structure-chapter / structure-outline / fact-instructor-syllabus / "
-            "fact-instructor-missing / fact-assessment / noanswer-chapter 六类。"
+            "fact-instructor-missing / fact-assessment / noanswer-chapter 六类；"
+            "E5 再追加 relation-neg / relation-pos / existence / semester-phrasing / "
+            "no-brackets 五类（问法多样、课名不带书名号）。"
             "新题型由 doc_tree.json 与 syllabus_profiles.json 自动生成（产物缺失时跳过）。"
             "内容题答案要点与部分 chunk 级标注仍需人工补充。"
         ),
