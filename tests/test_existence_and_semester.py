@@ -320,7 +320,13 @@ def test_exam_time_is_still_refused_by_s2(query: str) -> None:
 
 
 def test_semester_patterns_do_not_hijack_exam_phrasing() -> None:
-    assert QueryRouter.classify("电子文件管理什么时候考试") is not QueryType.FACT
+    # 「什么时候考试」经 S2 的封闭字段进入 fact，但不能被当成问开课学期。
+    import re
+
+    from src.online_service.query_router import _FACT_FIELD_PATTERNS
+
+    semester = dict(_FACT_FIELD_PATTERNS)["semester"]
+    assert not re.search(semester, "电子文件管理什么时候考试")
 
 
 # --------------------------------------------------------------------------- #
@@ -449,3 +455,12 @@ def test_existence_question_never_reaches_evidence_assembly() -> None:
     assert result.query_type == "existence"
     assert "chapter_coverage" not in result.metadata
     assert router.hybrid_calls == []
+
+
+def test_exam_time_in_question_first_order_is_refused_by_s2():
+    """「什么时候考试」与「考试什么时候」同属未记录字段，语序不影响拒答。"""
+    router = _Router()
+    for query in ("电子文件管理什么时候考试", "电子文件管理何时期末考试"):
+        gate = router._unrecorded_field_gate(query)
+        assert gate is not None, query
+        assert gate.metadata["error_code"] == "FIELD_NOT_RECORDED"

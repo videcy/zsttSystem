@@ -77,7 +77,8 @@ _UNRECORDED_FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
         "考试具体日期/时间",
         r"(?:期末|期中|课程|结课)?考试.{0,8}(?:具体)?"
         r"(?:日期|时间|哪天|哪一天|什么时候|何时|几号)"
-        r"|(?:具体)?(?:日期|时间).{0,4}(?:期末|期中|课程)?考试",
+        r"|(?:具体)?(?:日期|时间).{0,4}(?:期末|期中|课程)?考试"
+        r"|(?:什么时候|何时|哪天|哪一天|几号)(?:期末|期中)?考试",
     ),
     (
         "历年成绩/平均分/及格率",
@@ -417,7 +418,8 @@ _UNRECORDED_FIELD_TEMPLATE = "培养方案与教学大纲均未记录《{name}�
 
 # 两门课之间的关系问法；闸门要求同时链接到至少两门课，单独出现不触发。
 _COURSE_RELATION_PATTERN = re.compile(
-    r"有什么关系|什么关系|有关系吗|有没有关系|什么联系|有联系吗|有关联吗|关联"
+    r"有什么关系|什么关系|有关系吗|有没有关系|什么联系|有联系吗|有关联吗"
+    r"|(?:有什么|有哪些|之间的?)关联"
     r"|区别和联系|哪个先学|先学哪个"
 )
 # 评测按「无法说明两者存在关系」识别这类拒答，措辞不要改。
@@ -1322,6 +1324,7 @@ class QueryRouter:
             doc_tree=doc_tree,
         )
         from src.online_service.generator import (
+            EmptyGenerationError,
             build_fallback_answer,
             select_generation_evidence,
         )
@@ -1344,9 +1347,16 @@ class QueryRouter:
                 "fact",
             )
             metadata.update(verification_metadata)
-        except Exception:
+        except Exception as exc:
             answer = build_fallback_answer(query, evidence_items, persona)
-            metadata.update(status="degraded", error_code="LLM_UNAVAILABLE")
+            metadata.update(
+                status="degraded",
+                error_code=(
+                    "LLM_EMPTY_OUTPUT"
+                    if isinstance(exc, EmptyGenerationError)
+                    else "LLM_UNAVAILABLE"
+                ),
+            )
         citations = (
             []
             if metadata.get("nli_status") in {"refused", "unavailable"}

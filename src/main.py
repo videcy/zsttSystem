@@ -993,7 +993,7 @@ async def _log_query(
             status=str(status),
             persona=metadata.get("persona", "student"),
             persona_mode=metadata.get("persona_mode", "retrieval"),
-            persona_profile_version=metadata.get("persona_profile_version", "v1"),
+            persona_profile_version=metadata.get("persona_profile_version", PERSONA_PROFILE_VERSION),
         ),
     )
 

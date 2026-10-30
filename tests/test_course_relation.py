@@ -297,3 +297,12 @@ def test_dependency_service_failures_stay_degraded() -> None:
     broken = asyncio.run(_Router()._handle_dependency("某问题", _Broken(), None))
     assert broken.metadata["status"] == "degraded"
     assert broken.metadata["error_code"] == "DEPENDENCY_QUERY_FAILED"
+
+
+def test_bare_guanlian_inside_a_name_does_not_trigger_relation_gate():
+    """「关联」只在作疑问时算关系措辞；「关联数据」这类词组不触发闸门。"""
+    from src.online_service.query_router import _COURSE_RELATION_PATTERN
+
+    assert _COURSE_RELATION_PATTERN.search("数据库和数据结构之间的关联")
+    assert _COURSE_RELATION_PATTERN.search("数据库和数据结构有什么关联")
+    assert not _COURSE_RELATION_PATTERN.search("数据库和数据结构的关联数据怎么学")
