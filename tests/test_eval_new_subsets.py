@@ -214,8 +214,10 @@ def test_build_degrades_when_artifacts_missing(monkeypatch: Any, tmp_path: Path)
     items = load_dataset(output)
 
     assert summary["total"] == len(items)
-    # 产物缺失时，新子集全部跳过，只保留既有五类（subset 为空）。
-    assert all(item.subset == "" for item in items)
+    # 产物缺失时，M5.1 新子集全部跳过，只保留既有五类（subset 为空）；
+    # E5 子集只依赖 courses.json（no-brackets 由既有题派生），不受影响。
+    e5_subsets = {"relation-neg", "relation-pos", "existence", "semester-phrasing", "no-brackets"}
+    assert all(item.subset in ({""} | e5_subsets) for item in items)
 
 
 # ---------------------------------------------------------------------------

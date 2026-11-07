@@ -20,7 +20,11 @@ from typing import Any, Optional
 from src.config import config
 from src.online_service.chroma_retriever import ChromaRetriever
 from src.utils.lexical import term_set
-from src.online_service.program_index import ProgramIndex
+from src.online_service.program_graph import (
+    load_configured_concept_links,
+    parse_semester,
+)
+from src.online_service.program_index import ProgramIndex, core_program_name
 from src.online_service.persona import (
     DEFAULT_PERSONA,
     PERSONA_MODE,
@@ -36,6 +40,7 @@ class QueryType(Enum):
     STRUCTURE = "structure"
     CONTENT = "content"
     CATALOG = "catalog"
+    EXISTENCE = "existence"
     HYBRID = "hybrid"
 
 
@@ -52,6 +57,7 @@ _DEPENDENCY_PATTERNS: list[str] = [
     r"(课程|概念|知识).{0,4}(顺序|路径|依赖|关联)",
     r"(先学|后学|前置课程|先修课|预修课|前导课)",
     r"(有什么|有哪些).{0,4}(依赖|联系|关系|关联)",
+    r"(有关系|有联系|有关联)吗|有没有(关系|联系|关联)",
     r"(怎么|如何).{0,4}(选修|选课|规划|安排)",
 ]
 
@@ -71,7 +77,8 @@ _UNRECORDED_FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
         "考试具体日期/时间",
         r"(?:期末|期中|课程|结课)?考试.{0,8}(?:具体)?"
         r"(?:日期|时间|哪天|哪一天|什么时候|何时|几号)"
-        r"|(?:具体)?(?:日期|时间).{0,4}(?:期末|期中|课程)?考试",
+        r"|(?:具体)?(?:日期|时间).{0,4}(?:期末|期中|课程)?考试"
+        r"|(?:什么时候|何时|哪天|哪一天|几号)(?:期末|期中)?考试",
     ),
     (
         "历年成绩/平均分/及格率",
@@ -94,9 +101,38 @@ _FACT_PATTERNS: list[str] = [
     _ASSESSMENT_MODE_PATTERN,
     # Natural phrasings of the semester field: routing evaluation showed that
     # ``开课学期`` alone missed every question a student actually types.
-    r"(第几学期|什么学期|哪个学期|哪一学期|几年级).{0,3}(开|上|学|修|开课)?",
+    # 「大几 / 哪一年 / 什么时候上」同样是在问开课学期（R4）。「考试什么时候」
+    # 不含「开|上|学|修」，仍由 S2 闸门先行拒答。
+    r"(第几学期|什么学期|哪个学期|哪一学期|几年级|大几|哪一年|哪年"
+    r"|什么时候(?:开|上|学|修)|何时开|开设时间|开课时间).{0,3}(开|上|学|修|开课)?",
     # S2 的封闭字段也必须稳定进入 fact，避免落到 hybrid 后做整体摘要。
     *(pattern for _label, pattern in _UNRECORDED_FIELD_PATTERNS),
+]
+
+# 存在性问法（R4）：「有 X 这门课吗」「有没有 X 课」「开不开 X」「X 存在吗」。
+# 课名放在命名分组 ``name`` 里，处理函数复用同一组正则取课名片段。
+# 课名不得以疑问词 / 指代词开头，也不得只是「选修课、先修课」这类泛称，
+# 否则「专业有哪些必修课」「有没有先修课」会被抢走。
+_EXISTENCE_NAME = (
+    r"(?![哪什几多这那该本此怎如谁])"
+    r"(?!(?:专业)?(?:选修|必修|核心|基础|先修|前置|通识|公选|任选|实践|相关|其他|别的)(?:课|$))"
+    r"(?P<name>[^，。？?！!,；;\s]{1,20}?)"
+)
+_EXISTENCE_COURSE_TAIL = r"(?:这(?:一)?门|这个)?课(?:程)?"
+_EXISTENCE_END = r"(?=[，。？?！!,；;\s]|$)"
+_EXISTENCE_PATTERNS: list[str] = [
+    # 有没有 X 课 / 是否有 X 这门课 / 是否开设 X 课
+    rf"(?<![所拥具含享还])(?:有(?:没有|无)|是否有|是否开设){_EXISTENCE_NAME}"
+    rf"{_EXISTENCE_COURSE_TAIL}(?:吗|么|嘛)?{_EXISTENCE_END}",
+    # （本科生 / 信管专业）有 X 这门课吗
+    rf"(?<![所拥具含享还])有{_EXISTENCE_NAME}{_EXISTENCE_COURSE_TAIL}"
+    rf"(?:吗|么|嘛|没有|不){_EXISTENCE_END}",
+    # 开不开 X / 开了 X 这门课吗
+    rf"(?:开不开|开没开|有没有开){_EXISTENCE_NAME}(?:这(?:一)?门)?(?:课程|课)?{_EXISTENCE_END}",
+    rf"开(?:设)?了{_EXISTENCE_NAME}{_EXISTENCE_COURSE_TAIL}(?:吗|么|嘛){_EXISTENCE_END}",
+    # X 这门课存在吗 / X 开不开 / X 是否开设
+    rf"{_EXISTENCE_NAME}(?:这(?:一)?门课(?:程)?|课程|课)?"
+    rf"(?:存在吗|存不存在|存在不|有吗|开吗|开不开|开没开|是否开设){_EXISTENCE_END}",
 ]
 
 _CATALOG_PATTERNS: list[str] = [
@@ -130,6 +166,7 @@ _STRUCTURE_PATTERNS: list[str] = [
 # so it is unaffected.
 _INTENT_PATTERNS: tuple[tuple[QueryType, list[str]], ...] = (
     (QueryType.DEPENDENCY, _DEPENDENCY_PATTERNS),
+    (QueryType.EXISTENCE, _EXISTENCE_PATTERNS),
     (QueryType.CATALOG, _CATALOG_PATTERNS),
     (QueryType.FACT, _FACT_PATTERNS),
     (QueryType.STRUCTURE, _STRUCTURE_PATTERNS),
@@ -182,6 +219,7 @@ _INTENT_HEADINGS: dict[QueryType, str] = {
     QueryType.DEPENDENCY: "先修关系",
     QueryType.CONTENT: "课程内容",
     QueryType.CATALOG: "培养方案课程",
+    QueryType.EXISTENCE: "课程开设情况",
 }
 
 
@@ -319,7 +357,10 @@ def _generate_with_route(
 _FACT_FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
     ("credits", r"学分"),
     ("hours", r"学时|课时"),
-    ("semester", r"学期"),
+    (
+        "semester",
+        r"学期|大几|哪一年|哪年|什么时候(?:开|上|学|修)|何时开|开设时间|开课时间|几年级",
+    ),
     (
         "instructor",
         r"任课教师|课程负责人|主讲教师|授课教师|谁负责|负责人|谁教|哪个老师|哪位老师|老师是谁",
@@ -374,6 +415,47 @@ _NO_INSTRUCTOR_RECORDED = "培养方案与教学大纲均未记录该课程的�
 _COURSE_NOT_FOUND_TEMPLATE = "培养方案中没有名为《{name}》的课程。"
 _COURSE_CLARIFY_PREFIX = "你是不是想问"
 _UNRECORDED_FIELD_TEMPLATE = "培养方案与教学大纲均未记录《{name}》的{field}。"
+
+# 两门课之间的关系问法；闸门要求同时链接到至少两门课，单独出现不触发。
+_COURSE_RELATION_PATTERN = re.compile(
+    r"有什么关系|什么关系|有关系吗|有没有关系|什么联系|有联系吗|有关联吗"
+    r"|(?:有什么|有哪些|之间的?)关联"
+    r"|区别和联系|哪个先学|先学哪个"
+)
+# 评测按「无法说明两者存在关系」识别这类拒答，措辞不要改。
+_COURSE_RELATION_NOT_FOUND_TEMPLATE = (
+    "根据培养方案与课程图谱，《{a}》与《{b}》之间没有先修关系，"
+    "也没有经过验证的知识关联，无法说明两者存在关系。"
+)
+# 间接先修链的最大边数。
+_RELATION_MAX_DEPTH = 3
+# 知识关联最多列出的概念对数。
+_RELATION_MAX_EXAMPLES = 3
+
+
+_YEAR_NUMERALS = "零一二三四五六七八九十"
+
+
+def _semester_display(value: Any) -> str:
+    """把开课学期换算成年级说法（R4）。
+
+    单学期 ``n`` → ``第 n 学期（大X上/下学期）``，奇数为上、偶数为下；区间
+    ``a-b`` → ``第 a–b 学期均可修读（大X至大Y）``。无法解析的取值原样返回。
+    评测按「第 n 学期」「大X上/下」计分，格式不要随意改动。
+    """
+    column, _label = parse_semester(value)
+    if column is not None:
+        year = (column + 1) // 2
+        term = "上" if column % 2 else "下"
+        return f"第 {column} 学期（大{_YEAR_NUMERALS[year]}{term}学期）"
+    match = re.fullmatch(r"(\d+)\s*[-–~～至]\s*(\d+)", str(value).strip())
+    if match:
+        first, last = int(match.group(1)), int(match.group(2))
+        if 1 <= first <= last <= 12:
+            years = [_YEAR_NUMERALS[(first + 1) // 2], _YEAR_NUMERALS[(last + 1) // 2]]
+            span = f"大{years[0]}" if years[0] == years[1] else f"大{years[0]}至大{years[1]}"
+            return f"第 {first}–{last} 学期均可修读（{span}）"
+    return str(value)
 
 
 _COURSE_NAME_PUNCTUATION = re.compile(
@@ -538,7 +620,13 @@ class QueryRouter:
         )
         if unknown is None:
             return None
+        return self._unknown_course_result(unknown)
 
+    def _unknown_course_result(self, unknown: str) -> RouteResult:
+        """课名没有精确命中：给出相近候选的反问，或「没有这门课」的拒答。
+
+        S1 闸门（书名号里的课名）和存在性问法（不带书名号的课名片段）共用。
+        """
         normalized_unknown = _normalize_course_name(unknown)
         threshold = config.course_name_similarity_threshold
         scored: list[tuple[float, str, dict[str, Any]]] = []
@@ -708,6 +796,21 @@ class QueryRouter:
                 **intent.as_metadata(),
             )
             return safety_gate
+        # 两门课之间有没有关系，是结构化数据能确定回答的问题，不交给检索或 LLM。
+        relation_courses = (
+            self._link_courses(query) if _COURSE_RELATION_PATTERN.search(query) else []
+        )
+        if len(relation_courses) >= 2:
+            result = await asyncio.to_thread(
+                self._handle_course_relation, relation_courses[0], relation_courses[1]
+            )
+            result.metadata.update(
+                persona=persona,
+                persona_mode=PERSONA_MODE,
+                persona_profile_version=PERSONA_PROFILE_VERSION,
+                **intent.as_metadata(),
+            )
+            return result
         merge_labels = self._mergeable_labels(intent)
 
         if merge_labels:
@@ -790,6 +893,12 @@ class QueryRouter:
             )
         if query_type == QueryType.CATALOG:
             return self._handle_catalog(query)
+        if query_type == QueryType.EXISTENCE:
+            # ---- Path 2c: 课程是否开设，确定性回答（R4）----
+            result = self._handle_course_existence(query)
+            if result is not None:
+                return result
+            # 抽不出课名（或问的其实是已识别课程的某个属性）：交给 hybrid 兜底。
         # ---- Path 3: ChromaDB + Neo4j + grounded generation ----
         return await self._handle_hybrid(
             query,
@@ -991,7 +1100,7 @@ class QueryRouter:
                     facts.append(
                         "开课学期各培养方案不一致："
                         + "；".join(
-                            f"{program or '未标注方案'} 为 {value}"
+                            f"{program or '未标注方案'} 为 {_semester_display(value)}"
                             for program, value in variants
                         )
                     )
@@ -1016,9 +1125,10 @@ class QueryRouter:
                 _is_missing(conflict[0]) or _is_missing(conflict[1])
             ):
                 # M3.3：培养方案与大纲冲突时不覆盖，两者都给并注明来源。
+                show = _semester_display if fact_field == "semester" else str
                 facts.append(
-                    f"{_FACT_FIELD_LABELS[fact_field]}培养方案为 {conflict[0]}，"
-                    f"教学大纲为 {conflict[1]}"
+                    f"{_FACT_FIELD_LABELS[fact_field]}培养方案为 {show(conflict[0])}，"
+                    f"教学大纲为 {show(conflict[1])}"
                 )
                 continue
             value = _coalesce(
@@ -1030,6 +1140,8 @@ class QueryRouter:
                 continue
             if not _is_missing(profile.get(fact_field)):
                 from_profile = True
+            if fact_field == "semester":
+                value = _semester_display(value)
             facts.append(f"{_FACT_FIELD_LABELS[fact_field]}为 {value}")
         if not facts:
             if notes:
@@ -1212,6 +1324,7 @@ class QueryRouter:
             doc_tree=doc_tree,
         )
         from src.online_service.generator import (
+            EmptyGenerationError,
             build_fallback_answer,
             select_generation_evidence,
         )
@@ -1234,9 +1347,16 @@ class QueryRouter:
                 "fact",
             )
             metadata.update(verification_metadata)
-        except Exception:
+        except Exception as exc:
             answer = build_fallback_answer(query, evidence_items, persona)
-            metadata.update(status="degraded", error_code="LLM_UNAVAILABLE")
+            metadata.update(
+                status="degraded",
+                error_code=(
+                    "LLM_EMPTY_OUTPUT"
+                    if isinstance(exc, EmptyGenerationError)
+                    else "LLM_UNAVAILABLE"
+                ),
+            )
         citations = (
             []
             if metadata.get("nli_status") in {"refused", "unavailable"}
@@ -1608,16 +1728,71 @@ class QueryRouter:
             },
         )
 
-    def _link_course(self, query: str) -> dict[str, Any] | None:
+    def _link_courses(
+        self,
+        query: str,
+        *,
+        with_bracketed: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Every course the query mentions, in order of appearance.
+
+        Names match longest first and a span already claimed by a longer name
+        is not matched again (「大数据分析」不再命中「大数据」)。 Syllabus-only
+        twins ("X 转自DOC") share a display name with the programme course and
+        count as one course -- the one that carries offerings wins.  Bracketed
+        names the plain match did not cover resolve through the alias index.
+        """
         lowered = query.lower()
-        # Syllabus-only courses are stored as "X 转自DOC"; users type just "X".
-        matches = [
-            c
-            for c in self.courses
-            if str(c.get("course_code", "")).lower() in lowered
-            or str(c.get("course_name", "")) in query
-            or _course_display_name(c) in query
-        ]
+        candidates: list[tuple[str, str, dict[str, Any]]] = []
+        for course in self.courses:
+            for text, haystack in {
+                (str(course.get("course_name", "")), query),
+                (_course_display_name(course), query),
+                (str(course.get("course_code", "")).lower(), lowered),
+            }:
+                if text:
+                    candidates.append((text, haystack, course))
+        # 稳定排序：同长度时带 offerings 的在前，其余保持课程表顺序。
+        candidates.sort(key=lambda item: (-len(item[0]), not item[2].get("offerings")))
+
+        covered: list[tuple[int, int]] = []
+        found: dict[str, tuple[int, dict[str, Any]]] = {}
+
+        def free_start(haystack: str, text: str) -> int | None:
+            pos = haystack.find(text)
+            while pos != -1:
+                end = pos + len(text)
+                if all(end <= lo or pos >= hi for lo, hi in covered):
+                    return pos
+                pos = haystack.find(text, pos + 1)
+            return None
+
+        for text, haystack, course in candidates:
+            name = _course_display_name(course)
+            if name in found:
+                continue
+            start = free_start(haystack, text)
+            if start is not None:
+                covered.append((start, start + len(text)))
+                found[name] = (start, course)
+
+        if with_bracketed:
+            for match in re.finditer(r"《([^《》]+)》", query):
+                lo, hi = match.span(1)
+                if any(lo < end and start < hi for start, end in covered):
+                    continue
+                course = self._course_from_bracketed_name(match.group(1).strip())
+                if course is not None and _course_display_name(course) not in found:
+                    covered.append((lo, hi))
+                    found[_course_display_name(course)] = (lo, course)
+        return [course for _start, course in sorted(found.values(), key=lambda v: v[0])]
+
+    def _link_course(self, query: str) -> dict[str, Any] | None:
+        order = {id(course): index for index, course in enumerate(self.courses)}
+        matches = sorted(
+            self._link_courses(query, with_bracketed=False),
+            key=lambda course: order[id(course)],
+        )
         if matches:
             # A syllabus-only twin ("X 转自DOC") shares the display name with the
             # programme course; prefer the one that carries offerings.
@@ -1625,11 +1800,9 @@ class QueryRouter:
                 matches,
                 key=lambda c: (len(_course_display_name(c)), bool(c.get("offerings"))),
             )
-        for name in self._bracketed_course_names(query):
-            course = self._course_from_bracketed_name(name)
-            if course is not None:
-                return course
-        return None
+        # 只有书名号里的别名 / 英文名能对上时，取第一个。
+        bracketed = self._link_courses(query)
+        return bracketed[0] if bracketed else None
 
     @property
     def program_index(self) -> ProgramIndex:
@@ -1728,6 +1901,229 @@ class QueryRouter:
                 matches.append((course, offering))
                 break
         return matches
+
+    @staticmethod
+    def _existence_name_fragment(query: str) -> str:
+        """取存在性问法里的课名片段，取不到返回空串。"""
+        for pattern in _EXISTENCE_PATTERNS:
+            match = re.search(pattern, query)
+            if match:
+                return match.group("name").strip()
+        return ""
+
+    def _clean_existence_fragment(self, fragment: str) -> str:
+        """去掉课名片段里夹带的专业词和口语前缀，只留下可能是课名的部分。"""
+        text = _BOOK_TITLE_PATTERN.sub(
+            lambda match: match.group(0)[1:-1],
+            fragment,
+        )
+        index = self.program_index
+        for word in sorted(
+            [*index.aliases, *index.core_names, *index.program_names],
+            key=len,
+            reverse=True,
+        ):
+            text = text.replace(word, "")
+        text = re.sub(r"^(?:本科生?|研究生|专业|学院|学校|你们|咱们|的|开设了?|开了?)+", "", text)
+        text = re.sub(r"(?:这(?:一)?门|这个|的)+$", "", text)
+        return text.strip()
+
+    def _offering_programs(
+        self,
+        offerings: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        """把一组 offering 概括成（主修方案说法，辅修方案说法）。
+
+        同一专业的主修 / 辅修 / 微专业合并：``X辅修专业、辅修微专业``。
+        """
+        types = self.program_index.program_types
+        main: list[str] = []
+        minor: dict[str, list[str]] = {}
+        for offering in offerings:
+            name = str(offering.get("program_name") or "").strip()
+            core = core_program_name(name, types) or name
+            program_type = str(offering.get("program_type") or "").strip()
+            if "辅修" in program_type:
+                kinds = minor.setdefault(core, [])
+                if program_type not in kinds:
+                    kinds.append(program_type)
+            elif core not in main:
+                main.append(core)
+        plain = [core for core in main if not core.endswith("类")]
+        main_text = "、".join(
+            [*(["、".join(plain) + "专业"] if plain else []), *(c for c in main if c.endswith("类"))]
+        )
+        minor_text = "；".join(
+            f"{core}{'、'.join(sorted(kinds, key=len))}"
+            for core, kinds in minor.items()
+        )
+        return main_text, minor_text
+
+    @staticmethod
+    def _existence_details(
+        course: dict[str, Any],
+        offerings: list[dict[str, Any]],
+        program_label: Any,
+        *,
+        opened: bool = True,
+    ) -> list[str]:
+        """学期、学分、学时三项；缺失的跳过，各方案取值不同的列出差异。"""
+
+        def distinct(field: str) -> list[tuple[Any, list[str]]]:
+            groups: dict[str, tuple[Any, list[str]]] = {}
+            for offering in offerings:
+                value = offering.get(field)
+                if _is_missing(value):
+                    continue
+                groups.setdefault(str(value), (value, []))[1].append(
+                    program_label(offering)
+                )
+            if not groups and not _is_missing(course.get(field)):
+                return [(course.get(field), [])]
+            return list(groups.values())
+
+        def plain(value: Any) -> Any:
+            return int(value) if isinstance(value, float) and value.is_integer() else value
+
+        parts: list[str] = []
+        semesters = distinct("semester")
+        if len(semesters) == 1:
+            parts.append(
+                _semester_display(semesters[0][0]) + ("开设" if opened else "")
+            )
+        elif semesters:
+            parts.append(
+                "开课学期因培养方案而异（"
+                + "；".join(
+                    f"{'、'.join(dict.fromkeys(labels))}为{_semester_display(value)}"
+                    for value, labels in semesters
+                )
+                + "）"
+            )
+        for field, unit in (("credits", "学分"), ("hours", "学时")):
+            values = distinct(field)
+            if len(values) == 1:
+                parts.append(f"{plain(values[0][0])} {unit}")
+            elif values:
+                joined = "/".join(str(plain(value)) for value, _labels in values)
+                parts.append(f"{joined} {unit}（因培养方案而异）")
+        return parts
+
+    def _handle_course_existence(self, query: str) -> RouteResult | None:
+        """「有 X 这门课吗」：只查培养方案，不检索、不调 LLM（R4）。
+
+        返回 ``None`` 表示这不是一个能确定回答的存在性问题（抽不出课名，或者
+        问的其实是已识别课程的某个属性，如「信息检索有实验课吗」），调用方回退
+        到 hybrid。
+        """
+        fragment = self._existence_name_fragment(query)
+        if fragment:
+            course = self._link_course(fragment) or self._course_from_bracketed_name(
+                self._clean_existence_fragment(fragment)
+            )
+            if course is None:
+                if self._link_course(query) is not None:
+                    return None
+                name = self._clean_existence_fragment(fragment)
+                if not name or not self.courses:
+                    return None
+                result = self._unknown_course_result(name)
+                result.query_type = QueryType.EXISTENCE.value
+                result.metadata.update(llm_used=False, vector_hits=0)
+                return result
+        else:
+            course = self._link_course(query)
+            if course is None:
+                return None
+
+        index = self.program_index
+        keyword = index.match_keyword(query)
+        offerings = list(course.get("offerings") or [])
+        display = _course_display_name(course)
+        code = str(course.get("course_code") or "").strip()
+        title = f"《{display}》" + (f"（{code}）" if code else "")
+        metadata = {
+            "vector_hits": 0,
+            "graph_nodes": 0,
+            "llm_used": False,
+            "source_type": "training_plan",
+            "course_code": course.get("course_code"),
+            "course_name": display,
+        }
+
+        def program_label(offering: dict[str, Any]) -> str:
+            name = str(offering.get("program_name") or "").strip()
+            core = core_program_name(name, index.program_types) or name
+            program_type = str(offering.get("program_type") or "").strip()
+            return core + program_type if "辅修" in program_type else core
+
+        def describe(rows: list[dict[str, Any]]) -> tuple[str, str]:
+            """返回（主修方案，辅修方案的补充说明）；主修缺失时只写辅修。"""
+            main, minor = self._offering_programs(rows)
+            if main and minor:
+                return main, f"（{minor}也开设）"
+            return main or minor, ""
+
+        if not offerings:
+            # 只有教学大纲、培养方案里没有这门课的开设信息。
+            if keyword:
+                scope = self._program_scope(keyword)
+                answer = f"{scope}培养方案中没有{title}这门课。"
+            else:
+                answer = f"有。{title}在教学大纲中有记录，但培养方案里没有找到它的开设信息。"
+            return RouteResult(
+                answer,
+                [self._catalog_citation(course, None)],
+                QueryType.EXISTENCE.value,
+                metadata,
+            )
+
+        if keyword:
+            scoped = [
+                offering
+                for offering in offerings
+                if keyword in str(offering.get("program_name") or "")
+            ]
+            if not scoped:
+                scope = self._program_scope(keyword)
+                details = "，".join(
+                    self._existence_details(
+                        course, offerings, program_label, opened=False
+                    )
+                )
+                base, note = describe(offerings)
+                answer = (
+                    f"{scope}培养方案中没有{title}这门课；"
+                    f"它开设在{base}培养方案中{note}"
+                    + (f"，{details}" if details else "")
+                    + "。"
+                )
+                return RouteResult(
+                    answer,
+                    [self._catalog_citation(course, offerings[0])],
+                    QueryType.EXISTENCE.value,
+                    {**metadata, "program_match": False},
+                )
+            offerings = scoped
+
+        details = "，".join(self._existence_details(course, offerings, program_label))
+        base, note = describe(offerings)
+        answer = (
+            f"有。{title}是{base}培养方案中的课程{note}"
+            + (f"，{details}" if details else "")
+            + "。"
+        )
+        return RouteResult(
+            answer,
+            [self._catalog_citation(course, offerings[0])],
+            QueryType.EXISTENCE.value,
+            {**metadata, "program_match": True} if keyword else metadata,
+        )
+
+    def _program_scope(self, keyword: str) -> str:
+        """把问题里的专业线索写成「X专业」。"""
+        core = core_program_name(keyword, self.program_index.program_types) or keyword
+        return core if core.endswith(("专业", "类")) else f"{core}专业"
 
     def _handle_catalog(self, query: str) -> RouteResult:
         index = self.program_index
@@ -1847,8 +2243,9 @@ class QueryRouter:
             preferred_section_types=preferred,
             source_boosts=profile["source_boosts"],
         )
+        # 课程名、课程代码与用户问题拼接，让「学分」「学期」类问题取到对应字段所在的块。
         plan_query = (
-            f"{course.get('course_name', '')} {course_code} 培养方案 课程信息"
+            f"{course.get('course_name', '')} {course_code} {query}"
             if course
             else query
         )
@@ -1922,8 +2319,8 @@ class QueryRouter:
 
     # 「整门课内容」问法：M6.4 完备性检查的触发条件。
     _WHOLE_COURSE_PATTERN = (
-        r"整门课|这门课|课程内容|主要讲|主要学|讲什么|学什么|包括哪些|有哪些内容"
-        r"|课程安排|教学安排|教学进度"
+        r"整门课|课程内容|主要讲|主要学|讲什么|学什么|包括哪些|有哪些内容"
+        r"|介绍一下|概括一下|课程安排|教学安排|教学进度"
     )
 
     @classmethod
@@ -2266,6 +2663,7 @@ class QueryRouter:
             query, evidence_items, course, doc_tree
         )
         from src.online_service.generator import (
+            EmptyGenerationError,
             build_fallback_answer,
             select_generation_evidence,
         )
@@ -2288,9 +2686,18 @@ class QueryRouter:
                 "content",
             )
             metadata.update(verification_metadata)
-        except Exception:
+        except Exception as exc:
             answer = build_fallback_answer(query, evidence_items, persona)
-            metadata.update(status="degraded", error_code="LLM_UNAVAILABLE")
+            # 空输出（如 thinking 耗尽 max_tokens）与 LLM 不可用分开记，兜底摘要
+            # 不经过 NLI，也不标 ok（R-2f）。
+            metadata.update(
+                status="degraded",
+                error_code=(
+                    "LLM_EMPTY_OUTPUT"
+                    if isinstance(exc, EmptyGenerationError)
+                    else "LLM_UNAVAILABLE"
+                ),
+            )
         citations = (
             []
             if metadata.get("nli_status") in {"refused", "unavailable"}
@@ -2333,6 +2740,7 @@ class QueryRouter:
             query, evidence_items, course, doc_tree
         )
         from src.online_service.generator import (
+            EmptyGenerationError,
             build_fallback_answer,
             select_generation_evidence,
         )
@@ -2354,11 +2762,15 @@ class QueryRouter:
                 "hybrid",
             )
             metadata.update(verification_metadata)
-        except Exception:
+        except Exception as exc:
             answer = build_fallback_answer(query, evidence_items, persona)
             metadata.update(
                 status="degraded",
-                error_code="LLM_UNAVAILABLE",
+                error_code=(
+                    "LLM_EMPTY_OUTPUT"
+                    if isinstance(exc, EmptyGenerationError)
+                    else "LLM_UNAVAILABLE"
+                ),
             )
         citations = (
             []
@@ -2417,6 +2829,125 @@ class QueryRouter:
                 citations.append(citation)
                 seen.add(identity)
         return citations
+
+    def _concept_links(self) -> dict[str, Any] | None:
+        """与 `/programs/graph` 同一份知识关联汇总；产物不存在时为 None。"""
+        return load_configured_concept_links()
+
+    def _same_name_codes(self, course: dict[str, Any]) -> set[str]:
+        """Codes of the course and its same-name twins ("X 转自DOC", 多个学期的同名课)."""
+        name = _course_display_name(course)
+        return {
+            str(c.get("course_code", ""))
+            for c in self.courses
+            if _course_display_name(c) == name
+        }
+
+    def _prerequisite_chain(
+        self,
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        """Shortest prerequisite chain ``source -> ... -> target``, or None.
+
+        BFS from ``target`` back along ``courses[].prerequisites``; at most
+        ``_RELATION_MAX_DEPTH`` edges.  Twins of one display name count as the
+        same course, so a chain can start from any of their codes.
+        """
+        by_code = {str(c.get("course_code", "")): c for c in self.courses}
+        source_codes = self._same_name_codes(source)
+        queue = [[code] for code in sorted(self._same_name_codes(target))]
+        seen = {chain[0] for chain in queue}
+        while queue:
+            chain = queue.pop(0)
+            if chain[-1] in source_codes and len(chain) > 1:
+                return [by_code[code] for code in reversed(chain)]
+            if len(chain) > _RELATION_MAX_DEPTH:
+                continue
+            for value in (by_code.get(chain[-1]) or {}).get("prerequisites") or []:
+                value = str(value).strip()
+                if value in by_code and value not in seen:
+                    seen.add(value)
+                    queue.append([*chain, value])
+        return None
+
+    def _handle_course_relation(
+        self,
+        course_a: dict[str, Any],
+        course_b: dict[str, Any],
+    ) -> RouteResult:
+        """S3: answer "A 和 B 有什么关系" from the plan and the concept graph.
+
+        Looks, in both directions, for a prerequisite chain and then for a
+        verified knowledge link; with neither, refuses instead of retrieving.
+        """
+        name_a, name_b = _course_display_name(course_a), _course_display_name(course_b)
+        codes = [str(course_a.get("course_code", "")), str(course_b.get("course_code", ""))]
+        metadata: dict[str, Any] = {
+            "backend": "catalog",
+            "course_codes": codes,
+            "llm_used": False,
+            "vector_hits": 0,
+        }
+
+        sentences: list[str] = []
+        citations: list[dict[str, Any]] = []
+        for source, target in ((course_a, course_b), (course_b, course_a)):
+            chain = self._prerequisite_chain(source, target)
+            if chain is None:
+                continue
+            names = [_course_display_name(c) for c in chain]
+            if len(chain) == 2:
+                sentences.append(f"《{names[0]}》是《{names[1]}》的先修课程。")
+            else:
+                sentences.append(
+                    f"《{names[0]}》是《{names[-1]}》的间接先修课程，"
+                    f"先修链为：{'→'.join(f'《{n}》' for n in names)}。"
+                )
+            citations.extend(self._catalog_citation(c, None) for c in chain[1:])
+        if sentences:
+            metadata["relation_type"] = "prerequisite"
+            return RouteResult(
+                "".join(sentences),
+                citations=citations,
+                query_type="dependency",
+                metadata=metadata,
+            )
+
+        pairs = (self._concept_links() or {}).get("pairs") or {}
+        parts: list[str] = []
+        budget = _RELATION_MAX_EXAMPLES
+        for source, target in ((course_a, course_b), (course_b, course_a)):
+            examples = [
+                example
+                for source_code in sorted(self._same_name_codes(source))
+                for target_code in sorted(self._same_name_codes(target))
+                for example in pairs.get((source_code, target_code), [])
+            ][:budget]
+            if examples:
+                budget -= len(examples)
+                parts.append(
+                    f"《{_course_display_name(source)}》到《{_course_display_name(target)}》："
+                    + "、".join(examples)
+                )
+        if parts:
+            metadata["relation_type"] = "knowledge"
+            return RouteResult(
+                f"《{name_a}》与《{name_b}》没有先修要求，但图谱中有经过验证的知识关联："
+                f"{'；'.join(parts)}（由 LLM 验证的概念依赖汇总得出）。",
+                query_type="dependency",
+                metadata=metadata,
+            )
+
+        return RouteResult(
+            _COURSE_RELATION_NOT_FOUND_TEMPLATE.format(a=name_a, b=name_b),
+            query_type="dependency",
+            metadata={
+                **metadata,
+                "status": "refused",
+                "error_code": "COURSE_RELATION_NOT_FOUND",
+            },
+        )
 
     async def _handle_dependency(
         self,
@@ -2542,7 +3073,7 @@ class QueryRouter:
                 query_type="dependency",
                 metadata={
                     "backend": "zsttSystem_Neo4j",
-                    "status": "degraded",
+                    "status": "refused",
                     "error_code": "DEPENDENCY_NOT_FOUND",
                 },
             )

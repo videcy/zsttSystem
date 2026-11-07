@@ -16,6 +16,7 @@ Four metric families, matching the four things the system claims to do:
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping, Sequence
 
 # Phrases the service emits when it declines to answer.  Kept in one place so
@@ -33,6 +34,8 @@ REFUSAL_MARKERS: tuple[str, ...] = (
     "培养方案中没有名为",
     "你是不是想问",
     "均未记录",
+    # S3 课程对关系闸门：两门课既无先修也无知识关联时的拒答（以此结尾）。
+    "无法说明两者存在关系",
     # Degraded-backend messages: not an answer either, and counting them as
     # answers would inflate the hallucination rate whenever Neo4j is down.
     "未连接 Neo4j",
@@ -560,6 +563,97 @@ def instructor_report(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         report["instructor_missing_refusal_rate"] = round(
             sum(1 for item in missing if item.get("refused")) / len(missing), 4
         )
+    return report
+
+
+# ---------------------------------------------------------------------------
+# E5 答案切题率：existence / semester-phrasing
+# ---------------------------------------------------------------------------
+
+#: 只对这两个子集计算切题率。
+ON_TOPIC_SUBSETS: tuple[str, ...] = ("existence", "semester-phrasing")
+
+_SEMESTER_GRADES = "一二三四五六七八九"
+
+#: 行首的章节标题（可带列表符号 / 编号 / markdown 标记），如「第一章 绪论（3 学时）」。
+_CHAPTER_HEADING = re.compile(
+    r"^[\s\-\*•#>\d\.、]*第\s*[一二三四五六七八九十百零\d]+\s*章", re.MULTILINE
+)
+
+
+def first_sentence(answer: str) -> str:
+    """答案的第一句：按「。」或换行切分，保留句末的「。」（「有。」要能匹配）。"""
+    for line in (answer or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        end = line.find("。")
+        return line if end < 0 else line[: end + 1]
+    return ""
+
+
+def has_chapter_heading(answer: str) -> bool:
+    """答案里是否出现章节标题行（`coverage_filler` 把整门课的章节带进来的特征）。"""
+    return bool(_CHAPTER_HEADING.search(answer or ""))
+
+
+def semester_answer_correct(answer: str, semester: int) -> bool:
+    """答案同时给出「第 n 学期」和对应年级「大X上/下」。
+
+    学期用 ``第\\s*n\\s*学期`` 匹配（容忍空格）；年级按奇数上、偶数下换算。
+    """
+    text = answer or ""
+    if not re.search(rf"第\s*{semester}\s*学期", text):
+        return False
+    year = _SEMESTER_GRADES[(semester + 1) // 2 - 1]
+    half = "上" if semester % 2 else "下"
+    return bool(re.search(rf"大{year}\s*{half}", text))
+
+
+def answer_on_topic(
+    answer: str,
+    *,
+    focus_keys: Sequence[str] = (),
+    expected_semester: int | None = None,
+) -> bool | None:
+    """答案第一句是否直接回答了问题；出现章节标题行一律算不切题。
+
+    ``focus_keys`` 的候选用 ``|`` 分隔（existence：「有。」/「没有」）；
+    ``expected_semester`` 非空时第一句必须含「第 n 学期」。两者都没有时返回
+    ``None``，让这条题不参与平均。
+    """
+    if not focus_keys and not expected_semester:
+        return None
+    if has_chapter_heading(answer):
+        return False
+    sentence = first_sentence(answer)
+    if expected_semester:
+        return bool(re.search(rf"第\s*{expected_semester}\s*学期", sentence))
+    return all(
+        any(alternative and alternative in sentence for alternative in key.split("|"))
+        for key in focus_keys
+    )
+
+
+def answer_relevance_report(results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """答案切题率（总体 + 按子集）和章节标题泄漏率（逐题字段由 run_eval 填充）。"""
+    graded = [item for item in results if item.get("on_topic") is not None]
+    report: dict[str, Any] = {"on_topic_items": len(graded)}
+    if not graded:
+        return report
+    report["answer_on_topic_rate"] = round(
+        sum(1 for item in graded if item["on_topic"]) / len(graded), 4
+    )
+    report["chapter_heading_rate"] = round(
+        sum(1 for item in graded if item.get("chapter_heading")) / len(graded), 4
+    )
+    for subset in ON_TOPIC_SUBSETS:
+        group = [item for item in graded if item.get("subset") == subset]
+        if group:
+            report[f"{subset}_items"] = len(group)
+            report[f"{subset}_on_topic_rate"] = round(
+                sum(1 for item in group if item["on_topic"]) / len(group), 4
+            )
     return report
 
 

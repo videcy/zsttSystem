@@ -439,7 +439,10 @@ def test_generate_answer_once_uses_route_specific_output_budget(monkeypatch) -> 
         captured.update(kwargs)
         return "回答。"
 
-    evidence = [{"excerpt": "证据正文。", "source_file": "course.docx"}]
+    evidence = [
+        {"excerpt": "证据正文。", "source_file": "course.docx"},
+        {"excerpt": "第二章", "source_file": "course.docx", "coverage_filler": True},
+    ]
     with patch(
         "src.online_service.generator.generate_text",
         side_effect=fake_generate_text,
@@ -471,7 +474,14 @@ def test_rewrite_answer_keeps_route_budget_and_order_constraint(monkeypatch) -> 
         _rewrite_answer(
             "课程学什么",
             "旧回答。",
-            [{"excerpt": "证据正文。", "source_file": "course.docx"}],
+            [
+                {"excerpt": "证据正文。", "source_file": "course.docx"},
+                {
+                    "excerpt": "第二章",
+                    "source_file": "course.docx",
+                    "coverage_filler": True,
+                },
+            ],
             [{"sentence": "未通过句子。", "label": "Neutral"}],
             object(),
             "student",
