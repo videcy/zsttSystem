@@ -1141,6 +1141,24 @@
             return [name, parts.join("；")];
         }
 
+        // 后端会在回答末尾拼一段「资料来源」，下方「参考来源」已经列了同样的内容，展示时去掉正文里那段
+        function stripSourceListing(answer) {
+            const kept = [];
+            let inListing = false;
+            for (const line of answer.split("\n")) {
+                const text = line.trim();
+                if (/^资料来源\s*[：:]?\s*$/.test(text)) {
+                    inListing = true;
+                    continue;
+                }
+                if (inListing && (!text || /^(?:[-*•]|\d+[.)、])\s+/.test(text))) continue;
+                inListing = false;
+                if (/^资料来源\s*[：:]/.test(text)) continue;
+                kept.push(line);
+            }
+            return kept.join("\n").trim();
+        }
+
         function renderCitations(items) {
             citationList.replaceChildren();
             citations.hidden = !Array.isArray(items) || items.length === 0;
@@ -1530,6 +1548,9 @@
                     throw new Error(response.status === 429 ? "请求过于频繁，请稍后再试" : (data.detail || "请求失败"));
                 }
                 result.textContent = data.answer || "当前没有可展示的答案。";
+                if (Array.isArray(data.citations) && data.citations.length > 0) {
+                    result.textContent = stripSourceListing(result.textContent) || result.textContent;
+                }
                 renderAnswerTags(data, persona);
                 showFeedback(data.query_id);
                 renderCitations(data.citations);
