@@ -141,7 +141,7 @@ _CATALOG_PATTERNS: list[str] = [
 ]
 
 _CONTENT_PATTERNS: list[str] = [
-    r"(主要讲|主要学习|学什么|讲什么|内容|介绍|包括)",
+    r"(主要讲|主要学习|(?<!先)学什么|讲什么|内容|介绍|包括)",  # 「先学什么」是先修问法
 ]
 
 # 结构类问题的正则（大创方案 §4 M4.1）。优先级放在 FACT 之后、CONTENT
@@ -3020,7 +3020,16 @@ class QueryRouter:
         from src.online_service.dependency_explainer import build_dependency_answer
 
         course = self._link_course(query)
-        if course and re.search(r"先修课程|先修课|前置课程|预修课", query):
+        # 「学X要先学什么」也是在问培养方案里的先修课；
+        # 「为什么要先学A再学B」问的是原因，留给概念图解释。
+        asks_prerequisite = bool(
+            re.search(r"先修课程|先修课|前置课程|预修课", query)
+            or (
+                re.search(r"先学|先修", query)
+                and not re.search(r"为什么|为何", query)
+            )
+        )
+        if course and asks_prerequisite:
             prerequisites = [
                 str(value).strip()
                 for value in course.get("prerequisites") or []
