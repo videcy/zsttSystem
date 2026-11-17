@@ -36,6 +36,8 @@ REFUSAL_MARKERS: tuple[str, ...] = (
     "均未记录",
     # S3 课程对关系闸门：两门课既无先修也无知识关联时的拒答（以此结尾）。
     "无法说明两者存在关系",
+    # 澄清追问：含糊问题没认出课名时不回答，只给候选问法。
+    "没能确定你问的是哪门课",
     # Degraded-backend messages: not an answer either, and counting them as
     # answers would inflate the hallucination rate whenever Neo4j is down.
     "未连接 Neo4j",
