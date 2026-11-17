@@ -169,6 +169,8 @@ def test_rewrite_empty_content_is_caught_as_rewrite_failure(monkeypatch) -> None
 @pytest.mark.parametrize("route", ["hybrid", "content"])
 def test_router_marks_empty_output_as_degraded(route: str) -> None:
     router = QueryRouter(vector_retriever=FakeRetriever())
+    # 课名要能链接上，否则「这门课」会让 hybrid 走澄清追问而不生成。
+    router.courses = [{"course_code": "X1", "course_name": "电子文件管理"}]
     client = _fake_client("")
     handler = getattr(router, f"_handle_{route}")
     result = asyncio.run(handler("电子文件管理这门课是大几才开", client))

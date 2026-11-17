@@ -8,6 +8,7 @@ from src.online_service.dependency_explainer import (
     aggregate_prerequisites,
     build_dependency_answer,
     build_mermaid_graph,
+    extract_query_entities,
     generate_dependency_explanation,
 )
 
@@ -68,6 +69,16 @@ class DependencyExplainerTests(unittest.TestCase):
 
         self.assertIn("整数规划", entities["concepts"])
         self.assertIn("整数规划", entities["courses"])
+
+    def test_fallback_residue_containing_extracted_name_is_dropped(self) -> None:
+        with patch(
+            "src.online_service.dependency_explainer.generate_json_value",
+            return_value={"courses": ["数据可视化"], "concepts": []},
+        ):
+            entities = extract_query_entities("学数据可视化要先学什么", object())
+
+        self.assertEqual(entities["courses"], ["数据可视化"])
+        self.assertEqual(entities["concepts"], [])
 
     def test_aggregate_prerequisites_groups_by_course_and_chapter(self) -> None:
         paths = [

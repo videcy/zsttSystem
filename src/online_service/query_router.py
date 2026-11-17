@@ -478,6 +478,35 @@ def _course_display_name(course: dict[str, Any]) -> str:
     return name or str(course.get("course_code") or "").strip()
 
 
+# 澄清式追问：系统不回答主观问题（难不难、老师怎么样），而是把它改写成
+# 答得出来的客观问法。候选用固定模板，每句都能落到 content / structure / fact。
+_VAGUE_QUERY_PATTERN = re.compile(
+    r"这门课|这课|难不难|难吗|难度|怎么样|好不好|值不值|值得|好学|好过|水课|给分"
+    r"|要学.{0,8}吗|需要学.{0,8}吗"
+)
+_TEACHER_QUERY_PATTERN = re.compile(r"老师|教师|任课|授课|负责人")
+_CLARIFY_TEMPLATES = {
+    "content": "《{c}》的主要内容是什么？",
+    "structure": "《{c}》有哪些章节？",
+    "assessment": "《{c}》怎么考核？",
+    "teacher": "《{c}》的任课老师是谁？",
+}
+_CLARIFY_BLOCK_ANSWER = (
+    "没能确定你问的是哪门课。系统只回答培养方案和教学大纲里写明的内容，"
+    "可以把课程名填进下面的问法再问一次。"
+)
+
+
+def _clarify_candidates(query: str, course_name: str | None) -> list[str]:
+    """Three answerable rewrites of a vague question."""
+    if _TEACHER_QUERY_PATTERN.search(query):
+        keys = ("teacher", "content", "assessment")
+    else:
+        keys = ("content", "structure", "assessment")
+    name = course_name or "课程名"
+    return [_CLARIFY_TEMPLATES[key].format(c=name) for key in keys]
+
+
 def _course_alias_values(course: dict[str, Any]) -> list[str]:
     aliases = course.get("aliases") or course.get("course_aliases") or []
     if isinstance(aliases, str):
@@ -2712,6 +2741,35 @@ class QueryRouter:
         neo4j_driver: Any = None,
         persona: Persona = DEFAULT_PERSONA,
         **kwargs: Any,
+    ) -> RouteResult:
+        linked = self._link_course(query)
+        if linked is None and _VAGUE_QUERY_PATTERN.search(query):
+            return RouteResult(
+                _CLARIFY_BLOCK_ANSWER,
+                [],
+                "hybrid",
+                {
+                    "status": "clarify",
+                    "llm_used": False,
+                    "clarify": "block",
+                    "clarify_candidates": _clarify_candidates(query, None),
+                },
+            )
+        candidates = (
+            _clarify_candidates(query, _course_display_name(linked)) if linked else []
+        )
+        result = await self._answer_hybrid(query, llm_client, neo4j_driver, persona)
+        if candidates:
+            result.metadata["clarify"] = "suggest"
+            result.metadata["clarify_candidates"] = candidates
+        return result
+
+    async def _answer_hybrid(
+        self,
+        query: str,
+        llm_client: Any,
+        neo4j_driver: Any,
+        persona: Persona,
     ) -> RouteResult:
         course, hits = await self._retrieve_course_evidence(query, persona)
         graph_paths = []

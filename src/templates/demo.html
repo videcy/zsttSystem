@@ -200,6 +200,7 @@
         }
         .example:hover { border-color: var(--accent-2); background: var(--surface); }
         .example .tag { flex: none; }
+        .clarify { display: flex; flex-direction: column; gap: 8px; }
         .qa-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
         .ask-row { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
         .ask-row label { font-size: 14px; color: var(--ink-2); }
@@ -601,6 +602,10 @@
                             <span class="tag" id="answer-verify" hidden></span>
                         </div>
                         <div class="result empty" id="result">回答将显示在这里。左侧的示例问题覆盖了系统支持的各类问法，可以先从示例开始。</div>
+                        <section class="clarify" id="clarify" hidden>
+                            <div class="citations-title" id="clarify-title">你是不是想问</div>
+                            <div class="examples" id="clarify-list"></div>
+                        </section>
                         <section class="citations" id="citations" hidden>
                             <div class="citations-title">参考来源</div>
                             <ol class="citation-list" id="citation-list"></ol>
@@ -1014,6 +1019,7 @@
         const status = $("status");
         const result = $("result");
         const citations = $("citations");
+        const clarifyPanel = $("clarify");
         const citationList = $("citation-list");
         const feedback = $("feedback");
         const feedbackYes = $("feedback-yes");
@@ -1157,6 +1163,32 @@
                 kept.push(line);
             }
             return kept.join("\n").trim();
+        }
+
+        // 澄清式追问：候选问法点一下就问；带「《课程名》」占位的先填进输入框让用户改。
+        function renderClarify(metadata) {
+            const items = (metadata && metadata.clarify_candidates) || [];
+            if (!items.length) return;
+            $("clarify-title").textContent = metadata.clarify === "block" ? "换个问法试试" : "你是不是想问";
+            const list = $("clarify-list");
+            list.replaceChildren();
+            for (const text of items) {
+                const button = el("button", "example");
+                button.type = "button";
+                button.append(el("span", "", text));
+                button.addEventListener("click", () => {
+                    queryInput.value = text;
+                    const slot = text.indexOf("课程名");
+                    if (slot >= 0) {
+                        queryInput.focus();
+                        queryInput.setSelectionRange(slot, slot + 3);
+                    } else {
+                        handleSubmit();
+                    }
+                });
+                list.append(button);
+            }
+            clarifyPanel.hidden = false;
         }
 
         function renderCitations(items) {
@@ -1453,6 +1485,7 @@
         function resetAnswerArea() {
             hideFeedback();
             citations.hidden = true;
+            clarifyPanel.hidden = true;
             debugDetails.hidden = true;
             dependencyPanel.hidden = true;
             compareSection.hidden = true;
@@ -1554,10 +1587,12 @@
                 renderAnswerTags(data, persona);
                 showFeedback(data.query_id);
                 renderCitations(data.citations);
+                renderClarify(data.metadata);
                 await renderDependencyInfo(data.dependency_info);
                 renderDebug(data);
                 const degraded = data.status && data.status !== "ok";
-                updateStatus(degraded ? `查询完成（${data.status === "degraded" ? "服务降级" : "未找到可靠证据"}）` : "查询完成", "done");
+                const statusNote = { degraded: "服务降级", clarify: "需要补充课程名" }[data.status] || "未找到可靠证据";
+                updateStatus(degraded ? `查询完成（${statusNote}）` : "查询完成", "done");
             } catch (error) {
                 updateStatus("查询失败", "failed");
                 result.textContent = "错误：" + String(error.message || error);
