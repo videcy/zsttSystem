@@ -54,8 +54,19 @@ def extract_query_entities(question: str, llm_client: Any) -> dict[str, list[str
         "concepts": _normalize_string_list(payload.get("concepts", [])),
     }
     fallback = _fallback_extract_query_entities(question)
-    entities["courses"] = _merge_unique(entities["courses"], fallback["courses"])
-    entities["concepts"] = _merge_unique(entities["concepts"], fallback["concepts"])
+    # 兜底片段里如果包含已抽到的名字（如「学数据可视化要先学」包含「数据可视化」），
+    # 说明它只是没删干净的问句残渣，丢掉，免得被当成第二个实体。
+    known = entities["courses"] + entities["concepts"]
+
+    def _not_residue(name: str) -> bool:
+        return not any(k != name and k in name for k in known)
+
+    entities["courses"] = _merge_unique(
+        entities["courses"], [n for n in fallback["courses"] if _not_residue(n)]
+    )
+    entities["concepts"] = _merge_unique(
+        entities["concepts"], [n for n in fallback["concepts"] if _not_residue(n)]
+    )
     return entities
 
 
