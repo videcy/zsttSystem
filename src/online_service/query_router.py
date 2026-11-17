@@ -56,6 +56,7 @@ _DEPENDENCY_PATTERNS: list[str] = [
     r"(需要|需|要求|具备).{0,4}(什么|哪些|哪个).{0,2}(基础|前提|先修|前置|知识)",
     r"(课程|概念|知识).{0,4}(顺序|路径|依赖|关联)",
     r"(先学|后学|前置课程|先修课|预修课|前导课)",
+    r"(之前|以前).{0,4}(学|修)(什么|哪些)",
     r"(有什么|有哪些).{0,4}(依赖|联系|关系|关联)",
     r"(有关系|有联系|有关联)吗|有没有(关系|联系|关联)",
     r"(怎么|如何).{0,4}(选修|选课|规划|安排)",
@@ -139,6 +140,9 @@ _CATALOG_PATTERNS: list[str] = [
     r"(培养方案|课程设置|课程体系)",
     r"(专业|主修|辅修).{0,8}(核心课|核心课程|基础课|必修课|选修课|课程)",
 ]
+
+# 「先学什么」「之前要学什么」：问的是先修，其中的「学什么」不算课程内容。
+_PREREQ_CUE = re.compile(r"(先|之前|以前).{0,4}(学|修)")
 
 _CONTENT_PATTERNS: list[str] = [
     r"(主要讲|主要学习|(?<!先)学什么|讲什么|内容|介绍|包括)",  # 「先学什么」是先修问法
@@ -769,6 +773,17 @@ class QueryRouter:
                 scores[query_type.value] = hits
                 matched.append(query_type)
 
+        if (
+            QueryType.DEPENDENCY in matched
+            and QueryType.CONTENT in matched
+            and not any(
+                re.search(pattern, _PREREQ_CUE.sub(" ", textual))
+                for pattern in _CONTENT_PATTERNS
+            )
+        ):
+            matched.remove(QueryType.CONTENT)
+            del scores[QueryType.CONTENT.value]
+
         total = sum(scores.values())
         if not matched:
             return IntentPrediction(
@@ -1000,6 +1015,15 @@ class QueryRouter:
 
         metadata["answered_intents"] = answered
         metadata.update(self._merged_verification(part_metadata))
+        # 先修和内容一起命中时，系统可能把一个问题拆成了两个：给出两种问法让用户挑。
+        course = self._link_course(query)
+        if course and set(labels) == {QueryType.DEPENDENCY, QueryType.CONTENT}:
+            name = _course_display_name(course)
+            metadata["clarify"] = "suggest"
+            metadata["clarify_candidates"] = [
+                f"《{name}》的先修课程是什么？",
+                _CLARIFY_TEMPLATES["content"].format(c=name),
+            ]
         return RouteResult(
             answer="\n\n".join(sections),
             citations=citations,
@@ -3025,7 +3049,7 @@ class QueryRouter:
         asks_prerequisite = bool(
             re.search(r"先修课程|先修课|前置课程|预修课", query)
             or (
-                re.search(r"先学|先修", query)
+                _PREREQ_CUE.search(query)
                 and not re.search(r"为什么|为何", query)
             )
         )
